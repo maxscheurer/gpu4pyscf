@@ -112,7 +112,6 @@ static int GINTfill_int3c_overlap_density_contracted_tasks(
     const int i_l, const int j_l, const int k_l,
     const int nprim_ij,
     const int nao,
-    const int ao_offsets_i, const int ao_offsets_j,
     const double* aux_coords, const double* aux_exponents,
     const cudaStream_t stream
 ) {
@@ -126,40 +125,40 @@ static int GINTfill_int3c_overlap_density_contracted_tasks(
     switch (l_total) {
         DISPATCH_BY_L_TOTAL(0, GINTfill_int3c_overlap_density_contracted_kernel_general,
                             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(1, GINTfill_int3c_overlap_density_contracted_kernel_general,
                             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(2, GINTfill_int3c_overlap_density_contracted_kernel_general,
                             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(3, GINTfill_int3c_overlap_density_contracted_kernel_general,
                             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(4, GINTfill_int3c_overlap_density_contracted_kernel_general,
                             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(5, GINTfill_int3c_overlap_density_contracted_kernel_general,
                             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(6, GINTfill_int3c_overlap_density_contracted_kernel_general,
                             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(7, GINTfill_int3c_overlap_density_contracted_kernel_general,
                             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(8, GINTfill_int3c_overlap_density_contracted_kernel_general,
                             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(9, GINTfill_int3c_overlap_density_contracted_kernel_general,
                             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(10, GINTfill_int3c_overlap_density_contracted_kernel_general,
                             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(11, GINTfill_int3c_overlap_density_contracted_kernel_general,
                             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         default:
             fprintf(stderr, "l_total = %d out of range (max 11)\n", l_total);
             return 1;
@@ -180,7 +179,6 @@ static int GINTfill_int3c_overlap_amplitude_contracted_tasks(
     const int i_l, const int j_l, const int k_l,
     const int nprim_ij,
     const int nao,
-    const int ao_offsets_i, const int ao_offsets_j,
     const double* aux_coords, const double* aux_exponents,
     const cudaStream_t stream
 ) {
@@ -194,40 +192,40 @@ static int GINTfill_int3c_overlap_amplitude_contracted_tasks(
     switch (l_total) {
         DISPATCH_BY_L_TOTAL(0, GINTfill_int3c_overlap_amplitude_contracted_kernel_general,
                             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(1, GINTfill_int3c_overlap_amplitude_contracted_kernel_general,
                             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(2, GINTfill_int3c_overlap_amplitude_contracted_kernel_general,
                             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(3, GINTfill_int3c_overlap_amplitude_contracted_kernel_general,
                             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(4, GINTfill_int3c_overlap_amplitude_contracted_kernel_general,
                             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(5, GINTfill_int3c_overlap_amplitude_contracted_kernel_general,
                             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(6, GINTfill_int3c_overlap_amplitude_contracted_kernel_general,
                             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(7, GINTfill_int3c_overlap_amplitude_contracted_kernel_general,
                             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(8, GINTfill_int3c_overlap_amplitude_contracted_kernel_general,
                             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(9, GINTfill_int3c_overlap_amplitude_contracted_kernel_general,
                             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(10, GINTfill_int3c_overlap_amplitude_contracted_kernel_general,
                             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         DISPATCH_BY_L_TOTAL(11, GINTfill_int3c_overlap_amplitude_contracted_kernel_general,
                             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-                            ao_offsets_i, ao_offsets_j, aux_coords, aux_exponents)
+                            aux_coords, aux_exponents)
         default:
             fprintf(stderr, "l_total = %d out of range (max 11)\n", l_total);
             return 1;
@@ -310,7 +308,6 @@ int GINTfill_int3c_overlap_density_contracted(
     const double* dm,
     double* forces,
     const int nao,
-    const int* ao_offsets,
     const int* bins_locs_ij,
     int nbins,
     const int cp_ij_id
@@ -342,7 +339,6 @@ int GINTfill_int3c_overlap_density_contracted(
 
         const int err = GINTfill_int3c_overlap_density_contracted_tasks(
             forces, dm, offsets, i_l, j_l, k_l, nprim_ij, nao,
-            ao_offsets[0], ao_offsets[1],
             aux_coords, aux_exponents, stream);
 
         if (err != 0) return err;
@@ -364,7 +360,6 @@ int GINTfill_int3c_overlap_amplitude_contracted(
     const double* amplitudes,
     double* fock,
     const int nao,
-    const int* ao_offsets,
     const int* bins_locs_ij,
     int nbins,
     const int cp_ij_id
@@ -396,7 +391,6 @@ int GINTfill_int3c_overlap_amplitude_contracted(
 
         const int err = GINTfill_int3c_overlap_amplitude_contracted_tasks(
             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
-            ao_offsets[0], ao_offsets[1],
             aux_coords, aux_exponents, stream);
 
         if (err != 0) return err;

@@ -88,8 +88,20 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt):
     aux_coords_gpu = cp.asarray(aux_coords, dtype=np.float64, order='C')
     aux_exponents_gpu = cp.asarray(aux_exponents, dtype=np.float64, order='C')
 
+    # Create stream pool for concurrent kernel launches
+    n_streams = min(4, len(intopt.log_qs))
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(max(1, n_streams))]
+
     for p0, p1 in lib.prange(0, ngrids, ngrids_per_split):
         int3c_slice = cp.zeros([p1 - p0, ncart_aux, nao, nao], order='C')
+
+        # Pre-allocate buffer for largest angular pair to reduce allocations
+        max_ni = max((intopt.cart_ao_loc[intopt.cp_idx[cp_ij_id] + 1] -
+                      intopt.cart_ao_loc[intopt.cp_idx[cp_ij_id]])
+                     for cp_ij_id in range(len(intopt.log_qs)) if len(intopt.log_qs[cp_ij_id]) > 0)
+        max_nj = max((intopt.cart_ao_loc[intopt.cp_jdx[cp_ij_id] + 1] -
+                      intopt.cart_ao_loc[intopt.cp_jdx[cp_ij_id]])
+                     for cp_ij_id in range(len(intopt.log_qs)) if len(intopt.log_qs[cp_ij_id]) > 0)
 
         for cp_ij_id, log_q_ij in enumerate(intopt.log_qs):
             if len(log_q_ij) == 0:
@@ -100,7 +112,8 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt):
             li = intopt.angular[cpi]
             lj = intopt.angular[cpj]
 
-            stream = cp.cuda.get_current_stream()
+            # Use streams in round-robin fashion for concurrent execution
+            stream = streams[cp_ij_id % len(streams)]
 
             nbins = 1
             bins_locs_ij = np.array([0, len(log_q_ij)], dtype=np.int32)
@@ -117,22 +130,26 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt):
             coords_slice = aux_coords_gpu[p0:p1]
             exponents_slice = aux_exponents_gpu[p0:p1]
 
-            err = libgint.GINTfill_int3c_overlap(
-                ctypes.cast(stream.ptr, ctypes.c_void_p),
-                intopt.bpcache,
-                ctypes.cast(coords_slice.data.ptr, ctypes.c_void_p),
-                ctypes.cast(exponents_slice.data.ptr, ctypes.c_void_p),
-                ctypes.c_int(p1 - p0),
-                ctypes.c_int(aux_l),
-                ctypes.cast(int3c_angular.data.ptr, ctypes.c_void_p),
-                strides.ctypes.data_as(ctypes.c_void_p),
-                ao_offsets.ctypes.data_as(ctypes.c_void_p),
-                bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
-                ctypes.c_int(nbins),
-                ctypes.c_int(cp_ij_id))
+            with stream:
+                err = libgint.GINTfill_int3c_overlap(
+                    ctypes.cast(stream.ptr, ctypes.c_void_p),
+                    intopt.bpcache,
+                    ctypes.cast(coords_slice.data.ptr, ctypes.c_void_p),
+                    ctypes.cast(exponents_slice.data.ptr, ctypes.c_void_p),
+                    ctypes.c_int(p1 - p0),
+                    ctypes.c_int(aux_l),
+                    ctypes.cast(int3c_angular.data.ptr, ctypes.c_void_p),
+                    strides.ctypes.data_as(ctypes.c_void_p),
+                    ao_offsets.ctypes.data_as(ctypes.c_void_p),
+                    bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
+                    ctypes.c_int(nbins),
+                    ctypes.c_int(cp_ij_id))
 
             if err != 0:
                 raise RuntimeError(f'GINTfill_int3c_overlap failed with error {err}')
+
+            # Synchronize this stream before cart2sph and assignment
+            stream.synchronize()
 
             # Convert to spherical if needed
             i0s, i1s = intopt.ao_loc[cpi], intopt.ao_loc[cpi + 1]
@@ -143,6 +160,10 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt):
 
             # Reshape to combine grid and aux dimensions
             int3c_slice[:, :, j0s:j1s, i0s:i1s] = int3c_angular
+
+        # Synchronize all streams before post-processing
+        for stream in streams:
+            stream.synchronize()
 
         # Symmetrize: copy from upper triangle [j,i] (j<=i) to lower triangle [i,j]
         # Shell pairs with aosym have j <= i, storing at position [j, i].
@@ -205,42 +226,43 @@ def get_int3c_overlap_density_contracted(mol, aux_coords, aux_exponents, aux_l, 
     aux_exponents_gpu = cp.asarray(aux_exponents, dtype=np.float64, order='C')
     forces = cp.zeros(ngrids * ncart_aux, dtype=np.float64)
 
+    # Create stream pool for concurrent kernel launches
+    n_streams = min(4, len(intopt.log_qs))
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(max(1, n_streams))]
+
     for cp_ij_id, log_q_ij in enumerate(intopt.log_qs):
         if len(log_q_ij) == 0:
             continue
 
-        cpi = intopt.cp_idx[cp_ij_id]
-        cpj = intopt.cp_jdx[cp_ij_id]
-
-        stream = cp.cuda.get_current_stream()
+        # Use streams in round-robin fashion for concurrent execution
+        stream = streams[cp_ij_id % len(streams)]
 
         nbins = 1
         bins_locs_ij = np.array([0, len(log_q_ij)], dtype=np.int32)
 
-        i0, i1 = intopt.cart_ao_loc[cpi], intopt.cart_ao_loc[cpi + 1]
-        j0, j1 = intopt.cart_ao_loc[cpj], intopt.cart_ao_loc[cpj + 1]
-
-        ao_offsets = np.array([i0, j0], dtype=np.int32)
-
-        err = libgint.GINTfill_int3c_overlap_density_contracted(
-            ctypes.cast(stream.ptr, ctypes.c_void_p),
-            intopt.bpcache,
-            ctypes.cast(aux_coords_gpu.data.ptr, ctypes.c_void_p),
-            ctypes.cast(aux_exponents_gpu.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(ngrids),
-            ctypes.c_int(aux_l),
-            ctypes.cast(dm_flat.data.ptr, ctypes.c_void_p),
-            ctypes.cast(forces.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(nao_cart),
-            ao_offsets.ctypes.data_as(ctypes.c_void_p),
-            bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_int(nbins),
-            ctypes.c_int(cp_ij_id))
+        with stream:
+            err = libgint.GINTfill_int3c_overlap_density_contracted(
+                ctypes.cast(stream.ptr, ctypes.c_void_p),
+                intopt.bpcache,
+                ctypes.cast(aux_coords_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.cast(aux_exponents_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(ngrids),
+                ctypes.c_int(aux_l),
+                ctypes.cast(dm_flat.data.ptr, ctypes.c_void_p),
+                ctypes.cast(forces.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(nao_cart),
+                bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_int(nbins),
+                ctypes.c_int(cp_ij_id))
 
         if err != 0:
             raise RuntimeError(f'GINTfill_int3c_overlap_density_contracted failed with error {err}')
 
-    return forces.reshape([ngrids, ncart_aux]).get()
+    # Synchronize all streams before returning
+    for stream in streams:
+        stream.synchronize()
+
+    return forces.reshape([ngrids, ncart_aux])
 
 
 def get_int3c_overlap_amplitude_contracted(mol, aux_coords, aux_exponents, aux_l, amplitudes, intopt):
@@ -282,40 +304,41 @@ def get_int3c_overlap_amplitude_contracted(mol, aux_coords, aux_exponents, aux_l
     nao_cart = intopt._sorted_mol.nao
     fock_cart = cp.zeros([nao_cart, nao_cart], dtype=np.float64, order='C')
 
+    # Create stream pool for concurrent kernel launches
+    n_streams = min(4, len(intopt.log_qs))
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(max(1, n_streams))]
+
     for cp_ij_id, log_q_ij in enumerate(intopt.log_qs):
         if len(log_q_ij) == 0:
             continue
 
-        cpi = intopt.cp_idx[cp_ij_id]
-        cpj = intopt.cp_jdx[cp_ij_id]
-
-        stream = cp.cuda.get_current_stream()
+        # Use streams in round-robin fashion for concurrent execution
+        stream = streams[cp_ij_id % len(streams)]
 
         nbins = 1
         bins_locs_ij = np.array([0, len(log_q_ij)], dtype=np.int32)
 
-        i0, i1 = intopt.cart_ao_loc[cpi], intopt.cart_ao_loc[cpi + 1]
-        j0, j1 = intopt.cart_ao_loc[cpj], intopt.cart_ao_loc[cpj + 1]
-
-        ao_offsets = np.array([i0, j0], dtype=np.int32)
-
-        err = libgint.GINTfill_int3c_overlap_amplitude_contracted(
-            ctypes.cast(stream.ptr, ctypes.c_void_p),
-            intopt.bpcache,
-            ctypes.cast(aux_coords_gpu.data.ptr, ctypes.c_void_p),
-            ctypes.cast(aux_exponents_gpu.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(ngrids),
-            ctypes.c_int(aux_l),
-            ctypes.cast(amplitudes_gpu.data.ptr, ctypes.c_void_p),
-            ctypes.cast(fock_cart.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(nao_cart),
-            ao_offsets.ctypes.data_as(ctypes.c_void_p),
-            bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_int(nbins),
-            ctypes.c_int(cp_ij_id))
+        with stream:
+            err = libgint.GINTfill_int3c_overlap_amplitude_contracted(
+                ctypes.cast(stream.ptr, ctypes.c_void_p),
+                intopt.bpcache,
+                ctypes.cast(aux_coords_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.cast(aux_exponents_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(ngrids),
+                ctypes.c_int(aux_l),
+                ctypes.cast(amplitudes_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.cast(fock_cart.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(nao_cart),
+                bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_int(nbins),
+                ctypes.c_int(cp_ij_id))
 
         if err != 0:
             raise RuntimeError(f'GINTfill_int3c_overlap_amplitude_contracted failed with error {err}')
+
+    # Synchronize all streams before post-processing
+    for stream in streams:
+        stream.synchronize()
 
     # Symmetrize
     row, col = np.tril_indices(nao_cart)
@@ -328,7 +351,7 @@ def get_int3c_overlap_amplitude_contracted(mol, aux_coords, aux_exponents, aux_l
 
     # Unsort orbitals
     fock = intopt.unsort_orbitals(fock_cart, axis=[0, 1])
-    return fock.get()
+    return fock
 
 
 def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, dm=None, amplitudes=None,

@@ -183,6 +183,7 @@ def test_density_contracted():
     print("Computing GPU density-contracted...")
     forces_gpu = int3c_overlap.get_int3c_overlap_density_contracted(
         mol, aux_coords, aux_exponents, aux_l=0, dm=dm, intopt=intopt)
+    forces_gpu = forces_gpu.get()  # Convert CuPy to NumPy for comparison
     print(f"GPU forces shape: {forces_gpu.shape}")
 
     # Compute CPU reference by contracting full tensor
@@ -234,6 +235,7 @@ def test_amplitude_contracted():
     print("Computing GPU amplitude-contracted...")
     fock_gpu = int3c_overlap.get_int3c_overlap_amplitude_contracted(
         mol, aux_coords, aux_exponents, aux_l=0, amplitudes=amplitudes, intopt=intopt)
+    fock_gpu = fock_gpu.get()  # Convert CuPy to NumPy for comparison
     print(f"GPU fock shape: {fock_gpu.shape}")
 
     # Compute CPU reference
