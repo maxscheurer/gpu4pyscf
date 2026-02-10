@@ -15,7 +15,7 @@
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --ptxas-options=-v")
 
 set(CMAKE_VERBOSE_MAKEFILE ON)
-add_library(gint SHARED 
+add_library(gint SHARED
   g2e.c
   pair_data.c
   bpcache.cu
@@ -31,6 +31,7 @@ add_library(gint SHARED
   nr_fill_ao_int3c2e_ipip2.cu
   nr_fill_ao_int3c2e_ip1ip2.cu
   nr_fill_ao_int3c2e_ipvip1.cu
+  nr_fill_ao_int3c_overlap.cu
   j_engine_matrix_reorder.c
   rys_roots_dat.cu
   cart2sph.cu

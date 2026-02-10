@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from gpu4pyscf.solvent import pcm, smd
+from gpu4pyscf.solvent import pcm, smd, gostshyp
 
 def PCM(method_or_mol, solvent_obj=None, dm=None):
     '''Initialize PCM model.
@@ -55,3 +55,23 @@ def SMD(method_or_mol, solvent_obj=None, dm=None):
         return smd.smd_for_scf(method_or_mol, solvent_obj, dm)
     else:
         raise NotImplementedError(f'SMD model does not support {method_or_mol}')
+
+def GOSTSHYP(method_or_mol, solvent_obj=None, dm=None):
+    '''Initialize GOSTSHYP model (high-pressure solvation).
+
+    Examples:
+
+    >>> mf = GOSTSHYP(scf.RHF(mol))
+    >>> mf.kernel()
+    >>> sol = GOSTSHYP(mol)
+    >>> mf = sol.for_scf(scf.RHF(mol))
+    '''
+    from pyscf import gto
+    from gpu4pyscf import scf
+
+    if isinstance(method_or_mol, gto.mole.Mole):
+        return gostshyp.GOSTSHYP(method_or_mol)
+    elif isinstance(method_or_mol, scf.hf.SCF):
+        return gostshyp.gostshyp_for_scf(method_or_mol, solvent_obj, dm)
+    else:
+        raise NotImplementedError(f'GOSTSHYP model does not support {method_or_mol}')
