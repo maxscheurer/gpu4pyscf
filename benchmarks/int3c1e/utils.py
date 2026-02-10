@@ -86,7 +86,7 @@ def fakemol_for_gaussian(coords, exponents, l=0, cart=True, coeffs=None):
     return fakemol
 
 
-def compute_int3c_overlap_cpu(mol, aux_coords, aux_exponents, aux_l=0):
+def compute_int3c_overlap_cpu(mol, aux_coords, aux_exponents, aux_l=0, aux_cart=True):
     """
     Compute 3-center overlap integrals using PySCF's int3c1e with supermol approach.
 
@@ -102,27 +102,37 @@ def compute_int3c_overlap_cpu(mol, aux_coords, aux_exponents, aux_l=0):
         Exponents of auxiliary Gaussians
     aux_l : int, optional
         Angular momentum of auxiliary functions (default: 0)
+    aux_cart : bool, optional
+        If True (default), auxiliary functions are Cartesian.
+        If False, auxiliary functions are spherical harmonics.
+        Must match mol.cart setting.
 
     Returns
     -------
-    int3c : ndarray of shape (ngrids, ncart_aux, nao, nao)
-        3-center overlap integrals
+    int3c : ndarray of shape (ngrids, naux, nao, nao)
+        3-center overlap integrals.
+        naux = (aux_l+1)*(aux_l+2)//2 if aux_cart else 2*aux_l+1
     """
     nao = mol.nao
     ngrids = len(aux_coords)
     ncart_aux = (aux_l + 1) * (aux_l + 2) // 2
+    nsph_aux = 2 * aux_l + 1
+    naux = ncart_aux if aux_cart else nsph_aux
+
+    # aux_cart must match mol.cart for PySCF's int3c1e
+    assert aux_cart == mol.cart, "aux_cart must match mol.cart"
 
     # Build fake molecule for auxiliary Gaussians
-    gmol = fakemol_for_gaussian(aux_coords, aux_exponents, l=aux_l, cart=mol.cart)
+    gmol = fakemol_for_gaussian(aux_coords, aux_exponents, l=aux_l, cart=aux_cart)
 
     # Create supermolecule and compute integrals
     supermol = mol + gmol
     slices = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol.nbas)
     int3c = supermol.intor("int3c1e", shls_slice=slices, aosym="s1")
-    # Shape: (nao, nao, ngrids * ncart_aux)
+    # Shape: (nao, nao, ngrids * naux)
 
-    # Reshape to (ngrids, ncart_aux, nao, nao)
-    int3c = int3c.reshape(nao, nao, ngrids, ncart_aux).transpose(2, 3, 0, 1)
+    # Reshape to (ngrids, naux, nao, nao)
+    int3c = int3c.reshape(nao, nao, ngrids, naux).transpose(2, 3, 0, 1)
 
     return int3c
 

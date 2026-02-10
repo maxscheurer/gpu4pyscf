@@ -61,6 +61,7 @@ def test_int3c_overlap_correctness(cart, basis):
     """Test that GPU 3-center overlap integrals match CPU reference."""
     mol = make_test_molecule(basis=basis, cart=cart)
     nao = mol.nao
+    aux_cart = cart  # aux_cart must match mol.cart
 
     # Small number of grid points for correctness test
     aux_coords, aux_exponents = generate_test_grids(ngrids=10, seed=42)
@@ -71,10 +72,11 @@ def test_int3c_overlap_correctness(cart, basis):
 
     # Compute GPU integrals
     int3c_gpu = int3c_overlap.get_int3c_overlap(
-        mol, aux_coords, aux_exponents, aux_l=0, intopt=intopt)
+        mol, aux_coords, aux_exponents, aux_l=0, intopt=intopt, aux_cart=aux_cart)
 
     # Compute CPU reference
-    int3c_cpu = compute_int3c_overlap_cpu(mol, aux_coords, aux_exponents, aux_l=0)
+    int3c_cpu = compute_int3c_overlap_cpu(
+        mol, aux_coords, aux_exponents, aux_l=0, aux_cart=aux_cart)
 
     # Compare
     np.testing.assert_allclose(
@@ -86,8 +88,14 @@ def test_int3c_overlap_correctness(cart, basis):
 @pytest.mark.parametrize("cart", [True, False], ids=['cartesian', 'spherical'])
 @pytest.mark.parametrize("aux_l", [0, 1, 2, 3], ids=['s-type', 'p-type', 'd-type', 'f-type'])
 def test_int3c_overlap_angular_momentum(cart, aux_l):
-    """Test 3-center overlap with different auxiliary angular momenta."""
+    """Test 3-center overlap with different auxiliary angular momenta.
+
+    Tests all combinations of:
+    - AO/aux basis: Cartesian vs spherical (aux_cart matches mol.cart)
+    - Auxiliary angular momentum: s, p, d, f
+    """
     mol = make_test_molecule(basis='def2-tzvp', cart=cart)
+    aux_cart = cart  # aux_cart must match mol.cart
 
     aux_coords, aux_exponents = generate_test_grids(ngrids=5, seed=123)
 
@@ -97,10 +105,11 @@ def test_int3c_overlap_angular_momentum(cart, aux_l):
 
     # Compute GPU integrals
     int3c_gpu = int3c_overlap.get_int3c_overlap(
-        mol, aux_coords, aux_exponents, aux_l=aux_l, intopt=intopt)
+        mol, aux_coords, aux_exponents, aux_l=aux_l, intopt=intopt, aux_cart=aux_cart)
 
     # Compute CPU reference
-    int3c_cpu = compute_int3c_overlap_cpu(mol, aux_coords, aux_exponents, aux_l=aux_l)
+    int3c_cpu = compute_int3c_overlap_cpu(
+        mol, aux_coords, aux_exponents, aux_l=aux_l, aux_cart=aux_cart)
 
     np.testing.assert_allclose(
         int3c_gpu, int3c_cpu, atol=1e-10, rtol=1e-10,
@@ -115,9 +124,13 @@ def test_int3c_overlap_density_contracted(cart, basis):
 
     Tests with both single-shell (sto-3g) and multi-shell (6-31g) bases
     to verify correct AO indexing in the GPU kernel.
+    Note: Density-contracted kernel always uses Cartesian auxiliaries.
     """
     mol = make_test_molecule(basis=basis, cart=cart)
     nao = mol.nao
+    # Density-contracted uses Cartesian aux, so CPU reference must use cart=True mol
+    mol_cart = mol.copy()
+    mol_cart.cart = True
 
     aux_coords, aux_exponents = generate_test_grids(ngrids=5, seed=42)
 
@@ -134,9 +147,17 @@ def test_int3c_overlap_density_contracted(cart, basis):
     forces_gpu = int3c_overlap.get_int3c_overlap_density_contracted(
         mol, aux_coords, aux_exponents, aux_l=0, dm=dm, intopt=intopt)
 
-    # Compute CPU reference
-    int3c_cpu = compute_int3c_overlap_cpu(mol, aux_coords, aux_exponents, aux_l=0)
-    forces_cpu = np.einsum('ij,gkij->gk', dm, int3c_cpu)
+    # Compute CPU reference using Cartesian aux (aux_cart=True)
+    # The kernel contracts with dm internally, so we compute full integral and contract
+    int3c_cpu = compute_int3c_overlap_cpu(
+        mol_cart, aux_coords, aux_exponents, aux_l=0, aux_cart=True)
+    # Transform dm to Cartesian basis if mol uses spherical
+    if not mol.cart:
+        c2s = mol.cart2sph_coeff()
+        dm_cart = c2s @ dm @ c2s.T
+    else:
+        dm_cart = dm
+    forces_cpu = np.einsum('ij,gkij->gk', dm_cart, int3c_cpu)
 
     np.testing.assert_allclose(
         forces_gpu.get(), forces_cpu, atol=1e-9, rtol=1e-9,
@@ -151,9 +172,14 @@ def test_int3c_overlap_amplitude_contracted(cart, basis):
 
     Tests with both single-shell (sto-3g) and multi-shell (6-31g) bases
     to verify correct AO indexing in the GPU kernel.
+    Note: Amplitude-contracted kernel always uses Cartesian auxiliaries.
     """
     mol = make_test_molecule(basis=basis, cart=cart)
     nao = mol.nao
+    # Amplitude-contracted uses Cartesian aux, so CPU reference must use cart=True mol
+    mol_cart = mol.copy()
+    mol_cart.cart = True
+    nao_cart = mol_cart.nao
 
     aux_coords, aux_exponents = generate_test_grids(ngrids=5, seed=123)
     ngrids = len(aux_coords)
@@ -171,9 +197,16 @@ def test_int3c_overlap_amplitude_contracted(cart, basis):
     fock_gpu = int3c_overlap.get_int3c_overlap_amplitude_contracted(
         mol, aux_coords, aux_exponents, aux_l=0, amplitudes=amplitudes, intopt=intopt)
 
-    # Compute CPU reference
-    int3c_cpu = compute_int3c_overlap_cpu(mol, aux_coords, aux_exponents, aux_l=0)
-    fock_cpu = np.einsum('gk,gkij->ij', amplitudes, int3c_cpu)
+    # Compute CPU reference using Cartesian aux (aux_cart=True)
+    int3c_cpu = compute_int3c_overlap_cpu(
+        mol_cart, aux_coords, aux_exponents, aux_l=0, aux_cart=True)
+    fock_cpu_cart = np.einsum('gk,gkij->ij', amplitudes, int3c_cpu)
+    # Transform Fock from Cartesian to spherical if mol uses spherical
+    if not mol.cart:
+        c2s = mol.cart2sph_coeff()
+        fock_cpu = c2s.T @ fock_cpu_cart @ c2s
+    else:
+        fock_cpu = fock_cpu_cart
 
     np.testing.assert_allclose(
         fock_gpu.get(), fock_cpu, atol=1e-9, rtol=1e-9,

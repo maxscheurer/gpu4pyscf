@@ -21,9 +21,13 @@ This module provides GPU-accelerated computation of 3-center overlap integrals:
 where chi_i, chi_j are AO basis functions and G_k is a surface Gaussian.
 
 Functions:
-    get_int3c_overlap: Compute full integral tensor [ngrids, nao, nao]
-    get_int3c_overlap_density_contracted: Compute D_ij * S_ijk -> [ngrids]
+    get_int3c_overlap: Compute full integral tensor [ngrids, naux, nao, nao]
+    get_int3c_overlap_density_contracted: Compute D_ij * S_ijk -> [ngrids, naux]
     get_int3c_overlap_amplitude_contracted: Compute a_k * S_ijk -> [nao, nao]
+
+The auxiliary functions can be Cartesian (naux = ncart) or spherical (naux = 2l+1),
+controlled by the aux_cart parameter. Default is Cartesian (aux_cart=True) to match
+GOSTSHYP convention.
 """
 
 import ctypes
@@ -37,7 +41,15 @@ from gpu4pyscf.gto.int3c1e import VHFOpt
 libgint = load_library('libgint')
 
 
-def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt):
+def _get_aux_counts(aux_l, aux_cart):
+    """Get number of auxiliary functions for Cartesian and spherical cases."""
+    ncart_aux = (aux_l + 1) * (aux_l + 2) // 2
+    nsph_aux = 2 * aux_l + 1
+    naux = ncart_aux if aux_cart else nsph_aux
+    return ncart_aux, nsph_aux, naux
+
+
+def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt, aux_cart=True):
     """
     Compute 3-center overlap integrals with GPU acceleration.
 
@@ -53,17 +65,20 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt):
         Angular momentum of auxiliary functions (0=s, 1=p, 2=d, 3=f)
     intopt : VHFOpt
         Integral options with precomputed basis pair data
+    aux_cart : bool, optional
+        If True (default), auxiliary functions are Cartesian (ncart = (l+1)(l+2)/2).
+        If False, auxiliary functions are spherical harmonics (nsph = 2l+1).
 
     Returns
     -------
-    int3c : ndarray of shape (ngrids * ncart_aux, nao, nao)
-        3-center overlap integrals
+    int3c : ndarray of shape (ngrids, naux, nao, nao)
+        3-center overlap integrals. naux = ncart if aux_cart else nsph.
     """
     nao = mol.nao
     ngrids = aux_coords.shape[0]
-    ncart_aux = (aux_l + 1) * (aux_l + 2) // 2
+    ncart_aux, nsph_aux, naux = _get_aux_counts(aux_l, aux_cart)
 
-    # Memory management
+    # Memory management (use ncart_aux for kernel, convert later if needed)
     total_double_number = ngrids * ncart_aux * nao * nao
     cp.get_default_memory_pool().free_all_blocks()
     avail_mem = get_avail_mem()
@@ -78,11 +93,11 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt):
         )
     ngrids_per_split = (ngrids + n_grid_split - 1) // n_grid_split
 
-    # Allocate pinned memory for output
-    buf_size = ngrids * ncart_aux * nao * nao
+    # Allocate pinned memory for output (final size with naux)
+    buf_size = ngrids * naux * nao * nao
     int3c_pinned = cp.cuda.alloc_pinned_memory(buf_size * 8)
     int3c = np.frombuffer(int3c_pinned, np.float64, buf_size).reshape(
-        [ngrids * ncart_aux, nao, nao], order='C')
+        [ngrids * naux, nao, nao], order='C')
 
     # Transfer coordinates and exponents to GPU
     aux_coords_gpu = cp.asarray(aux_coords, dtype=np.float64, order='C')
@@ -93,15 +108,8 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt):
     streams = [cp.cuda.Stream(non_blocking=True) for _ in range(max(1, n_streams))]
 
     for p0, p1 in lib.prange(0, ngrids, ngrids_per_split):
+        # Kernel always computes in Cartesian
         int3c_slice = cp.zeros([p1 - p0, ncart_aux, nao, nao], order='C')
-
-        # Pre-allocate buffer for largest angular pair to reduce allocations
-        max_ni = max((intopt.cart_ao_loc[intopt.cp_idx[cp_ij_id] + 1] -
-                      intopt.cart_ao_loc[intopt.cp_idx[cp_ij_id]])
-                     for cp_ij_id in range(len(intopt.log_qs)) if len(intopt.log_qs[cp_ij_id]) > 0)
-        max_nj = max((intopt.cart_ao_loc[intopt.cp_jdx[cp_ij_id] + 1] -
-                      intopt.cart_ao_loc[intopt.cp_jdx[cp_ij_id]])
-                     for cp_ij_id in range(len(intopt.log_qs)) if len(intopt.log_qs[cp_ij_id]) > 0)
 
         for cp_ij_id, log_q_ij in enumerate(intopt.log_qs):
             if len(log_q_ij) == 0:
@@ -151,7 +159,7 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt):
             # Synchronize this stream before cart2sph and assignment
             stream.synchronize()
 
-            # Convert to spherical if needed
+            # Convert AO indices to spherical if needed
             i0s, i1s = intopt.ao_loc[cpi], intopt.ao_loc[cpi + 1]
             j0s, j1s = intopt.ao_loc[cpj], intopt.ao_loc[cpj + 1]
             if not mol.cart:
@@ -173,12 +181,16 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt):
             # Copy upper to lower: array[col, row] = array[row, col] where row < col
             int3c_slice[:, k, col, row] = int3c_slice[:, k, row, col]
 
-        # Unsort orbitals and copy to host
-        int3c_slice = int3c_slice.reshape([(p1 - p0) * ncart_aux, nao, nao])
-        int3c_slice = intopt.unsort_orbitals(int3c_slice, axis=[1, 2])
-        int3c_slice.get(out=int3c[p0 * ncart_aux:(p1) * ncart_aux])
+        # Convert auxiliary to spherical if needed
+        if not aux_cart:
+            int3c_slice = cart2sph(int3c_slice, axis=1, ang=aux_l)
 
-    return int3c.reshape([ngrids, ncart_aux, nao, nao])
+        # Unsort orbitals and copy to host
+        int3c_slice = int3c_slice.reshape([(p1 - p0) * naux, nao, nao])
+        int3c_slice = intopt.unsort_orbitals(int3c_slice, axis=[1, 2])
+        int3c_slice.get(out=int3c[p0 * naux:(p1) * naux])
+
+    return int3c.reshape([ngrids, naux, nao, nao])
 
 
 def get_int3c_overlap_density_contracted(mol, aux_coords, aux_exponents, aux_l, dm, intopt):
@@ -203,7 +215,8 @@ def get_int3c_overlap_density_contracted(mol, aux_coords, aux_exponents, aux_l, 
     Returns
     -------
     forces : ndarray of shape (ngrids, ncart_aux)
-        Contracted integrals (e.g., forces per surface point)
+        Contracted integrals (e.g., forces per surface point).
+        Auxiliary functions are always Cartesian.
     """
     nao = mol.nao
     ngrids = aux_coords.shape[0]
@@ -280,7 +293,8 @@ def get_int3c_overlap_amplitude_contracted(mol, aux_coords, aux_exponents, aux_l
     aux_l : int
         Angular momentum of auxiliary functions
     amplitudes : ndarray of shape (ngrids, ncart_aux)
-        Amplitudes for each auxiliary function
+        Amplitudes for each auxiliary function.
+        Auxiliary functions are always Cartesian.
     intopt : VHFOpt
         Integral options with precomputed basis pair data
 
@@ -354,8 +368,8 @@ def get_int3c_overlap_amplitude_contracted(mol, aux_coords, aux_exponents, aux_l
     return fock
 
 
-def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, dm=None, amplitudes=None,
-                  direct_scf_tol=1e-13, intopt=None):
+def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, aux_cart=True,
+                  dm=None, amplitudes=None, direct_scf_tol=1e-13, intopt=None):
     """
     Main interface for 3-center overlap integrals.
 
@@ -371,10 +385,14 @@ def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, dm=None, amplitudes=N
         Exponents of auxiliary Gaussians
     aux_l : int, optional
         Angular momentum of auxiliary functions (default 0)
+    aux_cart : bool, optional
+        If True (default), auxiliary functions are Cartesian.
+        If False, auxiliary functions are spherical harmonics.
+        Only applies to full integral (not dm/amplitude contracted).
     dm : ndarray, optional
-        If provided, contracts with density matrix
+        If provided, contracts with density matrix (aux always Cartesian)
     amplitudes : ndarray, optional
-        If provided, contracts with amplitudes
+        If provided, contracts with amplitudes (aux always Cartesian)
     direct_scf_tol : float, optional
         Tolerance for integral screening
     intopt : VHFOpt, optional
@@ -383,7 +401,7 @@ def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, dm=None, amplitudes=N
     Returns
     -------
     result : ndarray
-        Full tensor [ngrids, ncart_aux, nao, nao] if no contraction,
+        Full tensor [ngrids, naux, nao, nao] if no contraction,
         forces [ngrids, ncart_aux] if dm provided,
         fock [nao, nao] if amplitudes provided
     """
@@ -399,7 +417,7 @@ def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, dm=None, amplitudes=N
         "Cannot contract with both dm and amplitudes simultaneously"
 
     if dm is None and amplitudes is None:
-        return get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt)
+        return get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt, aux_cart)
     elif dm is not None:
         return get_int3c_overlap_density_contracted(
             mol, aux_coords, aux_exponents, aux_l, dm, intopt)
