@@ -158,10 +158,10 @@ class GOSTSHYP(lib.StreamObject):
             atom_idx[p0:p1] = ia
         self.atom_idx = atom_idx  # numpy (small, used for CPU scatter)
 
-        # Compute outward-pointing normals on GPU
+        # Compute inward-pointing normals on GPU
         atom_idx_gpu = cp.asarray(atom_idx)
         ref_coords = atom_coords[atom_idx_gpu]
-        dr = self.grid_coords - ref_coords
+        dr = ref_coords - self.grid_coords
         dr_norm = cp.linalg.norm(dr, axis=1, keepdims=True)
         self.surface_normals = dr / dr_norm  # cupy [ngrids, 3]
 

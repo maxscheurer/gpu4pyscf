@@ -92,7 +92,7 @@ def gostshyp_kernel_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110, scal
         atom_idx[p0:p1] = ia
 
     ref_coords = atom_coords[atom_idx]
-    dr = grid_coords - ref_coords
+    dr = ref_coords - grid_coords
     dr_norm = np.linalg.norm(dr, axis=1, keepdims=True)
     surface_normals = dr / dr_norm
 
@@ -279,7 +279,7 @@ class TestGOSTSHYPSCF(unittest.TestCase):
 
         # Reference energy: HF/6-31g with GOSTSHYP 50GPa
         # Computed using both GPU and CPU implementations with proper energy accounting
-        np.testing.assert_allclose(e_tot, -100.06337794338, atol=1e-7,
+        np.testing.assert_allclose(e_tot, -99.8941733641653, atol=1e-7,
                                    err_msg="SCF energy does not match reference")
 
     def test_uhf_scf(self):
@@ -444,7 +444,7 @@ def gostshyp_gradient_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110, sc
         atom_idx[p0:p1] = ia
 
     ref_coords = atom_coords[atom_idx]
-    dr = grid_coords - ref_coords
+    dr = ref_coords - grid_coords
     dr_norm = np.linalg.norm(dr, axis=1, keepdims=True)
     surface_normals = dr / dr_norm
     widths = np.pi * np.log(2) / areas
@@ -666,6 +666,31 @@ class TestGOSTSHYPGradient(unittest.TestCase):
 
         np.testing.assert_allclose(total_force, 0.0, atol=1e-7,
                                    err_msg="Gradient does not satisfy translational invariance")
+
+    def test_gradient_scf_hf_reference(self):
+        """Test GOSTSHYP gradient after SCF against validated reference."""
+        mol = gto.M(
+            atom='H 1 0 0; F 2 0 0',
+            basis='6-31g',
+            cart=True,
+            verbose=0,
+        )
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf.conv_tol_grad = 1e-8
+        gostshyp = GOSTSHYP(mol)
+        mf = _attach_solvent._for_scf(mf, gostshyp)
+        mf.kernel()
+
+        from gpu4pyscf.solvent.grad.gostshyp import Gradients as GOSTSHYPGradients
+        grad = GOSTSHYPGradients(gostshyp).kernel(mf.make_rdm1())
+
+        ref = np.array([
+            [-0.00951946951, 0.00951946951],
+            [ 0.00000000000, 0.00000000000],
+            [ 0.00000000000, 0.00000000000],
+        ]).T
+        np.testing.assert_allclose(grad, ref, atol=1e-7)
 
     def test_gradient_finite_diff_convergence(self):
         """Verify O(h^2) convergence of finite differences against analytical gradient."""
