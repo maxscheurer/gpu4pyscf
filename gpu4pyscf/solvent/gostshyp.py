@@ -1,4 +1,4 @@
-# Copyright 2021-2024 The PySCF Developers. All Rights Reserved.
+# Copyright 2021-2026 The PySCF Developers. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,15 +13,11 @@
 # limitations under the License.
 
 """
-GPU-accelerated GOSTSHYP solvation model.
-
-GOSTSHYP (Gaussian Overlap STrain model for Solvation under High-Yield Pressure)
-computes molecular cavity energy under high pressure using Gaussian-weighted
-surface integrals.
+GPU-accelerated GOSTSHYP pressure model.
 
 References:
-    J. Chem. Theory Comput. 2024, 20, 7, 2890-2900
-    https://doi.org/10.1021/acs.jctc.3c01365
+    J. Chem. Theory Comput. 2021, 17, 1, 583–597
+    https://doi.org/10.1021/acs.jctc.0c01212
 """
 
 import ctypes
@@ -29,8 +25,6 @@ import numpy as np
 import cupy as cp
 from pyscf import lib
 from pyscf import gto
-from pyscf.data import radii
-from pyscf.dft import gen_grid
 from gpu4pyscf.solvent import _attach_solvent
 from gpu4pyscf.solvent.pcm import gen_surface, modified_Bondi
 from gpu4pyscf.gto.int3c1e import VHFOpt
@@ -77,7 +71,7 @@ class GOSTSHYP(lib.StreamObject):
     _keys = {
         'mol', 'pressure_mpa', 'npoints', 'scaling_factor',
         'surface', 'intopt', 'frozen', 'equilibrium_solvation',
-        'e', 'v', 'amplitudes', 'forces'
+        'e', 'v', 'amplitudes', 'forces', 'gtilde_expval'
     }
 
     def __init__(self, mol, options=None):
@@ -108,6 +102,11 @@ class GOSTSHYP(lib.StreamObject):
         # Cached operators
         self._gtilde = None
         self._force_operators = None
+
+        # Timing (GPU ms accumulated via CUDA events)
+        self._t_gpu_ms = 0.0
+        self._t_wall = 0.0
+        self._n_kernel = 0
 
     @property
     def pressure_au(self):
@@ -146,37 +145,35 @@ class GOSTSHYP(lib.StreamObject):
 
         # Compute Gaussian widths from areas (eq. 4 in GOSTSHYP paper)
         # width = pi * ln(2) / area
-        areas = cp.asnumpy(self.surface['area'])
-        self.widths = np.pi * np.log(2) / areas
-
-        # Compute surface normals (outward-pointing)
-        grid_coords = cp.asnumpy(self.surface['grid_coords'])
-        atom_coords = cp.asnumpy(self.surface['atom_coords'])
+        # Keep grid data on GPU; gen_surface returns cupy arrays.
+        self.areas = self.surface['area']              # cupy [ngrids]
+        self.grid_coords = self.surface['grid_coords'] # cupy [ngrids, 3]
+        atom_coords = self.surface['atom_coords']      # cupy [natm, 3]
+        self.widths = cp.float64(np.pi * np.log(2)) / self.areas  # cupy [ngrids]
         gslice_by_atom = self.surface['gslice_by_atom']
 
-        atom_idx = np.zeros(len(areas), dtype=int)
+        ngrids = len(self.areas)
+        atom_idx = np.zeros(ngrids, dtype=np.int32)
         for ia, (p0, p1) in enumerate(gslice_by_atom):
             atom_idx[p0:p1] = ia
+        self.atom_idx = atom_idx  # numpy (small, used for CPU scatter)
 
-        self.atom_idx = atom_idx
-        self.grid_coords = grid_coords
-        self.areas = areas
-
-        # Compute outward-pointing normals
-        ref_coords = atom_coords[atom_idx]
-        dr = grid_coords - ref_coords
-        dr_norm = np.linalg.norm(dr, axis=1, keepdims=True)
-        self.surface_normals = dr / dr_norm
+        # Compute outward-pointing normals on GPU
+        atom_idx_gpu = cp.asarray(atom_idx)
+        ref_coords = atom_coords[atom_idx_gpu]
+        dr = self.grid_coords - ref_coords
+        dr_norm = cp.linalg.norm(dr, axis=1, keepdims=True)
+        self.surface_normals = dr / dr_norm  # cupy [ngrids, 3]
 
         # Build VHFOpt for AO shell pairs
         self.intopt = VHFOpt(mol)
-        self.intopt.build(1e-14, aosym=True)
+        self.intopt.build(1e-20, aosym=True)
 
         # Clear cached operators
         self._gtilde = None
         self._force_operators = None
 
-        logger.info(self, 'GOSTSHYP: %d surface Gaussians', len(areas))
+        logger.info(self, 'GOSTSHYP: %d surface Gaussians', ngrids)
         return self
 
     @property
@@ -232,6 +229,9 @@ class GOSTSHYP(lib.StreamObject):
         """
         Compute GOSTSHYP energy and Fock matrix contribution.
 
+        This implementation uses GPU-native contraction kernels for efficiency,
+        avoiding materialization of full [nao, nao, ngrids] tensors.
+
         Parameters
         ----------
         dm : ndarray of shape (nao, nao) or (2, nao, nao)
@@ -244,53 +244,71 @@ class GOSTSHYP(lib.StreamObject):
         fock : ndarray of shape (nao, nao)
             GOSTSHYP contribution to Fock matrix
         """
+        # Always record wall + GPU time for accumulation, regardless of verbose
+        _e0 = cp.cuda.Event(); _e0.record()
+        _w0 = logger.perf_counter()
+        t0 = logger.init_timer(self)
         if not hasattr(self, 'areas') or self.areas is None:
             self.build()
 
-        # Handle spin-unrestricted density matrices
-        if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
+        # Ensure dm is a CuPy array on GPU
+        dm = cp.asarray(dm)
+        if dm.ndim == 3 and dm.shape[0] == 2:
             dm = dm[0] + dm[1]
 
-        dm = np.asarray(dm)
-        nao = self.mol.nao
-        assert dm.shape == (nao, nao)
+        mol = self.mol
+        nao = mol.nao
+        assert dm.shape == (nao, nao), f"Expected dm shape ({nao}, {nao}), got {dm.shape}"
 
-        # Get cached operators
-        gtilde = self._compute_gtilde()
-        force_ops = self._compute_force_operators()
+        # All grid data (areas, widths, surface_normals, grid_coords) is already on GPU.
+        p_coeffs = 2.0 * self.widths  # cupy [ngrids]
 
-        # Step 1: Compute forces = D_ij * F_ij_g
-        forces = np.einsum('ij,ijg->g', dm, force_ops, optimize=True)
-        self.forces = forces
+        # Step 1: Forces via density-contracted p-type integrals
+        p_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
+            mol, self.grid_coords, self.widths, aux_l=1, dm=dm, intopt=self.intopt)
+        forces = cp.sum(p_contracted * self.surface_normals * p_coeffs[:, None], axis=1)
 
-        # Check for valid forces (should be positive for compression)
-        if np.any(forces <= 0):
+        if cp.any(forces <= 0):
             logger.warn(self, 'GOSTSHYP: Some forces are non-positive, '
                         'results may be unreliable')
 
         # Step 2: Compute amplitudes = P * A_g / forces
         amplitudes = self.pressure_au * self.areas / forces
-        self.amplitudes = amplitudes
 
-        # Step 3: Compute Fock contribution term 1: a_g * gtilde_ij_g
-        fock1 = np.einsum('g,ijg->ij', amplitudes, gtilde, optimize=True)
+        # Step 3: Fock term 1 via amplitude-contracted s-type integrals
+        fock1 = int3c_overlap.get_int3c_overlap_amplitude_contracted(
+            mol, self.grid_coords, self.widths, aux_l=0,
+            amplitudes=amplitudes[:, None], intopt=self.intopt)
 
-        # Step 4: Compute Fock contribution term 2 (response)
-        # gtilde_expval = D_ij * gtilde_ij_g
-        gtilde_expval = np.einsum('ij,ijg->g', dm, gtilde, optimize=True)
+        # Step 4: gtilde_expval via density-contracted s-type integrals
+        s_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
+            mol, self.grid_coords, self.widths, aux_l=0, dm=dm, intopt=self.intopt)
+        gtilde_expval = s_contracted[:, 0]
 
-        # Response term: -P * A * gtilde_expval / forces^2 * F_ij_g
+        # Step 5: Fock term 2 via amplitude-contracted p-type integrals
         response_coeff = -self.pressure_au * self.areas * gtilde_expval / (forces ** 2)
-        fock2 = np.einsum('g,ijg->ij', response_coeff, force_ops, optimize=True)
+        weighted_amp = response_coeff[:, None] * self.surface_normals * p_coeffs[:, None]
+        fock2 = int3c_overlap.get_int3c_overlap_amplitude_contracted(
+            mol, self.grid_coords, self.widths, aux_l=1,
+            amplitudes=weighted_amp, intopt=self.intopt)
 
         fock = fock1 + fock2
-        energy = np.vdot(fock1, dm)
+        energy = float(cp.vdot(fock1, dm))
 
+        # Store results on GPU
+        self.forces = forces
+        self.amplitudes = amplitudes
+        self.gtilde_expval = gtilde_expval
         self.e = energy
         self.v = fock
 
+        self._n_kernel += 1
+        _e1 = cp.cuda.Event(); _e1.record(); _e1.synchronize()
+        self._t_wall += logger.perf_counter() - _w0
+        self._t_gpu_ms += cp.cuda.get_elapsed_time(_e0, _e1)
         logger.info(self, 'GOSTSHYP energy: %.10f', energy)
-        return energy, fock
+        logger.timer(self, 'GOSTSHYP kernel', *t0)
+        return energy, self.v
 
     def reset(self, mol=None):
         """Reset molecule and rebuild surface (for geometry optimization)."""

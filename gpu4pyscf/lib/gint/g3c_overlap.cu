@@ -31,6 +31,14 @@
 #include "cint2e.cuh"
 #include "gint.h"
 
+// Screening threshold for integral contributions.
+// Values below this are considered negligible and skipped.
+// This can be overridden at compile time with -DPRIMITIVE_OVERLAP_CUTOFF=<value>
+// Typical values: 1e-14 (tight), 1e-12 (moderate), 1e-20 (very loose)
+#ifndef PRIMITIVE_OVERLAP_CUTOFF
+#define PRIMITIVE_OVERLAP_CUTOFF 1e-20
+#endif
+
 // Buffer size for recursion: need (L+2)^3 elements for each of x, y, z
 // MAX_L_TOTAL can be up to 4+4+3=11 for g-orbital AO + f-type aux
 #define OVERLAP_BUF_SIZE 2744  // (14)^3, supports up to L_total=11
@@ -301,7 +309,7 @@ __global__ void GINTfill_int3c_overlap_kernel_general(
                                * exp(-aij * gamma * inv_zeta * PC2)
                                * coeff_ij;
 
-        if (fabs(prefactor) < 1e-20) continue;
+        if (fabs(prefactor) < PRIMITIVE_OVERLAP_CUTOFF) continue;
 
         // Now compute quantities needed only for non-negligible contributions
         const double inv_2zeta = 0.5 * inv_zeta;
@@ -362,7 +370,7 @@ __global__ void GINTfill_int3c_overlap_kernel_general(
             for (int iI = 0; iI < ncart_i; ++iI) {
                 const int local_idx = iK * ncart_j * ncart_i + iJ * ncart_i + iI;
                 const double val = local_output[local_idx];
-                if (fabs(val) > 1e-20) {
+                if (fabs(val) > PRIMITIVE_OVERLAP_CUTOFF) {
                     // Output index: output[grid * ncart_k + iK, j, i]
                     const int out_idx = (ao_i + iI) + (ao_j + iJ) * stride_j
                                       + (task_grid * ncart_k + iK) * stride_ij;
@@ -457,7 +465,7 @@ __global__ void GINTfill_int3c_overlap_density_contracted_kernel_general(
                                * exp(-aij * gamma * inv_zeta * PC2)
                                * coeff_ij;
 
-        if (fabs(prefactor) < 1e-20) continue;
+        if (fabs(prefactor) < PRIMITIVE_OVERLAP_CUTOFF) continue;
 
         // Quantities needed only for non-negligible contributions
         const double inv_2zeta = 0.5 * inv_zeta;
@@ -626,7 +634,7 @@ __global__ void GINTfill_int3c_overlap_amplitude_contracted_kernel_general(
                                    * exp(-aij * gamma * inv_zeta * PC2)
                                    * coeff_ij;
 
-            if (fabs(prefactor) < 1e-20) continue;
+            if (fabs(prefactor) < PRIMITIVE_OVERLAP_CUTOFF) continue;
 
             // Quantities needed only for non-negligible contributions
             const double inv_2zeta = 0.5 * inv_zeta;
@@ -682,7 +690,7 @@ __global__ void GINTfill_int3c_overlap_amplitude_contracted_kernel_general(
     for (int iJ = 0; iJ < ncart_j; ++iJ) {
         for (int iI = 0; iI < ncart_i; ++iI) {
             const double fval = fock_ij[iJ * ncart_i + iI];
-            if (fabs(fval) < 1e-20) continue;  // Skip negligible values
+            if (fabs(fval) < PRIMITIVE_OVERLAP_CUTOFF) continue;  // Skip negligible values
             const int ii = ao_i + iI;
             const int jj = ao_j + iJ;
             const int fock_idx = ii * nao + jj;

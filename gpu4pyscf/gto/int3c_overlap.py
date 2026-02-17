@@ -307,13 +307,11 @@ def get_int3c_overlap_amplitude_contracted(mol, aux_coords, aux_exponents, aux_l
     ngrids = aux_coords.shape[0]
     ncart_aux = (aux_l + 1) * (aux_l + 2) // 2
 
-    amplitudes = np.asarray(amplitudes).flatten()
-    assert amplitudes.shape[0] == ngrids * ncart_aux
+    amplitudes_gpu = cp.asarray(amplitudes, dtype=np.float64).ravel()
+    assert amplitudes_gpu.shape[0] == ngrids * ncart_aux
 
-    # Transfer to GPU
     aux_coords_gpu = cp.asarray(aux_coords, dtype=np.float64, order='C')
     aux_exponents_gpu = cp.asarray(aux_exponents, dtype=np.float64, order='C')
-    amplitudes_gpu = cp.asarray(amplitudes, dtype=np.float64)
 
     nao_cart = intopt._sorted_mol.nao
     fock_cart = cp.zeros([nao_cart, nao_cart], dtype=np.float64, order='C')
