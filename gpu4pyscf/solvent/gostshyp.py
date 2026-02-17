@@ -324,6 +324,16 @@ class GOSTSHYP(lib.StreamObject):
         from gpu4pyscf.solvent.grad import gostshyp as gostshyp_grad
         return gostshyp_grad.Gradients(self)
 
+    def grad(self, dm):
+        '''Compute GOSTSHYP solvent gradient contribution for the given
+        density matrix. Called by WithSolventGrad.kernel().
+        '''
+        from gpu4pyscf.solvent.grad.gostshyp import Gradients as GOSTSHYPGradients
+        grad_obj = GOSTSHYPGradients(self)
+        result = grad_obj.kernel(dm)
+        self._grad_t_wall = grad_obj.t_wall
+        return result
+
 
 def GOSTSHYP_factory(method_or_mol, solvent_obj=None, dm=None):
     """

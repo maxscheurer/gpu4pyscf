@@ -692,6 +692,51 @@ class TestGOSTSHYPGradient(unittest.TestCase):
         ]).T
         np.testing.assert_allclose(grad, ref, atol=1e-7)
 
+    def test_nuc_grad_method(self):
+        """Test mf.nuc_grad_method().kernel() returns combined solute+solvent gradient."""
+        mol = gto.M(
+            atom='H 1 0 0; F 2 0 0',
+            basis='6-31g',
+            cart=True,
+            verbose=0,
+        )
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf.conv_tol_grad = 1e-8
+        gostshyp = GOSTSHYP(mol)
+        mf = _attach_solvent._for_scf(mf, gostshyp)
+        mf.kernel()
+
+        grad_obj = mf.nuc_grad_method()
+        de = grad_obj.kernel()
+        self.assertEqual(de.shape, (mol.natm, 3))
+
+        # The combined gradient should include both solute and solvent parts
+        self.assertIsNotNone(grad_obj.de_solvent)
+        self.assertIsNotNone(grad_obj.de_solute)
+        np.testing.assert_allclose(de, grad_obj.de_solute + grad_obj.de_solvent, atol=1e-10)
+
+        # Cross-check: solvent part should match a direct call
+        dm = mf.make_rdm1()
+        if hasattr(dm, 'get'):
+            dm = dm.get()
+        from gpu4pyscf.solvent.grad.gostshyp import Gradients as GOSTSHYPGradients
+        de_solvent_direct = GOSTSHYPGradients(gostshyp).kernel(dm)
+        np.testing.assert_allclose(grad_obj.de_solvent, de_solvent_direct, atol=1e-10)
+
+    def test_hessian_not_implemented(self):
+        """Test mf.Hessian() raises NotImplementedError for GOSTSHYP."""
+        mol = gto.M(
+            atom='H 1 0 0; F 2 0 0',
+            basis='sto-3g',
+            verbose=0,
+        )
+        mf = scf.RHF(mol)
+        gostshyp = GOSTSHYP(mol)
+        mf = _attach_solvent._for_scf(mf, gostshyp)
+        with self.assertRaises(NotImplementedError):
+            mf.Hessian()
+
     def test_gradient_finite_diff_convergence(self):
         """Verify O(h^2) convergence of finite differences against analytical gradient."""
         mol = gto.M(

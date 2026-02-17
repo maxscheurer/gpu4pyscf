@@ -134,16 +134,22 @@ class SCFWithSolvent(_Solvation):
         return e_tot, e_coul
 
     def Gradients(self):
-        # TODO: merge the two make_grad_object functions into a general one
+        # TODO: merge the make_grad_object functions into a general one
         from gpu4pyscf.solvent.pcm import PCM
+        from gpu4pyscf.solvent.gostshyp import GOSTSHYP
         if isinstance(self.with_solvent, PCM):
             from gpu4pyscf.solvent.grad.pcm import make_grad_object
+        elif isinstance(self.with_solvent, GOSTSHYP):
+            from gpu4pyscf.solvent.grad.gostshyp import make_grad_object
         else:
             from gpu4pyscf.solvent.grad.smd import make_grad_object
         return make_grad_object(self)
 
     def Hessian(self):
         from gpu4pyscf.solvent.pcm import PCM
+        from gpu4pyscf.solvent.gostshyp import GOSTSHYP
+        if isinstance(self.with_solvent, GOSTSHYP):
+            raise NotImplementedError('Hessian is not implemented for GOSTSHYP')
         if isinstance(self.with_solvent, PCM):
             from gpu4pyscf.solvent.hessian.pcm import make_hess_object
         else:

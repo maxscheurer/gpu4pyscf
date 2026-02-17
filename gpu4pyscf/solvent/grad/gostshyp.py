@@ -70,6 +70,7 @@ class Gradients(lib.StreamObject):
         gradient : ndarray of shape (natm, 3)
             Nuclear gradient contribution from GOSTSHYP
         """
+        _w0 = logger.perf_counter()
         t0 = logger.init_timer(self)
         gostshyp = self.gostshyp
         mol = self.mol
@@ -215,6 +216,11 @@ class Gradients(lib.StreamObject):
         dE3 = force_operator_grad + width_grad_ftype
 
         gradient = dE1 + dE2 + dE3
+
+        # Full device sync to catch errors from non-default streams used by
+        # int3c kernels before returning control to the solute gradient.
+        cp.cuda.Device().synchronize()
+        self.t_wall = logger.perf_counter() - _w0
         logger.timer(self, 'GOSTSHYP gradient', *t0)
 
         return cp.asnumpy(gradient)
@@ -239,3 +245,64 @@ def make_grad(gostshyp_obj, dm):
         Nuclear gradients
     """
     return Gradients(gostshyp_obj).kernel(dm)
+
+
+def make_grad_object(base_method):
+    '''Create nuclear gradients object with solvent contributions for the given
+    solvent-attached method based on its gradients method in vacuum
+    '''
+    from pyscf.grad.rhf import GradientsBase
+    if isinstance(base_method, GradientsBase):
+        base_method = base_method.base
+
+    with_solvent = base_method.with_solvent
+    if with_solvent.frozen:
+        raise RuntimeError('Frozen solvent model is not available for energy gradients')
+
+    vac_grad = base_method.undo_solvent().Gradients()
+    vac_grad.base = base_method
+    name = with_solvent.__class__.__name__ + vac_grad.__class__.__name__
+    return lib.set_class(WithSolventGrad(vac_grad),
+                         (WithSolventGrad, vac_grad.__class__), name)
+
+
+class WithSolventGrad:
+    from gpu4pyscf.lib.utils import to_gpu, device
+
+    _keys = {'de_solvent', 'de_solute'}
+
+    def __init__(self, grad_method):
+        self.__dict__.update(grad_method.__dict__)
+        self.de_solvent = None
+        self.de_solute = None
+
+    def undo_solvent(self):
+        cls = self.__class__
+        name_mixin = self.base.with_solvent.__class__.__name__
+        obj = lib.view(self, lib.drop_class(cls, WithSolventGrad, name_mixin))
+        del obj.de_solvent
+        del obj.de_solute
+        return obj
+
+    def kernel(self, *args, dm=None, atmlst=None, **kwargs):
+        if dm is None:
+            dm = self.base.make_rdm1()
+        if dm.ndim == 3:
+            dm = dm[0] + dm[1]
+        logger.debug(self, 'Compute gradients from solvents')
+        self.de_solvent = self.base.with_solvent.grad(dm)
+        logger.debug(self, 'Compute gradients from solutes')
+        self.de_solute = super().kernel(*args, **kwargs)
+        self.de = self.de_solute + self.de_solvent
+
+        if self.verbose >= logger.NOTE:
+            from pyscf.grad import rhf as rhf_grad
+            logger.note(self, '--------------- %s (+%s) gradients ---------------',
+                        self.base.__class__.__name__,
+                        self.base.with_solvent.__class__.__name__)
+            rhf_grad._write(self, self.mol, self.de, self.atmlst)
+            logger.note(self, '----------------------------------------------')
+        return self.de
+
+    def _finalize(self):
+        pass
