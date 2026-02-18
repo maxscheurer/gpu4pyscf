@@ -71,7 +71,8 @@ class GOSTSHYP(lib.StreamObject):
     _keys = {
         'mol', 'pressure_mpa', 'npoints', 'scaling_factor',
         'surface', 'intopt', 'frozen', 'equilibrium_solvation',
-        'e', 'v', 'amplitudes', 'forces', 'gtilde_expval'
+        'e', 'v', 'amplitudes', 'forces', 'gtilde_expval',
+        'overlap_cutoff'
     }
 
     def __init__(self, mol, options=None):
@@ -86,6 +87,7 @@ class GOSTSHYP(lib.StreamObject):
         self.pressure_mpa = options.get('pressure_mpa', 50_000)  # 50 GPa default
         self.npoints = options.get('npoints', 110)
         self.scaling_factor = options.get('scaling_factor', 1.2)
+        self.overlap_cutoff = options.get('overlap_cutoff', 1e-14)
 
         # Internal state
         self.surface = {}
@@ -119,6 +121,7 @@ class GOSTSHYP(lib.StreamObject):
                     self.pressure_mpa, self.pressure_au)
         logger.info(self, 'npoints = %d', self.npoints)
         logger.info(self, 'scaling_factor = %.2f', self.scaling_factor)
+        logger.info(self, 'overlap_cutoff = %.2e', self.overlap_cutoff)
         logger.info(self, 'frozen = %s', self.frozen)
         logger.info(self, 'equilibrium_solvation = %s', self.equilibrium_solvation)
         if self.surface:
@@ -263,9 +266,11 @@ class GOSTSHYP(lib.StreamObject):
         # All grid data (areas, widths, surface_normals, grid_coords) is already on GPU.
         p_coeffs = 2.0 * self.widths  # cupy [ngrids]
 
+        cutoff = self.overlap_cutoff
+
         # Step 1: Forces via density-contracted p-type integrals
         p_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, self.grid_coords, self.widths, aux_l=1, dm=dm, intopt=self.intopt)
+            mol, self.grid_coords, self.widths, aux_l=1, dm=dm, intopt=self.intopt, cutoff=cutoff)
         forces = cp.sum(p_contracted * self.surface_normals * p_coeffs[:, None], axis=1)
 
         if cp.any(forces <= 0):
@@ -278,11 +283,11 @@ class GOSTSHYP(lib.StreamObject):
         # Step 3: Fock term 1 via amplitude-contracted s-type integrals
         fock1 = int3c_overlap.get_int3c_overlap_amplitude_contracted(
             mol, self.grid_coords, self.widths, aux_l=0,
-            amplitudes=amplitudes[:, None], intopt=self.intopt)
+            amplitudes=amplitudes[:, None], intopt=self.intopt, cutoff=cutoff)
 
         # Step 4: gtilde_expval via density-contracted s-type integrals
         s_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, self.grid_coords, self.widths, aux_l=0, dm=dm, intopt=self.intopt)
+            mol, self.grid_coords, self.widths, aux_l=0, dm=dm, intopt=self.intopt, cutoff=cutoff)
         gtilde_expval = s_contracted[:, 0]
 
         # Step 5: Fock term 2 via amplitude-contracted p-type integrals
@@ -290,7 +295,7 @@ class GOSTSHYP(lib.StreamObject):
         weighted_amp = response_coeff[:, None] * self.surface_normals * p_coeffs[:, None]
         fock2 = int3c_overlap.get_int3c_overlap_amplitude_contracted(
             mol, self.grid_coords, self.widths, aux_l=1,
-            amplitudes=weighted_amp, intopt=self.intopt)
+            amplitudes=weighted_amp, intopt=self.intopt, cutoff=cutoff)
 
         fock = fock1 + fock2
         energy = float(cp.vdot(fock1, dm))

@@ -37,7 +37,7 @@ libgint = load_library('libgint')
 
 
 def get_int3c_overlap_ip1_amplitude_contracted(
-        mol, aux_coords, aux_exponents, aux_l, amplitudes, intopt):
+        mol, aux_coords, aux_exponents, aux_l, amplitudes, intopt, cutoff=1e-14):
     """
     Compute amplitude-contracted ip1 3-center overlap derivative
     (PySCF nabla convention):
@@ -111,7 +111,8 @@ def get_int3c_overlap_ip1_amplitude_contracted(
                 ctypes.c_int(nao_cart),
                 bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
                 ctypes.c_int(nbins),
-                ctypes.c_int(cp_ij_id))
+                ctypes.c_int(cp_ij_id),
+                ctypes.c_double(cutoff))
 
         if err != 0:
             raise RuntimeError(

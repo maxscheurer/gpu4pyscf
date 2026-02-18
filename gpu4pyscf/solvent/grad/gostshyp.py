@@ -92,6 +92,7 @@ class Gradients(lib.StreamObject):
         atom_idx = gostshyp.atom_idx  # numpy int array
         intopt = gostshyp.intopt
         P = gostshyp.pressure_au
+        cutoff = gostshyp.overlap_cutoff
         ngrids = len(areas)
         aoslice = mol.aoslice_by_atom()
 
@@ -127,7 +128,7 @@ class Gradients(lib.StreamObject):
         # ip1 returns nabla_1 = -d/dA (PySCF convention). Result is cupy.
         dPQ = int3c_overlap_ip.get_int3c_overlap_ip1_amplitude_contracted(
             mol, grid_coords, widths, aux_l=0,
-            amplitudes=amplitudes[:, None], intopt=intopt)
+            amplitudes=amplitudes[:, None], intopt=intopt, cutoff=cutoff)
         # dPQ: cupy [3, nao, nao]
 
         dgtilde_braket = cp.einsum('xij,ij->ix', dPQ, dm)
@@ -137,7 +138,7 @@ class Gradients(lib.StreamObject):
         # --- Part B: Aux center derivative (ip2 of s-type overlap) ---
         # d/dC_x S(l=0) = 2*gamma * S(l=1, px), negated to nabla convention
         p_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, grid_coords, widths, aux_l=1, dm=dm, intopt=intopt)
+            mol, grid_coords, widths, aux_l=1, dm=dm, intopt=intopt, cutoff=cutoff)
         # p_contracted: cupy [ngrids, 3]
         dgtilde_gaussian = amplitudes[:, None] * 2.0 * widths[:, None] * p_contracted
         _scatter_add(gtilde_operator_grad, atom_idx, -dgtilde_gaussian)
@@ -145,7 +146,7 @@ class Gradients(lib.StreamObject):
 
         # --- Part C: d-type width gradient ---
         d_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, grid_coords, widths, aux_l=2, dm=dm, intopt=intopt)
+            mol, grid_coords, widths, aux_l=2, dm=dm, intopt=intopt, cutoff=cutoff)
         # d_contracted: cupy [ngrids, 6]
         trace_d = d_contracted[:, 0] + d_contracted[:, 3] + d_contracted[:, 5]
         imd = wgrad_prefs * amplitudes * trace_d
@@ -164,7 +165,7 @@ class Gradients(lib.StreamObject):
         weighted_amp = coeffs[:, None] * normals
         dpq = int3c_overlap_ip.get_int3c_overlap_ip1_amplitude_contracted(
             mol, grid_coords, widths, aux_l=1,
-            amplitudes=weighted_amp, intopt=intopt)
+            amplitudes=weighted_amp, intopt=intopt, cutoff=cutoff)
         # dpq: cupy [3, nao, nao]
 
         dpq_ix = cp.einsum('xij,ij->ix', dpq, dm)
@@ -173,7 +174,7 @@ class Gradients(lib.StreamObject):
 
         # --- Part B: Aux center derivative (ip2 of p-type overlap) ---
         s_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, grid_coords, widths, aux_l=0, dm=dm, intopt=intopt)
+            mol, grid_coords, widths, aux_l=0, dm=dm, intopt=intopt, cutoff=cutoff)
         s_val = s_contracted[:, 0]  # cupy [ngrids]
 
         # Build 3x3 derivative matrix on GPU: dS_p_dC[g, x, p]
@@ -195,7 +196,7 @@ class Gradients(lib.StreamObject):
 
         # --- Part C: f-type width gradient ---
         f_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, grid_coords, widths, aux_l=3, dm=dm, intopt=intopt)
+            mol, grid_coords, widths, aux_l=3, dm=dm, intopt=intopt, cutoff=cutoff)
         # f_contracted: cupy [ngrids, 10]
         xf = f_contracted[:, 0] + f_contracted[:, 3] + f_contracted[:, 5]
         yf = f_contracted[:, 1] + f_contracted[:, 6] + f_contracted[:, 8]

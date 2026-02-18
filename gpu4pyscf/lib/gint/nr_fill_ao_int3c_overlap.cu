@@ -32,6 +32,10 @@
 #include "cuda_alloc.cuh"
 #include "cint2e.cuh"
 
+// Define the __constant__ variable for overlap screening cutoff.
+// This is the single definition; g3c_overlap.cu declares it extern.
+__constant__ double c_overlap_cutoff;
+
 #include "g3c_overlap.cu"
 
 // Dispatch macro for MAX_L_TOTAL templated kernels
@@ -257,7 +261,8 @@ int GINTfill_int3c_overlap(
     const int* ao_offsets,
     const int* bins_locs_ij,
     int nbins,
-    const int cp_ij_id
+    const int cp_ij_id,
+    const double cutoff
 ) {
     const ContractionProdType* cp_ij = bpcache->cptype + cp_ij_id;
     const int i_l = cp_ij->l_bra;
@@ -266,6 +271,7 @@ int GINTfill_int3c_overlap(
     const int nprim_ij = cp_ij->nprim_12;
 
     checkCudaErrors(cudaMemcpyToSymbol(c_bpcache, bpcache, sizeof(BasisProdCache)));
+    checkCudaErrors(cudaMemcpyToSymbol(c_overlap_cutoff, &cutoff, sizeof(double)));
 
     const int* bas_pairs_locs = bpcache->bas_pairs_locs;
     const int* primitive_pairs_locs = bpcache->primitive_pairs_locs;
@@ -310,7 +316,8 @@ int GINTfill_int3c_overlap_density_contracted(
     const int nao,
     const int* bins_locs_ij,
     int nbins,
-    const int cp_ij_id
+    const int cp_ij_id,
+    const double cutoff
 ) {
     const ContractionProdType* cp_ij = bpcache->cptype + cp_ij_id;
     const int i_l = cp_ij->l_bra;
@@ -319,6 +326,7 @@ int GINTfill_int3c_overlap_density_contracted(
     const int nprim_ij = cp_ij->nprim_12;
 
     checkCudaErrors(cudaMemcpyToSymbol(c_bpcache, bpcache, sizeof(BasisProdCache)));
+    checkCudaErrors(cudaMemcpyToSymbol(c_overlap_cutoff, &cutoff, sizeof(double)));
 
     const int* bas_pairs_locs = bpcache->bas_pairs_locs;
     const int* primitive_pairs_locs = bpcache->primitive_pairs_locs;
@@ -362,7 +370,8 @@ int GINTfill_int3c_overlap_amplitude_contracted(
     const int nao,
     const int* bins_locs_ij,
     int nbins,
-    const int cp_ij_id
+    const int cp_ij_id,
+    const double cutoff
 ) {
     const ContractionProdType* cp_ij = bpcache->cptype + cp_ij_id;
     const int i_l = cp_ij->l_bra;
@@ -371,6 +380,7 @@ int GINTfill_int3c_overlap_amplitude_contracted(
     const int nprim_ij = cp_ij->nprim_12;
 
     checkCudaErrors(cudaMemcpyToSymbol(c_bpcache, bpcache, sizeof(BasisProdCache)));
+    checkCudaErrors(cudaMemcpyToSymbol(c_overlap_cutoff, &cutoff, sizeof(double)));
 
     const int* bas_pairs_locs = bpcache->bas_pairs_locs;
     const int* primitive_pairs_locs = bpcache->primitive_pairs_locs;

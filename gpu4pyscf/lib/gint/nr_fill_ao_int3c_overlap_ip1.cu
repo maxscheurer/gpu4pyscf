@@ -135,7 +135,8 @@ int GINTfill_int3c_overlap_ip1_amplitude_contracted(
     const int nao,
     const int* bins_locs_ij,
     int nbins,
-    const int cp_ij_id
+    const int cp_ij_id,
+    const double cutoff
 ) {
     const ContractionProdType* cp_ij = bpcache->cptype + cp_ij_id;
     const int i_l = cp_ij->l_bra;
@@ -144,6 +145,7 @@ int GINTfill_int3c_overlap_ip1_amplitude_contracted(
     const int nprim_ij = cp_ij->nprim_12;
 
     checkCudaErrors(cudaMemcpyToSymbol(c_bpcache, bpcache, sizeof(BasisProdCache)));
+    checkCudaErrors(cudaMemcpyToSymbol(c_overlap_cutoff, &cutoff, sizeof(double)));
 
     const int* bas_pairs_locs = bpcache->bas_pairs_locs;
     const int* primitive_pairs_locs = bpcache->primitive_pairs_locs;

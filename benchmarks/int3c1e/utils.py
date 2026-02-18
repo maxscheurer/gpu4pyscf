@@ -122,8 +122,12 @@ def compute_int3c_overlap_cpu(mol, aux_coords, aux_exponents, aux_l=0, aux_cart=
     # aux_cart must match mol.cart for PySCF's int3c1e
     assert aux_cart == mol.cart, "aux_cart must match mol.cart"
 
+    # Normalization factor: GPU kernel uses (gamma/zeta)^{3/2} prefactor
+    # instead of (pi/zeta)^{3/2}, so CPU reference must include N_j = (gamma/pi)^{3/2}
+    N_j = (aux_exponents / np.pi) ** 1.5
+
     # Build fake molecule for auxiliary Gaussians
-    gmol = fakemol_for_gaussian(aux_coords, aux_exponents, l=aux_l, cart=aux_cart)
+    gmol = fakemol_for_gaussian(aux_coords, aux_exponents, l=aux_l, cart=aux_cart, coeffs=N_j)
 
     # Create supermolecule and compute integrals
     supermol = mol + gmol

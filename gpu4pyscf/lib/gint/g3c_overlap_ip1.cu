@@ -149,12 +149,12 @@ __global__ void GINTfill_int3c_overlap_ip1_amplitude_contracted_kernel_general(
             const double PCx = Px - Cx, PCy = Py - Cy, PCz = Pz - Cz;
             const double PC2 = PCx * PCx + PCy * PCy + PCz * PCz;
 
-            const double pi_over_zeta = M_PI * inv_zeta;
-            const double prefactor = sqrt(pi_over_zeta) * pi_over_zeta
+            const double gamma_over_zeta = gamma * inv_zeta;
+            const double prefactor = sqrt(gamma_over_zeta) * gamma_over_zeta
                                    * exp(-aij * gamma * inv_zeta * PC2)
                                    * coeff_ij;
 
-            if (fabs(prefactor) < PRIMITIVE_OVERLAP_CUTOFF) continue;
+            if (fabs(prefactor) < c_overlap_cutoff) continue;
 
             const double inv_2zeta = 0.5 * inv_zeta;
 
@@ -260,15 +260,15 @@ __global__ void GINTfill_int3c_overlap_ip1_amplitude_contracted_kernel_general(
 
             double fval;
             fval = fock_ij_x[bra_idx];
-            if (fabs(fval) >= PRIMITIVE_OVERLAP_CUTOFF)
+            if (fabs(fval) >= c_overlap_cutoff)
                 atomicAdd(&fock_x[fock_idx], fval);
 
             fval = fock_ij_y[bra_idx];
-            if (fabs(fval) >= PRIMITIVE_OVERLAP_CUTOFF)
+            if (fabs(fval) >= c_overlap_cutoff)
                 atomicAdd(&fock_y[fock_idx], fval);
 
             fval = fock_ij_z[bra_idx];
-            if (fabs(fval) >= PRIMITIVE_OVERLAP_CUTOFF)
+            if (fabs(fval) >= c_overlap_cutoff)
                 atomicAdd(&fock_z[fock_idx], fval);
         }
     }
@@ -284,15 +284,15 @@ __global__ void GINTfill_int3c_overlap_ip1_amplitude_contracted_kernel_general(
 
                 double fval;
                 fval = fock_ji_x[ket_idx];
-                if (fabs(fval) >= PRIMITIVE_OVERLAP_CUTOFF)
+                if (fabs(fval) >= c_overlap_cutoff)
                     atomicAdd(&fock_x[fock_idx], fval);
 
                 fval = fock_ji_y[ket_idx];
-                if (fabs(fval) >= PRIMITIVE_OVERLAP_CUTOFF)
+                if (fabs(fval) >= c_overlap_cutoff)
                     atomicAdd(&fock_y[fock_idx], fval);
 
                 fval = fock_ji_z[ket_idx];
-                if (fabs(fval) >= PRIMITIVE_OVERLAP_CUTOFF)
+                if (fabs(fval) >= c_overlap_cutoff)
                     atomicAdd(&fock_z[fock_idx], fval);
             }
         }

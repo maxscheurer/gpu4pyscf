@@ -428,19 +428,20 @@ def gostshyp_kernel_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110, scal
         atom_idx[p0:p1] = ia
 
     ref_coords = atom_coords[atom_idx]
-    dr = grid_coords - ref_coords
+    dr = ref_coords - grid_coords
     dr_norm = np.linalg.norm(dr, axis=1, keepdims=True)
     surface_normals = dr / dr_norm
 
     # Compute widths
     widths = np.pi * np.log(2) / areas
+    N_j = (widths / np.pi) ** 1.5  # normalization factor
     nao = mol.nao
     n_gaussian = len(areas)
 
     # Build fakemols for full surface (integrals computed via shell slicing)
-    gmol = fakemol_for_gaussian(grid_coords, widths, l=0, cart=mol.cart)
+    gmol = fakemol_for_gaussian(grid_coords, widths, l=0, cart=mol.cart, coeffs=N_j)
     gmol_p = fakemol_for_gaussian(grid_coords, widths, l=1, cart=mol.cart,
-                                   coeffs=2.0 * widths)
+                                   coeffs=2.0 * widths * N_j)
     supermol = mol + gmol
     supermol_p = mol + gmol_p
 
@@ -584,17 +585,18 @@ def gostshyp_gradient_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110,
         atom_idx[p0:p1] = ia
 
     ref_coords = atom_coords[atom_idx]
-    dr = grid_coords - ref_coords
+    dr = ref_coords - grid_coords
     dr_norm = np.linalg.norm(dr, axis=1, keepdims=True)
     surface_normals = dr / dr_norm
     widths = np.pi * np.log(2) / areas
+    N_j = (widths / np.pi) ** 1.5  # normalization factor
     nao = mol.nao
     n_gaussian = len(areas)
 
     # Energy quantities
-    gmol = fakemol_for_gaussian(grid_coords, widths, l=0, cart=mol.cart)
+    gmol = fakemol_for_gaussian(grid_coords, widths, l=0, cart=mol.cart, coeffs=N_j)
     gmol_p = fakemol_for_gaussian(grid_coords, widths, l=1, cart=mol.cart,
-                                   coeffs=2.0 * widths)
+                                   coeffs=2.0 * widths * N_j)
     supermol = mol + gmol
     supermol_p = mol + gmol_p
     slices = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol.nbas)
@@ -643,7 +645,7 @@ def gostshyp_gradient_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110,
     gtilde_operator_grad *= -1.0
 
     gmol_d = fakemol_for_gaussian(grid_coords, widths, l=2,
-                                   coeffs=wgrad_prefs * amplitudes, cart=True)
+                                   coeffs=wgrad_prefs * amplitudes * N_j, cart=True)
     supermol_d = mol + gmol_d
     supermol_d.cart = True
     slices_d = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_d.nbas)
@@ -661,7 +663,7 @@ def gostshyp_gradient_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110,
 
     # dE3
     coeffs = -2.0 * pressure_au * areas * gtilde_expval * widths / (forces * forces)
-    gmol_p2 = fakemol_for_gaussian(grid_coords, widths, l=1, coeffs=coeffs)
+    gmol_p2 = fakemol_for_gaussian(grid_coords, widths, l=1, coeffs=coeffs * N_j)
     supermol_p2 = mol + gmol_p2
     slices_p2 = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_p2.nbas)
     dpq = supermol_p2.intor("int3c1e_ip1", shls_slice=slices_p2).reshape(
@@ -680,7 +682,7 @@ def gostshyp_gradient_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110,
     force_operator_grad *= -1.0
 
     f_coeffs_val = -2.0 * widths * wgrad_prefs
-    gmol_f = fakemol_for_gaussian(grid_coords, widths, l=3, coeffs=f_coeffs_val,
+    gmol_f = fakemol_for_gaussian(grid_coords, widths, l=3, coeffs=f_coeffs_val * N_j,
                                    cart=True)
     supermol_f = mol + gmol_f
     supermol_f.cart = True

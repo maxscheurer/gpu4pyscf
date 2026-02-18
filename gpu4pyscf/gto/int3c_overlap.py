@@ -49,7 +49,7 @@ def _get_aux_counts(aux_l, aux_cart):
     return ncart_aux, nsph_aux, naux
 
 
-def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt, aux_cart=True):
+def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt, aux_cart=True, cutoff=1e-14):
     """
     Compute 3-center overlap integrals with GPU acceleration.
 
@@ -151,7 +151,8 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt, aux_cart=Tr
                     ao_offsets.ctypes.data_as(ctypes.c_void_p),
                     bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
                     ctypes.c_int(nbins),
-                    ctypes.c_int(cp_ij_id))
+                    ctypes.c_int(cp_ij_id),
+                    ctypes.c_double(cutoff))
 
             if err != 0:
                 raise RuntimeError(f'GINTfill_int3c_overlap failed with error {err}')
@@ -193,7 +194,7 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt, aux_cart=Tr
     return int3c.reshape([ngrids, naux, nao, nao])
 
 
-def get_int3c_overlap_density_contracted(mol, aux_coords, aux_exponents, aux_l, dm, intopt):
+def get_int3c_overlap_density_contracted(mol, aux_coords, aux_exponents, aux_l, dm, intopt, cutoff=1e-14):
     """
     Compute density-contracted 3-center overlap: sum_ij D_ij * S_ijk
 
@@ -266,7 +267,8 @@ def get_int3c_overlap_density_contracted(mol, aux_coords, aux_exponents, aux_l, 
                 ctypes.c_int(nao_cart),
                 bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
                 ctypes.c_int(nbins),
-                ctypes.c_int(cp_ij_id))
+                ctypes.c_int(cp_ij_id),
+                ctypes.c_double(cutoff))
 
         if err != 0:
             raise RuntimeError(f'GINTfill_int3c_overlap_density_contracted failed with error {err}')
@@ -278,7 +280,7 @@ def get_int3c_overlap_density_contracted(mol, aux_coords, aux_exponents, aux_l, 
     return forces.reshape([ngrids, ncart_aux])
 
 
-def get_int3c_overlap_amplitude_contracted(mol, aux_coords, aux_exponents, aux_l, amplitudes, intopt):
+def get_int3c_overlap_amplitude_contracted(mol, aux_coords, aux_exponents, aux_l, amplitudes, intopt, cutoff=1e-14):
     """
     Compute amplitude-contracted 3-center overlap: sum_k a_k * S_ijk
 
@@ -343,7 +345,8 @@ def get_int3c_overlap_amplitude_contracted(mol, aux_coords, aux_exponents, aux_l
                 ctypes.c_int(nao_cart),
                 bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
                 ctypes.c_int(nbins),
-                ctypes.c_int(cp_ij_id))
+                ctypes.c_int(cp_ij_id),
+                ctypes.c_double(cutoff))
 
         if err != 0:
             raise RuntimeError(f'GINTfill_int3c_overlap_amplitude_contracted failed with error {err}')
@@ -367,7 +370,8 @@ def get_int3c_overlap_amplitude_contracted(mol, aux_coords, aux_exponents, aux_l
 
 
 def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, aux_cart=True,
-                  dm=None, amplitudes=None, direct_scf_tol=1e-13, intopt=None):
+                  dm=None, amplitudes=None, direct_scf_tol=1e-13, intopt=None,
+                  cutoff=1e-14):
     """
     Main interface for 3-center overlap integrals.
 
@@ -415,10 +419,10 @@ def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, aux_cart=True,
         "Cannot contract with both dm and amplitudes simultaneously"
 
     if dm is None and amplitudes is None:
-        return get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt, aux_cart)
+        return get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt, aux_cart, cutoff)
     elif dm is not None:
         return get_int3c_overlap_density_contracted(
-            mol, aux_coords, aux_exponents, aux_l, dm, intopt)
+            mol, aux_coords, aux_exponents, aux_l, dm, intopt, cutoff)
     else:
         return get_int3c_overlap_amplitude_contracted(
-            mol, aux_coords, aux_exponents, aux_l, amplitudes, intopt)
+            mol, aux_coords, aux_exponents, aux_l, amplitudes, intopt, cutoff)

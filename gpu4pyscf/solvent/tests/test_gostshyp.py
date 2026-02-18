@@ -98,13 +98,14 @@ def gostshyp_kernel_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110, scal
 
     # Compute widths
     widths = np.pi * np.log(2) / areas
+    N_j = (widths / np.pi) ** 1.5  # normalization factor
     nao = mol.nao
     n_gaussian = len(areas)
 
     # Build fakemols for integrals
-    gmol = fakemol_for_gaussian(grid_coords, widths, l=0, cart=mol.cart)
+    gmol = fakemol_for_gaussian(grid_coords, widths, l=0, cart=mol.cart, coeffs=N_j)
     gmol_p = fakemol_for_gaussian(grid_coords, widths, l=1, cart=mol.cart,
-                                   coeffs=2.0 * widths)
+                                   coeffs=2.0 * widths * N_j)
     supermol = mol + gmol
     supermol_p = mol + gmol_p
 
@@ -300,6 +301,36 @@ class TestGOSTSHYPSCF(unittest.TestCase):
         e_tot = mf.kernel()
         self.assertTrue(mf.converged, "UHF+GOSTSHYP did not converge")
 
+    def test_custom_cutoff(self):
+        """Test GOSTSHYP with a custom overlap_cutoff converges and gives reasonable energy."""
+        mol = gto.M(
+            atom='H 1 0 0; F 2 0 0',
+            basis='6-31g',
+            cart=True,
+            verbose=0
+        )
+
+        # Run with default cutoff
+        mf_default = scf.RHF(mol)
+        mf_default.conv_tol = 1e-10
+        sol_default = GOSTSHYP(mol)
+        mf_default = _attach_solvent._for_scf(mf_default, sol_default)
+        e_default = mf_default.kernel()
+        self.assertTrue(mf_default.converged, "SCF with default cutoff did not converge")
+
+        # Run with tighter cutoff (1e-14)
+        mf_tight = scf.RHF(mol)
+        mf_tight.conv_tol = 1e-10
+        sol_tight = GOSTSHYP(mol)
+        sol_tight.overlap_cutoff = 1e-14
+        mf_tight = _attach_solvent._for_scf(mf_tight, sol_tight)
+        e_tight = mf_tight.kernel()
+        self.assertTrue(mf_tight.converged, "SCF with cutoff=1e-14 did not converge")
+
+        # Energies should be very close (cutoff only affects negligible integrals)
+        np.testing.assert_allclose(e_tight, e_default, atol=1e-7,
+                                   err_msg="Energy with cutoff=1e-14 differs from default")
+
     def test_different_pressure(self):
         """Test GOSTSHYP with different pressure values."""
         mol = gto.M(
@@ -448,13 +479,14 @@ def gostshyp_gradient_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110, sc
     dr_norm = np.linalg.norm(dr, axis=1, keepdims=True)
     surface_normals = dr / dr_norm
     widths = np.pi * np.log(2) / areas
+    N_j = (widths / np.pi) ** 1.5  # normalization factor
     nao = mol.nao
     n_gaussian = len(areas)
 
     # Energy quantities
-    gmol = fakemol_for_gaussian(grid_coords, widths, l=0, cart=mol.cart)
+    gmol = fakemol_for_gaussian(grid_coords, widths, l=0, cart=mol.cart, coeffs=N_j)
     gmol_p = fakemol_for_gaussian(grid_coords, widths, l=1, cart=mol.cart,
-                                   coeffs=2.0 * widths)
+                                   coeffs=2.0 * widths * N_j)
     supermol = mol + gmol
     supermol_p = mol + gmol_p
     slices = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol.nbas)
@@ -499,7 +531,7 @@ def gostshyp_gradient_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110, sc
 
     wgrad_prefs = -np.pi * np.log(2) / (areas ** 2)
     gmol_d = fakemol_for_gaussian(grid_coords, widths, l=2,
-                                   coeffs=wgrad_prefs * amplitudes, cart=True)
+                                   coeffs=wgrad_prefs * amplitudes * N_j, cart=True)
     supermol_d = mol + gmol_d
     supermol_d.cart = True
     slices_d = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_d.nbas)
@@ -516,7 +548,7 @@ def gostshyp_gradient_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110, sc
 
     # dE3
     coeffs = -2.0 * pressure_au * areas * gtilde_expval * widths / (forces * forces)
-    gmol_p2 = fakemol_for_gaussian(grid_coords, widths, l=1, coeffs=coeffs)
+    gmol_p2 = fakemol_for_gaussian(grid_coords, widths, l=1, coeffs=coeffs * N_j)
     supermol_p2 = mol + gmol_p2
     slices_p2 = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_p2.nbas)
     dpq = supermol_p2.intor("int3c1e_ip1", shls_slice=slices_p2).reshape(
@@ -535,7 +567,7 @@ def gostshyp_gradient_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110, sc
     force_operator_grad *= -1.0
 
     f_coeffs_val = -2.0 * widths * wgrad_prefs
-    gmol_f = fakemol_for_gaussian(grid_coords, widths, l=3, coeffs=f_coeffs_val, cart=True)
+    gmol_f = fakemol_for_gaussian(grid_coords, widths, l=3, coeffs=f_coeffs_val * N_j, cart=True)
     supermol_f = mol + gmol_f
     supermol_f.cart = True
     slices_f = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_f.nbas)
