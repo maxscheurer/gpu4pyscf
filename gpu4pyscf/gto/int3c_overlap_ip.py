@@ -84,6 +84,9 @@ def get_int3c_overlap_ip1_amplitude_contracted(
     fock_y = cp.zeros([nao_cart, nao_cart], dtype=np.float64, order='C')
     fock_z = cp.zeros([nao_cart, nao_cart], dtype=np.float64, order='C')
 
+    # Set constant memory once before the kernel loop
+    libgint.GINTset_int3c_overlap_constants(intopt.bpcache, ctypes.c_double(cutoff))
+
     n_streams = min(4, len(intopt.log_qs))
     streams = [cp.cuda.Stream(non_blocking=True) for _ in range(max(1, n_streams))]
 

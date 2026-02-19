@@ -247,6 +247,19 @@ static int GINTfill_int3c_overlap_amplitude_contracted_tasks(
 extern "C" {
 
 /*
+ * Set constant memory for overlap kernels once, before the cp_ij_id loop.
+ * This avoids redundant cudaMemcpyToSymbol calls per kernel launch.
+ */
+int GINTset_int3c_overlap_constants(
+    const BasisProdCache* bpcache,
+    const double cutoff
+) {
+    checkCudaErrors(cudaMemcpyToSymbol(c_bpcache, bpcache, sizeof(BasisProdCache)));
+    checkCudaErrors(cudaMemcpyToSymbol(c_overlap_cutoff, &cutoff, sizeof(double)));
+    return 0;
+}
+
+/*
  * Compute full 3-center overlap integral tensor.
  */
 int GINTfill_int3c_overlap(
@@ -269,9 +282,6 @@ int GINTfill_int3c_overlap(
     const int j_l = cp_ij->l_ket;
     const int k_l = aux_l;
     const int nprim_ij = cp_ij->nprim_12;
-
-    checkCudaErrors(cudaMemcpyToSymbol(c_bpcache, bpcache, sizeof(BasisProdCache)));
-    checkCudaErrors(cudaMemcpyToSymbol(c_overlap_cutoff, &cutoff, sizeof(double)));
 
     const int* bas_pairs_locs = bpcache->bas_pairs_locs;
     const int* primitive_pairs_locs = bpcache->primitive_pairs_locs;
@@ -325,9 +335,6 @@ int GINTfill_int3c_overlap_density_contracted(
     const int k_l = aux_l;
     const int nprim_ij = cp_ij->nprim_12;
 
-    checkCudaErrors(cudaMemcpyToSymbol(c_bpcache, bpcache, sizeof(BasisProdCache)));
-    checkCudaErrors(cudaMemcpyToSymbol(c_overlap_cutoff, &cutoff, sizeof(double)));
-
     const int* bas_pairs_locs = bpcache->bas_pairs_locs;
     const int* primitive_pairs_locs = bpcache->primitive_pairs_locs;
 
@@ -378,9 +385,6 @@ int GINTfill_int3c_overlap_amplitude_contracted(
     const int j_l = cp_ij->l_ket;
     const int k_l = aux_l;
     const int nprim_ij = cp_ij->nprim_12;
-
-    checkCudaErrors(cudaMemcpyToSymbol(c_bpcache, bpcache, sizeof(BasisProdCache)));
-    checkCudaErrors(cudaMemcpyToSymbol(c_overlap_cutoff, &cutoff, sizeof(double)));
 
     const int* bas_pairs_locs = bpcache->bas_pairs_locs;
     const int* primitive_pairs_locs = bpcache->primitive_pairs_locs;

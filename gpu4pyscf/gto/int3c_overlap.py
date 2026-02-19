@@ -103,6 +103,9 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt, aux_cart=Tr
     aux_coords_gpu = cp.asarray(aux_coords, dtype=np.float64, order='C')
     aux_exponents_gpu = cp.asarray(aux_exponents, dtype=np.float64, order='C')
 
+    # Set constant memory once before the kernel loop
+    libgint.GINTset_int3c_overlap_constants(intopt.bpcache, ctypes.c_double(cutoff))
+
     # Create stream pool for concurrent kernel launches
     n_streams = min(4, len(intopt.log_qs))
     streams = [cp.cuda.Stream(non_blocking=True) for _ in range(max(1, n_streams))]
@@ -240,6 +243,9 @@ def get_int3c_overlap_density_contracted(mol, aux_coords, aux_exponents, aux_l, 
     aux_exponents_gpu = cp.asarray(aux_exponents, dtype=np.float64, order='C')
     forces = cp.zeros(ngrids * ncart_aux, dtype=np.float64)
 
+    # Set constant memory once before the kernel loop
+    libgint.GINTset_int3c_overlap_constants(intopt.bpcache, ctypes.c_double(cutoff))
+
     # Create stream pool for concurrent kernel launches
     n_streams = min(4, len(intopt.log_qs))
     streams = [cp.cuda.Stream(non_blocking=True) for _ in range(max(1, n_streams))]
@@ -317,6 +323,9 @@ def get_int3c_overlap_amplitude_contracted(mol, aux_coords, aux_exponents, aux_l
 
     nao_cart = intopt._sorted_mol.nao
     fock_cart = cp.zeros([nao_cart, nao_cart], dtype=np.float64, order='C')
+
+    # Set constant memory once before the kernel loop
+    libgint.GINTset_int3c_overlap_constants(intopt.bpcache, ctypes.c_double(cutoff))
 
     # Create stream pool for concurrent kernel launches
     n_streams = min(4, len(intopt.log_qs))
