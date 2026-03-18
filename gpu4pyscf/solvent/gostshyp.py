@@ -72,7 +72,7 @@ class GOSTSHYP(lib.StreamObject):
         'mol', 'pressure_mpa', 'npoints', 'scaling_factor',
         'surface', 'intopt', 'frozen', 'equilibrium_solvation',
         'e', 'v', 'amplitudes', 'forces', 'gtilde_expval',
-        'overlap_cutoff'
+        'overlap_cutoff', 'cavity', 'r_ext',
     }
 
     def __init__(self, mol, options=None):
@@ -88,6 +88,8 @@ class GOSTSHYP(lib.StreamObject):
         self.npoints = options.get('npoints', 110)
         self.scaling_factor = options.get('scaling_factor', 1.2)
         self.overlap_cutoff = options.get('overlap_cutoff', 1e-14)
+        self.cavity = options.get('cavity', 'vdw/occ')     # 'vdw' or 'vdw/occ'
+        self.r_ext = options.get('r_ext', 0.4724)          # Bohr (0.25 Ang)
 
         # Internal state
         self.surface = {}
@@ -122,6 +124,9 @@ class GOSTSHYP(lib.StreamObject):
         logger.info(self, 'npoints = %d', self.npoints)
         logger.info(self, 'scaling_factor = %.2f', self.scaling_factor)
         logger.info(self, 'overlap_cutoff = %.2e', self.overlap_cutoff)
+        logger.info(self, 'cavity = %s', self.cavity)
+        if self.cavity == 'vdw/occ':
+            logger.info(self, 'r_ext = %.4f Bohr (%.4f Ang)', self.r_ext, self.r_ext * 0.529177)
         logger.info(self, 'frozen = %s', self.frozen)
         logger.info(self, 'equilibrium_solvation = %s', self.equilibrium_solvation)
         if self.surface:
@@ -144,7 +149,32 @@ class GOSTSHYP(lib.StreamObject):
 
         # Generate surface using PCM infrastructure
         rad = self.scaling_factor * modified_Bondi
-        self.surface = gen_surface(mol, ng=self.npoints, rad=rad)
+
+        if self.cavity == 'vdw/occ':
+            r_ext = self.r_ext
+            # Build OUTER surface (inflated radii) -- switching is crevice-free
+            rad_outer = rad + r_ext  # add r_ext to all elements
+            self.surface = gen_surface(mol, ng=self.npoints, rad=rad_outer)
+
+            # Project grid coords inward to actual vdW surface
+            norm_vec = self.surface['norm_vec']        # Lebedev unit vectors (outward)
+            grid_outer = self.surface['grid_coords']   # outer positions (cupy)
+            grid_inner = grid_outer - r_ext * norm_vec # inner positions (cupy)
+
+            # Scale areas: w * R_inner^2 * swf_outer (instead of w * R_outer^2 * swf_outer)
+            R_outer_per_grid = self.surface['R_vdw']   # per-grid outer radius
+            R_inner_per_grid = R_outer_per_grid - r_ext
+            ratio_sq = (R_inner_per_grid / R_outer_per_grid) ** 2
+            area_occ = self.surface['area'] * ratio_sq
+
+            # Store both sets of coords; GOSTSHYP energy uses inner, gradient uses outer
+            self.surface['grid_coords_outer'] = grid_outer  # for get_dF_dA
+            self.surface['grid_coords'] = grid_inner         # for overlap integrals
+            self.surface['area'] = area_occ
+            self.surface['R_vdw'] = R_inner_per_grid         # inner radii
+        else:
+            # Plain vdW (current behavior, unchanged)
+            self.surface = gen_surface(mol, ng=self.npoints, rad=rad)
 
         # Compute Gaussian widths from areas (eq. 4 in GOSTSHYP paper)
         # width = pi * ln(2) / area
@@ -273,10 +303,6 @@ class GOSTSHYP(lib.StreamObject):
             mol, self.grid_coords, self.widths, aux_l=1, dm=dm, intopt=self.intopt, cutoff=cutoff)
         forces = cp.sum(p_contracted * self.surface_normals * p_coeffs[:, None], axis=1)
 
-        if cp.any(forces <= 0):
-            logger.warn(self, 'GOSTSHYP: Some forces are non-positive, '
-                        'results may be unreliable')
-
         # Step 2: Compute amplitudes = P * A_g / forces
         amplitudes = self.pressure_au * self.areas / forces
 
@@ -289,6 +315,24 @@ class GOSTSHYP(lib.StreamObject):
         s_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
             mol, self.grid_coords, self.widths, aux_l=0, dm=dm, intopt=self.intopt, cutoff=cutoff)
         gtilde_expval = s_contracted[:, 0]
+
+        # Check negative forces: only warn if their energy contribution > 1%
+        neg_mask = forces <= 0
+        if cp.any(neg_mask):
+            neg_contrib = cp.sum(amplitudes[neg_mask] * gtilde_expval[neg_mask])
+            total_contrib = cp.sum(amplitudes * gtilde_expval)
+            if abs(float(total_contrib)) > 0:
+                frac = abs(float(neg_contrib)) / abs(float(total_contrib))
+            else:
+                frac = 0.0
+            n_neg = int(cp.sum(neg_mask))
+            if frac > 0.01:
+                logger.warn(self, 'GOSTSHYP: %d grid points have non-positive '
+                            'forces (%.1f%% of energy), results may be unreliable',
+                            n_neg, 100.0 * frac)
+            else:
+                logger.debug(self, 'GOSTSHYP: %d grid points have non-positive '
+                             'forces (%.4f%% of energy)', n_neg, 100.0 * frac)
 
         # Step 5: Fock term 2 via amplitude-contracted p-type integrals
         response_coeff = -self.pressure_au * self.areas * gtilde_expval / (forces ** 2)

@@ -24,7 +24,7 @@ The GOSTSHYP gradient dE/dR has three contributions:
 import numpy as np
 import cupy as cp
 from pyscf import lib
-from pyscf.solvent.grad.pcm import get_dF_dA
+from gpu4pyscf.solvent.grad.pcm import get_dF_dA
 from gpu4pyscf.gto import int3c_overlap
 from gpu4pyscf.gto import int3c_overlap_ip
 from gpu4pyscf.lib import logger
@@ -96,20 +96,21 @@ class Gradients(lib.StreamObject):
         ngrids = len(areas)
         aoslice = mol.aoslice_by_atom()
 
-        # ---- Area derivatives (CPU — PCM infrastructure) ----
-        # get_dF_dA is a CPU function; pull the minimal surface data needed.
+        # ---- Area derivatives (GPU — PCM infrastructure) ----
+        # Use outer grid coords for switching gradient (OCC), inner coords otherwise
+        gc_for_switching = gostshyp.surface.get('grid_coords_outer', grid_coords)
         surface_dict = {
-            'grid_coords': cp.asnumpy(grid_coords),
-            'area': cp.asnumpy(areas),
+            'grid_coords': gc_for_switching,
+            'area': areas,
             'gslice_by_atom': gostshyp.surface['gslice_by_atom'],
-            'R_vdw': cp.asnumpy(gostshyp.surface['R_vdw']),
-            'switch_fun': cp.asnumpy(gostshyp.surface['switch_fun']),
-            'R_in_J': cp.asnumpy(gostshyp.surface['R_in_J']),
-            'R_sw_J': cp.asnumpy(gostshyp.surface['R_sw_J']),
-            'atom_coords': cp.asnumpy(gostshyp.surface['atom_coords']),
+            'R_vdw': gostshyp.surface['R_vdw'],
+            'switch_fun': gostshyp.surface['switch_fun'],
+            'R_in_J': gostshyp.surface['R_in_J'],
+            'R_sw_J': gostshyp.surface['R_sw_J'],
+            'atom_coords': gostshyp.surface['atom_coords'],
         }
-        _, dareas_np = get_dF_dA(surface_dict)
-        dareas = cp.asarray(dareas_np.transpose(1, 2, 0))  # [natm, 3, ngrids] on GPU
+        _, dareas = get_dF_dA(surface_dict)
+        dareas = dareas.transpose(2, 0, 1)  # [3, ngrids, natm] -> [natm, 3, ngrids]
 
         # Width gradient prefactors
         wgrad_prefs = -cp.float64(np.pi * np.log(2)) / (areas ** 2)

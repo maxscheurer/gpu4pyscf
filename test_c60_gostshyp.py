@@ -19,7 +19,7 @@ print(f'{"="*70}')
 mempool = cp.get_default_memory_pool()
 
 # RHF + GOSTSHYP SCF
-mf = scf.RHF(mol).density_fit("def2-universal-jkfit")
+mf = scf.RHF(mol)#.density_fit("def2-universal-jkfit")
 mf = mf.GOSTSHYP()
 
 mf.max_cycle = 100
