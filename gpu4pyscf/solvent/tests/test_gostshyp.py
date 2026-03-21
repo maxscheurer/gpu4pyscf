@@ -168,7 +168,7 @@ class TestGOSTSHYPKernel(unittest.TestCase):
 
     def test_energy_hf(self):
         """Test GOSTSHYP energy matches CPU reference for HF molecule."""
-        gostshyp_gpu = GOSTSHYP(self.mol_hf)
+        gostshyp_gpu = GOSTSHYP(self.mol_hf, options={'cavity': 'vdw'})
         gostshyp_gpu.build()
 
         np.random.seed(42)
@@ -191,7 +191,7 @@ class TestGOSTSHYPKernel(unittest.TestCase):
 
     def test_forces_hf(self):
         """Test GOSTSHYP forces match CPU reference."""
-        gostshyp_gpu = GOSTSHYP(self.mol_hf)
+        gostshyp_gpu = GOSTSHYP(self.mol_hf, options={'cavity': 'vdw'})
         gostshyp_gpu.build()
 
         np.random.seed(42)
@@ -209,7 +209,7 @@ class TestGOSTSHYPKernel(unittest.TestCase):
 
     def test_amplitudes_hf(self):
         """Test GOSTSHYP amplitudes match CPU reference."""
-        gostshyp_gpu = GOSTSHYP(self.mol_hf)
+        gostshyp_gpu = GOSTSHYP(self.mol_hf, options={'cavity': 'vdw'})
         gostshyp_gpu.build()
 
         np.random.seed(42)
@@ -237,7 +237,7 @@ class TestGOSTSHYPKernel(unittest.TestCase):
             verbose=0
         )
 
-        gostshyp_gpu = GOSTSHYP(mol_sph)
+        gostshyp_gpu = GOSTSHYP(mol_sph, options={'cavity': 'vdw'})
         gostshyp_gpu.build()
 
         np.random.seed(42)
@@ -271,15 +271,14 @@ class TestGOSTSHYPSCF(unittest.TestCase):
         mf = scf.RHF(mol)
         mf.conv_tol = 1e-10
 
-        gostshyp = GOSTSHYP(mol)
+        gostshyp = GOSTSHYP(mol, options={'cavity': 'vdw'})
         mf = _attach_solvent._for_scf(mf, gostshyp)
 
         e_tot = mf.kernel()
 
         self.assertTrue(mf.converged, "SCF did not converge")
 
-        # Reference energy: HF/6-31g with GOSTSHYP 50GPa
-        # Computed using both GPU and CPU implementations with proper energy accounting
+        # Reference energy: HF/6-31g with GOSTSHYP 50GPa, vdw cavity
         np.testing.assert_allclose(e_tot, -99.8941733641653, atol=1e-7,
                                    err_msg="SCF energy does not match reference")
 
@@ -615,9 +614,12 @@ class TestGOSTSHYPGradient(unittest.TestCase):
             verbose=0
         )
 
-    def _compute_gpu_gradient(self, mol, dm):
+    def _compute_gpu_gradient(self, mol, dm, cavity=None):
         from gpu4pyscf.solvent.grad.gostshyp import Gradients as GOSTSHYPGradients
-        gostshyp = GOSTSHYP(mol)
+        opts = {}
+        if cavity is not None:
+            opts['cavity'] = cavity
+        gostshyp = GOSTSHYP(mol, options=opts)
         gostshyp.build()
         gostshyp.kernel(dm)
         return GOSTSHYPGradients(gostshyp).kernel(dm)
@@ -629,7 +631,7 @@ class TestGOSTSHYPGradient(unittest.TestCase):
         dm = np.random.randn(nao, nao)
         dm = (dm + dm.T) / 2
 
-        grad_gpu = self._compute_gpu_gradient(self.mol_hf, dm)
+        grad_gpu = self._compute_gpu_gradient(self.mol_hf, dm, cavity='vdw')
         grad_cpu = gostshyp_gradient_cpu_reference(self.mol_hf, dm)
 
         np.testing.assert_allclose(grad_gpu, grad_cpu, atol=1e-7, rtol=1e-7,
@@ -648,7 +650,7 @@ class TestGOSTSHYPGradient(unittest.TestCase):
         dm = np.random.randn(nao, nao)
         dm = (dm + dm.T) / 2
 
-        grad_gpu = self._compute_gpu_gradient(mol_sph, dm)
+        grad_gpu = self._compute_gpu_gradient(mol_sph, dm, cavity='vdw')
         grad_cpu = gostshyp_gradient_cpu_reference(mol_sph, dm)
 
         np.testing.assert_allclose(grad_gpu, grad_cpu, atol=1e-7, rtol=1e-7,
@@ -661,7 +663,7 @@ class TestGOSTSHYPGradient(unittest.TestCase):
         dm = np.random.randn(nao, nao)
         dm = (dm + dm.T) / 2
 
-        grad_gpu = self._compute_gpu_gradient(self.mol_water, dm)
+        grad_gpu = self._compute_gpu_gradient(self.mol_water, dm, cavity='vdw')
         grad_cpu = gostshyp_gradient_cpu_reference(self.mol_water, dm)
 
         np.testing.assert_allclose(grad_gpu, grad_cpu, atol=1e-7, rtol=1e-7,
@@ -680,7 +682,7 @@ class TestGOSTSHYPGradient(unittest.TestCase):
         dm = np.random.randn(nao, nao)
         dm = (dm + dm.T) / 2
 
-        grad_gpu = self._compute_gpu_gradient(mol, dm)
+        grad_gpu = self._compute_gpu_gradient(mol, dm, cavity='vdw')
         grad_cpu = gostshyp_gradient_cpu_reference(mol, dm)
 
         np.testing.assert_allclose(grad_gpu, grad_cpu, atol=1e-7, rtol=1e-7,
@@ -710,7 +712,7 @@ class TestGOSTSHYPGradient(unittest.TestCase):
         mf = scf.RHF(mol)
         mf.conv_tol = 1e-12
         mf.conv_tol_grad = 1e-8
-        gostshyp = GOSTSHYP(mol)
+        gostshyp = GOSTSHYP(mol, options={'cavity': 'vdw'})
         mf = _attach_solvent._for_scf(mf, gostshyp)
         mf.kernel()
 

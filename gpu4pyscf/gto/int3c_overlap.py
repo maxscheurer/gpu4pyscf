@@ -378,6 +378,181 @@ def get_int3c_overlap_amplitude_contracted(mol, aux_coords, aux_exponents, aux_l
     return fock
 
 
+def get_int3c_overlap_density_contracted_sp(mol, aux_coords, aux_exponents, dm, intopt, cutoff=1e-14):
+    """
+    Fused density-contracted 3-center overlap for s+p in a single kernel pass.
+
+    Computes both s-type (aux_l=0) and p-type (aux_l=1) density contractions
+    simultaneously, sharing the recursion work.
+
+    Parameters
+    ----------
+    mol : pyscf.gto.Mole
+        Molecular object
+    aux_coords : ndarray of shape (ngrids, 3)
+        Coordinates of auxiliary Gaussian centers
+    aux_exponents : ndarray of shape (ngrids,)
+        Exponents of auxiliary Gaussians
+    dm : ndarray of shape (nao, nao)
+        Density matrix
+    intopt : VHFOpt
+        Integral options with precomputed basis pair data
+
+    Returns
+    -------
+    forces_s : ndarray of shape (ngrids, 1)
+        s-type (aux_l=0) contracted integrals
+    forces_p : ndarray of shape (ngrids, 3)
+        p-type (aux_l=1) contracted integrals
+    """
+    nao = mol.nao
+    ngrids = aux_coords.shape[0]
+
+    dm = cp.asarray(dm)
+    assert dm.ndim == 2 and dm.shape[0] == dm.shape[1] == nao
+
+    dm_sorted = intopt.sort_orbitals(dm, [0, 1])
+    if not mol.cart:
+        c2s = intopt.cart2sph
+        dm_sorted = c2s @ dm_sorted @ c2s.T
+
+    nao_cart = intopt._sorted_mol.nao
+    dm_flat = dm_sorted.flatten(order='C')
+
+    aux_coords_gpu = cp.asarray(aux_coords, dtype=np.float64, order='C')
+    aux_exponents_gpu = cp.asarray(aux_exponents, dtype=np.float64, order='C')
+    forces_s = cp.zeros(ngrids, dtype=np.float64)
+    forces_p = cp.zeros(ngrids * 3, dtype=np.float64)
+
+    libgint.GINTset_int3c_overlap_constants(intopt.bpcache, ctypes.c_double(cutoff))
+
+    n_streams = min(4, len(intopt.log_qs))
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(max(1, n_streams))]
+
+    for cp_ij_id, log_q_ij in enumerate(intopt.log_qs):
+        if len(log_q_ij) == 0:
+            continue
+
+        stream = streams[cp_ij_id % len(streams)]
+
+        nbins = 1
+        bins_locs_ij = np.array([0, len(log_q_ij)], dtype=np.int32)
+
+        with stream:
+            err = libgint.GINTfill_int3c_overlap_density_contracted_sp(
+                ctypes.cast(stream.ptr, ctypes.c_void_p),
+                intopt.bpcache,
+                ctypes.cast(aux_coords_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.cast(aux_exponents_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(ngrids),
+                ctypes.cast(dm_flat.data.ptr, ctypes.c_void_p),
+                ctypes.cast(forces_s.data.ptr, ctypes.c_void_p),
+                ctypes.cast(forces_p.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(nao_cart),
+                bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_int(nbins),
+                ctypes.c_int(cp_ij_id),
+                ctypes.c_double(cutoff))
+
+        if err != 0:
+            raise RuntimeError(f'GINTfill_int3c_overlap_density_contracted_sp failed with error {err}')
+
+    for stream in streams:
+        stream.synchronize()
+
+    return forces_s.reshape([ngrids, 1]), forces_p.reshape([ngrids, 3])
+
+
+def get_int3c_overlap_amplitude_contracted_sp(mol, aux_coords, aux_exponents, amp_s, amp_p, intopt, cutoff=1e-14):
+    """
+    Fused amplitude-contracted 3-center overlap for s+p in a single kernel pass.
+
+    Computes fock[i,j] = sum_g (amp_s[g] * S_ij0_g + sum_k amp_p[g,k] * S_ij1k_g)
+
+    Parameters
+    ----------
+    mol : pyscf.gto.Mole
+        Molecular object
+    aux_coords : ndarray of shape (ngrids, 3)
+        Coordinates of auxiliary Gaussian centers
+    aux_exponents : ndarray of shape (ngrids,)
+        Exponents of auxiliary Gaussians
+    amp_s : ndarray of shape (ngrids,)
+        s-type amplitudes (aux_l=0)
+    amp_p : ndarray of shape (ngrids, 3)
+        p-type amplitudes (aux_l=1), Cartesian
+    intopt : VHFOpt
+        Integral options with precomputed basis pair data
+
+    Returns
+    -------
+    fock : ndarray of shape (nao, nao)
+        Fock matrix contribution
+    """
+    nao = mol.nao
+    ngrids = aux_coords.shape[0]
+
+    amp_s_gpu = cp.asarray(amp_s, dtype=np.float64).ravel()
+    amp_p_gpu = cp.asarray(amp_p, dtype=np.float64).ravel()
+    assert amp_s_gpu.shape[0] == ngrids
+    assert amp_p_gpu.shape[0] == ngrids * 3
+
+    aux_coords_gpu = cp.asarray(aux_coords, dtype=np.float64, order='C')
+    aux_exponents_gpu = cp.asarray(aux_exponents, dtype=np.float64, order='C')
+
+    nao_cart = intopt._sorted_mol.nao
+    fock_cart = cp.zeros([nao_cart, nao_cart], dtype=np.float64, order='C')
+
+    libgint.GINTset_int3c_overlap_constants(intopt.bpcache, ctypes.c_double(cutoff))
+
+    n_streams = min(4, len(intopt.log_qs))
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(max(1, n_streams))]
+
+    for cp_ij_id, log_q_ij in enumerate(intopt.log_qs):
+        if len(log_q_ij) == 0:
+            continue
+
+        stream = streams[cp_ij_id % len(streams)]
+
+        nbins = 1
+        bins_locs_ij = np.array([0, len(log_q_ij)], dtype=np.int32)
+
+        with stream:
+            err = libgint.GINTfill_int3c_overlap_amplitude_contracted_sp(
+                ctypes.cast(stream.ptr, ctypes.c_void_p),
+                intopt.bpcache,
+                ctypes.cast(aux_coords_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.cast(aux_exponents_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(ngrids),
+                ctypes.cast(amp_s_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.cast(amp_p_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.cast(fock_cart.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(nao_cart),
+                bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_int(nbins),
+                ctypes.c_int(cp_ij_id),
+                ctypes.c_double(cutoff))
+
+        if err != 0:
+            raise RuntimeError(f'GINTfill_int3c_overlap_amplitude_contracted_sp failed with error {err}')
+
+    for stream in streams:
+        stream.synchronize()
+
+    # Symmetrize
+    row, col = np.tril_indices(nao_cart)
+    fock_cart[row, col] = fock_cart[col, row]
+
+    # Convert to spherical if needed
+    if not mol.cart:
+        c2s = intopt.cart2sph
+        fock_cart = c2s.T @ fock_cart @ c2s
+
+    # Unsort orbitals
+    fock = intopt.unsort_orbitals(fock_cart, axis=[0, 1])
+    return fock
+
+
 def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, aux_cart=True,
                   dm=None, amplitudes=None, direct_scf_tol=1e-13, intopt=None,
                   cutoff=1e-14):

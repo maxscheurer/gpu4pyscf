@@ -298,23 +298,14 @@ class GOSTSHYP(lib.StreamObject):
 
         cutoff = self.overlap_cutoff
 
-        # Step 1: Forces via density-contracted p-type integrals
-        p_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, self.grid_coords, self.widths, aux_l=1, dm=dm, intopt=self.intopt, cutoff=cutoff)
+        # Fused pass 1: density-contracted s+p integrals in one kernel pass
+        s_contracted, p_contracted = int3c_overlap.get_int3c_overlap_density_contracted_sp(
+            mol, self.grid_coords, self.widths, dm=dm, intopt=self.intopt, cutoff=cutoff)
+        gtilde_expval = s_contracted[:, 0]
         forces = cp.sum(p_contracted * self.surface_normals * p_coeffs[:, None], axis=1)
 
-        # Step 2: Compute amplitudes = P * A_g / forces
+        # Compute amplitudes = P * A_g / forces
         amplitudes = self.pressure_au * self.areas / forces
-
-        # Step 3: Fock term 1 via amplitude-contracted s-type integrals
-        fock1 = int3c_overlap.get_int3c_overlap_amplitude_contracted(
-            mol, self.grid_coords, self.widths, aux_l=0,
-            amplitudes=amplitudes[:, None], intopt=self.intopt, cutoff=cutoff)
-
-        # Step 4: gtilde_expval via density-contracted s-type integrals
-        s_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, self.grid_coords, self.widths, aux_l=0, dm=dm, intopt=self.intopt, cutoff=cutoff)
-        gtilde_expval = s_contracted[:, 0]
 
         # Check negative forces: only warn if their energy contribution > 1%
         neg_mask = forces <= 0
@@ -334,15 +325,17 @@ class GOSTSHYP(lib.StreamObject):
                 logger.debug(self, 'GOSTSHYP: %d grid points have non-positive '
                              'forces (%.4f%% of energy)', n_neg, 100.0 * frac)
 
-        # Step 5: Fock term 2 via amplitude-contracted p-type integrals
+        # Energy: sum_g amplitudes_g * gtilde_expval_g
+        # (equivalent to vdot(fock1, dm) since fock1 = sum_g a_g * S_ij0_g)
+        energy = float(cp.sum(amplitudes * gtilde_expval))
+
+        # Fused pass 2: amplitude-contracted s+p integrals in one kernel pass
         response_coeff = -self.pressure_au * self.areas * gtilde_expval / (forces ** 2)
         weighted_amp = response_coeff[:, None] * self.surface_normals * p_coeffs[:, None]
-        fock2 = int3c_overlap.get_int3c_overlap_amplitude_contracted(
-            mol, self.grid_coords, self.widths, aux_l=1,
-            amplitudes=weighted_amp, intopt=self.intopt, cutoff=cutoff)
-
-        fock = fock1 + fock2
-        energy = float(cp.vdot(fock1, dm))
+        fock = int3c_overlap.get_int3c_overlap_amplitude_contracted_sp(
+            mol, self.grid_coords, self.widths,
+            amp_s=amplitudes, amp_p=weighted_amp,
+            intopt=self.intopt, cutoff=cutoff)
 
         # Store results on GPU
         self.forces = forces

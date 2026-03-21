@@ -244,6 +244,126 @@ static int GINTfill_int3c_overlap_amplitude_contracted_tasks(
 }
 
 
+static int GINTfill_int3c_overlap_density_contracted_sp_tasks(
+    double* forces_s,
+    double* forces_p,
+    const double* dm,
+    const BasisProdOffsets offsets,
+    const int i_l, const int j_l,
+    const int nprim_ij,
+    const int nao,
+    const double* aux_coords, const double* aux_exponents,
+    const cudaStream_t stream
+) {
+    const int ntasks_ij = offsets.ntasks_ij;
+    const int ngrids = offsets.ntasks_kl;
+    // Recursion needs l_total = i_l + j_l + 1 (always k_l=1)
+    const int l_total = i_l + j_l + 1;
+
+    const dim3 threads(THREADSX, THREADSY);
+    const dim3 blocks((ntasks_ij + THREADSX - 1) / THREADSX, (ngrids + THREADSY - 1) / THREADSY);
+
+    switch (l_total) {
+        DISPATCH_BY_L_TOTAL(1, GINTfill_int3c_overlap_density_contracted_sp_kernel_general,
+                            forces_s, forces_p, dm, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(2, GINTfill_int3c_overlap_density_contracted_sp_kernel_general,
+                            forces_s, forces_p, dm, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(3, GINTfill_int3c_overlap_density_contracted_sp_kernel_general,
+                            forces_s, forces_p, dm, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(4, GINTfill_int3c_overlap_density_contracted_sp_kernel_general,
+                            forces_s, forces_p, dm, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(5, GINTfill_int3c_overlap_density_contracted_sp_kernel_general,
+                            forces_s, forces_p, dm, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(6, GINTfill_int3c_overlap_density_contracted_sp_kernel_general,
+                            forces_s, forces_p, dm, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(7, GINTfill_int3c_overlap_density_contracted_sp_kernel_general,
+                            forces_s, forces_p, dm, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(8, GINTfill_int3c_overlap_density_contracted_sp_kernel_general,
+                            forces_s, forces_p, dm, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(9, GINTfill_int3c_overlap_density_contracted_sp_kernel_general,
+                            forces_s, forces_p, dm, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        default:
+            fprintf(stderr, "l_total = %d out of range for SP density kernel (max 9)\n", l_total);
+            return 1;
+    }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in %s: %s\n", __func__, cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+static int GINTfill_int3c_overlap_amplitude_contracted_sp_tasks(
+    double* fock,
+    const double* amp_s,
+    const double* amp_p,
+    const BasisProdOffsets offsets,
+    const int i_l, const int j_l,
+    const int nprim_ij,
+    const int nao,
+    const double* aux_coords, const double* aux_exponents,
+    const cudaStream_t stream
+) {
+    const int ntasks_ij = offsets.ntasks_ij;
+    const int ngrids = offsets.ntasks_kl;
+    const int l_total = i_l + j_l + 1;
+
+    const dim3 threads(THREADSX, THREADSY);
+    const dim3 blocks((ntasks_ij + THREADSX - 1) / THREADSX, (ngrids + THREADSY - 1) / THREADSY);
+
+    switch (l_total) {
+        DISPATCH_BY_L_TOTAL(1, GINTfill_int3c_overlap_amplitude_contracted_sp_kernel_general,
+                            fock, amp_s, amp_p, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(2, GINTfill_int3c_overlap_amplitude_contracted_sp_kernel_general,
+                            fock, amp_s, amp_p, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(3, GINTfill_int3c_overlap_amplitude_contracted_sp_kernel_general,
+                            fock, amp_s, amp_p, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(4, GINTfill_int3c_overlap_amplitude_contracted_sp_kernel_general,
+                            fock, amp_s, amp_p, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(5, GINTfill_int3c_overlap_amplitude_contracted_sp_kernel_general,
+                            fock, amp_s, amp_p, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(6, GINTfill_int3c_overlap_amplitude_contracted_sp_kernel_general,
+                            fock, amp_s, amp_p, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(7, GINTfill_int3c_overlap_amplitude_contracted_sp_kernel_general,
+                            fock, amp_s, amp_p, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(8, GINTfill_int3c_overlap_amplitude_contracted_sp_kernel_general,
+                            fock, amp_s, amp_p, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        DISPATCH_BY_L_TOTAL(9, GINTfill_int3c_overlap_amplitude_contracted_sp_kernel_general,
+                            fock, amp_s, amp_p, offsets, i_l, j_l, nprim_ij, nao,
+                            aux_coords, aux_exponents)
+        default:
+            fprintf(stderr, "l_total = %d out of range for SP amplitude kernel (max 9)\n", l_total);
+            return 1;
+    }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in %s: %s\n", __func__, cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+
 extern "C" {
 
 /*
@@ -405,6 +525,106 @@ int GINTfill_int3c_overlap_amplitude_contracted(
 
         const int err = GINTfill_int3c_overlap_amplitude_contracted_tasks(
             fock, amplitudes, offsets, i_l, j_l, k_l, nprim_ij, nao,
+            aux_coords, aux_exponents, stream);
+
+        if (err != 0) return err;
+    }
+
+    return 0;
+}
+
+/*
+ * Fused density-contracted s+p: computes forces_s and forces_p in one pass
+ */
+int GINTfill_int3c_overlap_density_contracted_sp(
+    const cudaStream_t stream,
+    const BasisProdCache* bpcache,
+    const double* aux_coords,
+    const double* aux_exponents,
+    const int ngrids,
+    const double* dm,
+    double* forces_s,
+    double* forces_p,
+    const int nao,
+    const int* bins_locs_ij,
+    int nbins,
+    const int cp_ij_id,
+    const double cutoff
+) {
+    const ContractionProdType* cp_ij = bpcache->cptype + cp_ij_id;
+    const int i_l = cp_ij->l_bra;
+    const int j_l = cp_ij->l_ket;
+    const int nprim_ij = cp_ij->nprim_12;
+
+    const int* bas_pairs_locs = bpcache->bas_pairs_locs;
+    const int* primitive_pairs_locs = bpcache->primitive_pairs_locs;
+
+    for (int ij_bin = 0; ij_bin < nbins; ij_bin++) {
+        const int bas_ij0 = bins_locs_ij[ij_bin];
+        const int bas_ij1 = bins_locs_ij[ij_bin + 1];
+        const int ntasks_ij = bas_ij1 - bas_ij0;
+        if (ntasks_ij <= 0) continue;
+
+        BasisProdOffsets offsets;
+        offsets.ntasks_ij = ntasks_ij;
+        offsets.ntasks_kl = ngrids;
+        offsets.bas_ij = bas_pairs_locs[cp_ij_id] + bas_ij0;
+        offsets.bas_kl = -1;
+        offsets.primitive_ij = primitive_pairs_locs[cp_ij_id] + bas_ij0 * nprim_ij;
+        offsets.primitive_kl = -1;
+
+        const int err = GINTfill_int3c_overlap_density_contracted_sp_tasks(
+            forces_s, forces_p, dm, offsets, i_l, j_l, nprim_ij, nao,
+            aux_coords, aux_exponents, stream);
+
+        if (err != 0) return err;
+    }
+
+    return 0;
+}
+
+/*
+ * Fused amplitude-contracted s+p: computes fock from amp_s and amp_p in one pass
+ */
+int GINTfill_int3c_overlap_amplitude_contracted_sp(
+    const cudaStream_t stream,
+    const BasisProdCache* bpcache,
+    const double* aux_coords,
+    const double* aux_exponents,
+    const int ngrids,
+    const double* amp_s,
+    const double* amp_p,
+    double* fock,
+    const int nao,
+    const int* bins_locs_ij,
+    int nbins,
+    const int cp_ij_id,
+    const double cutoff
+) {
+    const ContractionProdType* cp_ij = bpcache->cptype + cp_ij_id;
+    const int i_l = cp_ij->l_bra;
+    const int j_l = cp_ij->l_ket;
+    const int nprim_ij = cp_ij->nprim_12;
+
+    const int* bas_pairs_locs = bpcache->bas_pairs_locs;
+    const int* primitive_pairs_locs = bpcache->primitive_pairs_locs;
+
+    for (int ij_bin = 0; ij_bin < nbins; ij_bin++) {
+        const int bas_ij0 = bins_locs_ij[ij_bin];
+        const int bas_ij1 = bins_locs_ij[ij_bin + 1];
+        const int ntasks_ij = bas_ij1 - bas_ij0;
+        if (ntasks_ij <= 0) continue;
+
+        BasisProdOffsets offsets;
+        offsets.ntasks_ij = ntasks_ij;
+        offsets.ntasks_kl = ngrids;
+        offsets.bas_ij = bas_pairs_locs[cp_ij_id] + bas_ij0;
+        offsets.bas_kl = -1;
+        offsets.primitive_ij = primitive_pairs_locs[cp_ij_id] + bas_ij0 * nprim_ij;
+        offsets.primitive_kl = -1;
+
+        const int err = GINTfill_int3c_overlap_amplitude_contracted_sp_tasks(
+            fock, amp_s, amp_p, offsets, i_l, j_l, nprim_ij, nao,
             aux_coords, aux_exponents, stream);
 
         if (err != 0) return err;

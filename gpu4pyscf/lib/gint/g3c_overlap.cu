@@ -705,3 +705,306 @@ __global__ void GINTfill_int3c_overlap_amplitude_contracted_kernel_general(
         }
     }
 }
+
+/*
+ * Fused density-contracted kernel for s+p: computes both
+ *   sum_ij D_ij * S_ij0 -> forces_s[grid]       (aux_l=0)
+ *   sum_ij D_ij * S_ij1 -> forces_p[grid*3+k]   (aux_l=1)
+ * in a single pass with recursion at k_l=1.
+ */
+template <int MAX_L_TOTAL>
+__global__ void GINTfill_int3c_overlap_density_contracted_sp_kernel_general(
+    double* __restrict__ forces_s,
+    double* __restrict__ forces_p,
+    const double* __restrict__ dm,
+    const BasisProdOffsets offsets,
+    const int i_l, const int j_l,
+    const int nprim_ij,
+    const int nao,
+    const double* __restrict__ aux_coords,
+    const double* __restrict__ aux_exponents
+) {
+    const int ntasks_ij = offsets.ntasks_ij;
+    const int ngrids = offsets.ntasks_kl;
+
+    const int task_ij = blockIdx.x * blockDim.x + threadIdx.x;
+    const int task_grid = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (task_ij >= ntasks_ij || task_grid >= ngrids) return;
+
+    const int ncart_i = (i_l + 1) * (i_l + 2) / 2;
+    const int ncart_j = (j_l + 1) * (j_l + 2) / 2;
+
+    const int bas_ij = offsets.bas_ij + task_ij;
+    const int prim_ij = offsets.primitive_ij + task_ij * nprim_ij;
+    const int ish = c_bpcache.bas_pair2bra[bas_ij];
+    const int jsh = c_bpcache.bas_pair2ket[bas_ij];
+
+    const int ao_i = c_bpcache.ao_loc[ish];
+    const int ao_j = c_bpcache.ao_loc[jsh];
+
+    const double* bas_x = c_bpcache.bas_coords;
+    const double* bas_y = bas_x + c_bpcache.nbas;
+    const double* bas_z = bas_y + c_bpcache.nbas;
+    const double Ax = bas_x[ish], Ay = bas_y[ish], Az = bas_z[ish];
+    const double Bx = bas_x[jsh], By = bas_y[jsh], Bz = bas_z[jsh];
+
+    const double Cx = aux_coords[task_grid * 3 + 0];
+    const double Cy = aux_coords[task_grid * 3 + 1];
+    const double Cz = aux_coords[task_grid * 3 + 2];
+    const double gamma = aux_exponents[task_grid];
+
+    constexpr int STRIDE = MAX_L_TOTAL + 2;
+    constexpr int BUF_SIZE = STRIDE * STRIDE * STRIDE;
+    double Sx[BUF_SIZE];
+    double Sy[BUF_SIZE];
+    double Sz[BUF_SIZE];
+
+    const int i_loc = c_l_locs[i_l];
+    const int j_loc = c_l_locs[j_l];
+
+    // Accumulators: 1 for s-type, 3 for p-type
+    double result_s = 0.0;
+    double result_p[3] = {0.0, 0.0, 0.0};
+
+    for (int ij = prim_ij; ij < prim_ij + nprim_ij; ++ij) {
+        const double alpha = c_bpcache.a1[ij];
+        const double beta = c_bpcache.a2[ij];
+        const double coeff_ij = c_bpcache.e12[ij];
+        const double aij = alpha + beta;
+
+        const double zeta = aij + gamma;
+        const double inv_zeta = 1.0 / zeta;
+
+        const double Px = (alpha * Ax + beta * Bx) / aij;
+        const double Py = (alpha * Ay + beta * By) / aij;
+        const double Pz = (alpha * Az + beta * Bz) / aij;
+
+        const double PCx = Px - Cx, PCy = Py - Cy, PCz = Pz - Cz;
+        const double PC2 = PCx * PCx + PCy * PCy + PCz * PCz;
+
+        const double gamma_over_zeta = gamma * inv_zeta;
+        const double prefactor = sqrt(gamma_over_zeta) * gamma_over_zeta
+                               * exp(-aij * gamma * inv_zeta * PC2)
+                               * coeff_ij;
+
+        if (fabs(prefactor) < c_overlap_cutoff) continue;
+
+        const double inv_2zeta = 0.5 * inv_zeta;
+
+        const double Gx = (aij * Px + gamma * Cx) * inv_zeta;
+        const double Gy = (aij * Py + gamma * Cy) * inv_zeta;
+        const double Gz = (aij * Pz + gamma * Cz) * inv_zeta;
+
+        const double GA[3] = {Gx - Ax, Gy - Ay, Gz - Az};
+        const double GB[3] = {Gx - Bx, Gy - By, Gz - Bz};
+        const double GC[3] = {Gx - Cx, Gy - Cy, Gz - Cz};
+
+        // Always recurse with k_l=1 to get both s and p components
+        compute_3c_overlap_recursion_general<MAX_L_TOTAL>(
+            i_l, j_l, 1, GA, GB, GC, inv_2zeta, Sx, Sy, Sz);
+
+        #define S_IDX(a, b, c) ((a) * STRIDE * STRIDE + (b) * STRIDE + (c))
+
+        double sum_ij_s = 0.0;
+        double sum_ij_p[3] = {0.0, 0.0, 0.0};
+
+        for (int iJ = 0; iJ < ncart_j; ++iJ) {
+            const int j_cart = j_loc + iJ;
+            const int jx = c_idx[j_cart];
+            const int jy = c_idx[j_cart + TOT_NF];
+            const int jz = c_idx[j_cart + 2 * TOT_NF];
+
+            for (int iI = 0; iI < ncart_i; ++iI) {
+                const int i_cart = i_loc + iI;
+                const int ix = c_idx[i_cart];
+                const int iy = c_idx[i_cart + TOT_NF];
+                const int iz = c_idx[i_cart + 2 * TOT_NF];
+
+                const int ii = ao_i + iI;
+                const int jj = ao_j + iJ;
+                double dm_contrib = dm[ii * nao + jj];
+                if (ish != jsh) {
+                    dm_contrib += dm[jj * nao + ii];
+                }
+
+                const double sx0 = Sx[S_IDX(ix, jx, 0)];
+                const double sy0 = Sy[S_IDX(iy, jy, 0)];
+                const double sz0 = Sz[S_IDX(iz, jz, 0)];
+
+                sum_ij_s += dm_contrib * sx0 * sy0 * sz0;
+                sum_ij_p[0] += dm_contrib * Sx[S_IDX(ix, jx, 1)] * sy0 * sz0;
+                sum_ij_p[1] += dm_contrib * sx0 * Sy[S_IDX(iy, jy, 1)] * sz0;
+                sum_ij_p[2] += dm_contrib * sx0 * sy0 * Sz[S_IDX(iz, jz, 1)];
+            }
+        }
+
+        result_s += prefactor * sum_ij_s;
+        result_p[0] += prefactor * sum_ij_p[0];
+        result_p[1] += prefactor * sum_ij_p[1];
+        result_p[2] += prefactor * sum_ij_p[2];
+
+        #undef S_IDX
+    }
+
+    atomicAdd(&forces_s[task_grid], result_s);
+    atomicAdd(&forces_p[task_grid * 3 + 0], result_p[0]);
+    atomicAdd(&forces_p[task_grid * 3 + 1], result_p[1]);
+    atomicAdd(&forces_p[task_grid * 3 + 2], result_p[2]);
+}
+
+/*
+ * Fused amplitude-contracted kernel for s+p: computes
+ *   fock[i,j] += sum_g (amp_s[g] * S_ij0_g + sum_k amp_p[g*3+k] * S_ij1k_g)
+ * in a single pass with recursion at k_l=1.
+ */
+template <int MAX_L_TOTAL>
+__global__ void GINTfill_int3c_overlap_amplitude_contracted_sp_kernel_general(
+    double* __restrict__ fock,
+    const double* __restrict__ amp_s,
+    const double* __restrict__ amp_p,
+    const BasisProdOffsets offsets,
+    const int i_l, const int j_l,
+    const int nprim_ij,
+    const int nao,
+    const double* __restrict__ aux_coords,
+    const double* __restrict__ aux_exponents
+) {
+    const int ntasks_ij = offsets.ntasks_ij;
+    const int ngrids = offsets.ntasks_kl;
+
+    const int task_ij = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (task_ij >= ntasks_ij) return;
+
+    const int ncart_i = (i_l + 1) * (i_l + 2) / 2;
+    const int ncart_j = (j_l + 1) * (j_l + 2) / 2;
+
+    const int bas_ij = offsets.bas_ij + task_ij;
+    const int prim_ij = offsets.primitive_ij + task_ij * nprim_ij;
+    const int ish = c_bpcache.bas_pair2bra[bas_ij];
+    const int jsh = c_bpcache.bas_pair2ket[bas_ij];
+
+    const int ao_i = c_bpcache.ao_loc[ish];
+    const int ao_j = c_bpcache.ao_loc[jsh];
+
+    const double* bas_x = c_bpcache.bas_coords;
+    const double* bas_y = bas_x + c_bpcache.nbas;
+    const double* bas_z = bas_y + c_bpcache.nbas;
+    const double Ax = bas_x[ish], Ay = bas_y[ish], Az = bas_z[ish];
+    const double Bx = bas_x[jsh], By = bas_y[jsh], Bz = bas_z[jsh];
+
+    constexpr int STRIDE = MAX_L_TOTAL + 2;
+    constexpr int BUF_SIZE = STRIDE * STRIDE * STRIDE;
+    double Sx[BUF_SIZE];
+    double Sy[BUF_SIZE];
+    double Sz[BUF_SIZE];
+
+    const int i_loc = c_l_locs[i_l];
+    const int j_loc = c_l_locs[j_l];
+
+    // Accumulate Fock contributions across ALL grids
+    double fock_ij[225] = {0.0};
+
+    // Grid-striding loop
+    const int grid_stride = gridDim.y * blockDim.y;
+    for (int task_grid = blockIdx.y * blockDim.y + threadIdx.y;
+         task_grid < ngrids;
+         task_grid += grid_stride) {
+
+        const double Cx = aux_coords[task_grid * 3 + 0];
+        const double Cy = aux_coords[task_grid * 3 + 1];
+        const double Cz = aux_coords[task_grid * 3 + 2];
+        const double gamma = aux_exponents[task_grid];
+
+        // Load amplitudes for this grid point
+        const double a_s = amp_s[task_grid];
+        const double a_p0 = amp_p[task_grid * 3 + 0];
+        const double a_p1 = amp_p[task_grid * 3 + 1];
+        const double a_p2 = amp_p[task_grid * 3 + 2];
+
+        for (int ij = prim_ij; ij < prim_ij + nprim_ij; ++ij) {
+            const double alpha = c_bpcache.a1[ij];
+            const double beta = c_bpcache.a2[ij];
+            const double coeff_ij = c_bpcache.e12[ij];
+            const double aij = alpha + beta;
+
+            const double zeta = aij + gamma;
+            const double inv_zeta = 1.0 / zeta;
+
+            const double Px = (alpha * Ax + beta * Bx) / aij;
+            const double Py = (alpha * Ay + beta * By) / aij;
+            const double Pz = (alpha * Az + beta * Bz) / aij;
+
+            const double PCx = Px - Cx, PCy = Py - Cy, PCz = Pz - Cz;
+            const double PC2 = PCx * PCx + PCy * PCy + PCz * PCz;
+
+            const double gamma_over_zeta = gamma * inv_zeta;
+            const double prefactor = sqrt(gamma_over_zeta) * gamma_over_zeta
+                                   * exp(-aij * gamma * inv_zeta * PC2)
+                                   * coeff_ij;
+
+            if (fabs(prefactor) < c_overlap_cutoff) continue;
+
+            const double inv_2zeta = 0.5 * inv_zeta;
+
+            const double Gx = (aij * Px + gamma * Cx) * inv_zeta;
+            const double Gy = (aij * Py + gamma * Cy) * inv_zeta;
+            const double Gz = (aij * Pz + gamma * Cz) * inv_zeta;
+
+            const double GA[3] = {Gx - Ax, Gy - Ay, Gz - Az};
+            const double GB[3] = {Gx - Bx, Gy - By, Gz - Bz};
+            const double GC[3] = {Gx - Cx, Gy - Cy, Gz - Cz};
+
+            // Always recurse with k_l=1 to get both s and p components
+            compute_3c_overlap_recursion_general<MAX_L_TOTAL>(
+                i_l, j_l, 1, GA, GB, GC, inv_2zeta, Sx, Sy, Sz);
+
+            #define S_IDX(a, b, c) ((a) * STRIDE * STRIDE + (b) * STRIDE + (c))
+
+            for (int iJ = 0; iJ < ncart_j; ++iJ) {
+                const int j_cart = j_loc + iJ;
+                const int jx = c_idx[j_cart];
+                const int jy = c_idx[j_cart + TOT_NF];
+                const int jz = c_idx[j_cart + 2 * TOT_NF];
+
+                for (int iI = 0; iI < ncart_i; ++iI) {
+                    const int i_cart = i_loc + iI;
+                    const int ix = c_idx[i_cart];
+                    const int iy = c_idx[i_cart + TOT_NF];
+                    const int iz = c_idx[i_cart + 2 * TOT_NF];
+
+                    const double sx0 = Sx[S_IDX(ix, jx, 0)];
+                    const double sy0 = Sy[S_IDX(iy, jy, 0)];
+                    const double sz0 = Sz[S_IDX(iz, jz, 0)];
+
+                    const double val = a_s * sx0 * sy0 * sz0
+                        + a_p0 * Sx[S_IDX(ix, jx, 1)] * sy0 * sz0
+                        + a_p1 * sx0 * Sy[S_IDX(iy, jy, 1)] * sz0
+                        + a_p2 * sx0 * sy0 * Sz[S_IDX(iz, jz, 1)];
+
+                    fock_ij[iJ * ncart_i + iI] += prefactor * val;
+                }
+            }
+
+            #undef S_IDX
+        }
+    }  // end grid-striding loop
+
+    // Write to Fock matrix with atomic adds
+    for (int iJ = 0; iJ < ncart_j; ++iJ) {
+        for (int iI = 0; iI < ncart_i; ++iI) {
+            const double fval = fock_ij[iJ * ncart_i + iI];
+            if (fabs(fval) < c_overlap_cutoff) continue;
+            const int ii = ao_i + iI;
+            const int jj = ao_j + iJ;
+            const int fock_idx = ii * nao + jj;
+            atomicAdd(&fock[fock_idx], fval);
+
+            if (ish != jsh) {
+                const int fock_idx_T = jj * nao + ii;
+                atomicAdd(&fock[fock_idx_T], fval);
+            }
+        }
+    }
+}
