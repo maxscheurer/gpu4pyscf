@@ -1,0 +1,19 @@
+Structures of amylose-chains as used in the following publications:
+
+ - J. Kussmann and C. Ochsenfeld,
+   "Linear-scaling method for calculating nuclear magnetic resonance
+    chemical shifts using gauge-including atomic orbitals within Hartree-Fock
+    and density-functional theory",
+   J. Chem. Phys. 127, 054103 (2007).
+
+ - J. Kussmann and C. Ochsenfeld,
+   "A density matrix-based method for the linear-scaling calculation of
+    dynamic second- and third-order properties at the Hartree-Fock and Kohn-Sham
+    density functional theory levels",
+   J. Chem. Phys., submitted for publication (2007).
+
+
+Original structures have been obtained by the SWEET tool
+(http://www.dkfz-heidelberg.de/spec/sweet2/doc/index.php), sequence has been
+reordered by applying the reverse Cuthill-McKee algorithm onto the connectivity
+matrix.
