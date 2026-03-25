@@ -136,12 +136,16 @@ def get_int3c_overlap(mol, aux_coords, aux_exponents, aux_l, intopt, aux_cart=Tr
             ao_offsets = np.array([i0, j0], dtype=np.int32)
             strides = np.array([ni, ni * nj], dtype=np.int32)
 
-            int3c_angular = cp.zeros([p1 - p0, ncart_aux, nj, ni], order='C')
-
             coords_slice = aux_coords_gpu[p0:p1]
             exponents_slice = aux_exponents_gpu[p0:p1]
 
             with stream:
+                # Zero the output buffer on the kernel stream to avoid a race
+                # condition: cp.zeros uses cudaMemsetAsync on the default stream,
+                # but non-blocking streams don't synchronize with the default
+                # stream. Allocating and zeroing here ensures the memset and
+                # kernel launch are ordered on the same stream.
+                int3c_angular = cp.zeros([p1 - p0, ncart_aux, nj, ni], order='C')
                 err = libgint.GINTfill_int3c_overlap(
                     ctypes.cast(stream.ptr, ctypes.c_void_p),
                     intopt.bpcache,
