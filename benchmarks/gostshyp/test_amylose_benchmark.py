@@ -46,11 +46,17 @@ def xyz_file(request):
     return os.path.join(BENCH_DIR, request.param)
 
 
-def test_amylose(xyz_file):
+@pytest.mark.parametrize(
+    "overlap_cutoff", [
+        0.0,
+        1e-14,
+        1e-12, 1e-10, 1e-8, 1e-6,
+    ],
+)
+def test_amylose(xyz_file, overlap_cutoff):
     """Run PBE/def2-SV(P) + GOSTSHYP(50 GPa, vdW/OCC) SCF + gradient."""
     label = _label(os.path.basename(xyz_file))
     row = {'system': label}
-    overlap_cutoff = 1e-11
 
     mol = gto.M(atom=xyz_file, basis=BASIS_FILE, unit='Ang', verbose=4)
     row['natom'] = mol.natm
