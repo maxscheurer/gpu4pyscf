@@ -99,13 +99,7 @@ class TestGOSTSHYPKernel(unittest.TestCase):
                                    err_msg="Fock matrix mismatch between GPU and CPU")
 
     def test_forces_hf(self):
-        """Test GOSTSHYP forces match CPU reference.
-
-        The GPU kernel bakes the Gaussian normalization N_j = (γ_j/π)^{3/2}
-        into the 3-center integrals, while pyscf-forge does not. This means
-        GPU forces = N_j * CPU forces (per grid point). We rescale before
-        comparison.
-        """
+        """Test GOSTSHYP forces match CPU reference."""
         gostshyp_gpu = GOSTSHYP(self.mol_hf, options={'cavity': 'vdw'})
         gostshyp_gpu.build()
 
@@ -115,17 +109,11 @@ class TestGOSTSHYPKernel(unittest.TestCase):
 
         cpu = cpu_reference(self.mol_hf, dm, options={'cavity': 'vdw'})
 
-        # Rescale: GPU includes N_j = (width/pi)^1.5 in integrals, CPU does not
-        N_j = (cpu.widths / np.pi) ** 1.5
-        np.testing.assert_allclose(forces_gpu, cpu.forces * N_j, atol=1e-9, rtol=1e-9,
+        np.testing.assert_allclose(forces_gpu, cpu.forces, atol=1e-9, rtol=1e-9,
                                    err_msg="Forces mismatch between GPU and CPU")
 
     def test_amplitudes_hf(self):
-        """Test GOSTSHYP amplitudes match CPU reference.
-
-        Since amplitudes = P·A/forces, the N_j normalization factor appears
-        inverted: GPU amplitudes = CPU amplitudes / N_j.
-        """
+        """Test GOSTSHYP amplitudes match CPU reference."""
         gostshyp_gpu = GOSTSHYP(self.mol_hf, options={'cavity': 'vdw'})
         gostshyp_gpu.build()
 
@@ -135,9 +123,7 @@ class TestGOSTSHYPKernel(unittest.TestCase):
 
         cpu = cpu_reference(self.mol_hf, dm, options={'cavity': 'vdw'})
 
-        # Rescale: GPU amplitudes = CPU amplitudes / N_j
-        N_j = (cpu.widths / np.pi) ** 1.5
-        np.testing.assert_allclose(amplitudes_gpu, cpu.amplitudes / N_j, atol=1e-7, rtol=1e-7,
+        np.testing.assert_allclose(amplitudes_gpu, cpu.amplitudes, atol=1e-7, rtol=1e-7,
                                    err_msg="Amplitudes mismatch between GPU and CPU")
 
     def test_spherical_basis(self):
