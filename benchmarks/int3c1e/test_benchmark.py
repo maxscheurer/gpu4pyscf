@@ -28,6 +28,8 @@ from gpu4pyscf.gto import int3c_overlap
 from gpu4pyscf.gto.int3c1e import VHFOpt
 
 from .molecules import create_hydrogen_grid, create_water_box
+from pyscf.solvent.gostshyp import GOSTSHYP as GOSTSHYP_CPU
+
 from .utils import (
     compute_int3c_overlap_cpu,
     gpu_timer_events,
@@ -399,92 +401,22 @@ def create_biphenyl(basis='def2-tzvp', cart=True):
     return mol
 
 
-def gostshyp_kernel_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110, scaling_factor=1.2):
+def gostshyp_kernel_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110,
+                                   scaling_factor=1.2, cavity='vdw/occ'):
     """
-    CPU reference implementation of GOSTSHYP kernel using integral-direct
-    (streaming/chunked) algorithm. Based on the reference implementation in
-    /dfs/is/home/m341593/Projects/overlap_cuda/gostshyp/gostshyp.py (direct=True).
+    CPU reference implementation of GOSTSHYP kernel using pyscf-forge.
 
-    Integrals are computed on-the-fly in chunks rather than materializing
-    the full [nao, nao, ngrids] tensor.
+    Returns (energy, fock) tuple.
     """
-    from pyscf import lib
-    from pyscf.solvent.pcm import gen_surface, modified_Bondi
-    from .utils import fakemol_for_gaussian
-
-    pressure_au = pressure_mpa * 3.3989309735473356e-08
-
-    # Build surface
-    radii = scaling_factor * modified_Bondi
-    surface_dict = gen_surface(mol, ng=npoints, rad=radii)
-    areas = np.asarray(surface_dict['area'])
-    grid_coords = np.asarray(surface_dict['grid_coords'])
-    atom_coords = mol.atom_coords()
-    gslice_by_atom = surface_dict['gslice_by_atom']
-
-    # Compute atom index and surface normals
-    atom_idx = np.zeros(len(areas), dtype=int)
-    for ia, (p0, p1) in enumerate(gslice_by_atom):
-        atom_idx[p0:p1] = ia
-
-    ref_coords = atom_coords[atom_idx]
-    dr = ref_coords - grid_coords
-    dr_norm = np.linalg.norm(dr, axis=1, keepdims=True)
-    surface_normals = dr / dr_norm
-
-    # Compute widths
-    widths = np.pi * np.log(2) / areas
-    N_j = (widths / np.pi) ** 1.5  # normalization factor
-    nao = mol.nao
-    n_gaussian = len(areas)
-
-    # Build fakemols for full surface (integrals computed via shell slicing)
-    gmol = fakemol_for_gaussian(grid_coords, widths, l=0, cart=mol.cart, coeffs=N_j)
-    gmol_p = fakemol_for_gaussian(grid_coords, widths, l=1, cart=mol.cart,
-                                   coeffs=2.0 * widths * N_j)
-    supermol = mol + gmol
-    supermol_p = mol + gmol_p
-
-    # Determine chunking based on memory
-    max_memreq = 5 * n_gaussian * nao**2 * 8.0 / 1e6  # MB
-    max_memory = max(2000, mol.max_memory * 0.9 - lib.current_memory()[0])
-    n_chunks = 1
-    if max_memreq >= max_memory:
-        n_chunks = int(max_memreq // max_memory + 1)
-
-    shells = np.arange(n_gaussian)
-    chunks = np.array_split(shells, n_chunks)
-
-    energy = 0.0
-    fock = np.zeros_like(dm)
-
-    for shell_slice in chunks:
-        off1, off2 = int(shell_slice[0]), len(shell_slice)
-        slices = (0, mol.nbas, 0, mol.nbas,
-                  mol.nbas + off1, mol.nbas + off1 + off2)
-
-        overlap3_s = supermol.intor("int3c1e", shls_slice=slices, aosym="s2")
-        overlap3_s = lib.unpack_tril(overlap3_s, axis=0)
-
-        overlap3_p = supermol_p.intor("int3c1e", shls_slice=slices, aosym="s2")
-        overlap3_p = lib.unpack_tril(overlap3_p, axis=0).reshape(nao, nao, -1, 3)
-
-        force_operators = np.einsum(
-            'ijgc,gc->ijg', overlap3_p,
-            surface_normals[shell_slice], optimize=True)
-        forces = np.einsum('ij,ijg->g', dm, force_operators, optimize=True)
-
-        amplitudes = pressure_au * areas[shell_slice] / forces
-
-        f1 = np.einsum('g,ijg->ij', amplitudes, overlap3_s, optimize=True)
-
-        gtilde_expval = np.einsum('ij,ijg->g', dm, overlap3_s, optimize=True)
-        response_coeff = -pressure_au * areas[shell_slice] * gtilde_expval / (forces ** 2)
-        f2 = np.einsum('g,ijg->ij', response_coeff, force_operators, optimize=True)
-
-        fock += f1 + f2
-        energy += np.vdot(f1, dm)
-
+    cpu = GOSTSHYP_CPU(mol, options={
+        'pressure_mpa': pressure_mpa,
+        'npoints': npoints,
+        'scaling_factor': scaling_factor,
+        'cavity': cavity,
+        'direct': True,
+    })
+    cpu.build()
+    energy, fock = cpu.kernel(dm)
     return energy, fock
 
 
@@ -500,15 +432,18 @@ def test_benchmark_gostshyp_biphenyl(basis, cart, results_bag):
     - gtilde_expval via density-contracted s-type integrals
     - Fock term 2 via amplitude-contracted p-type integrals
     """
+    from pyscf import scf as cpu_scf
     from gpu4pyscf.solvent.gostshyp import GOSTSHYP
 
     mol = create_biphenyl(basis=basis, cart=cart)
     nao = mol.nao
 
-    # Create test density matrix (random symmetric)
-    np.random.seed(42)
-    dm = np.random.randn(nao, nao)
-    dm = (dm + dm.T) / 2
+    # Use converged SCF DM to ensure all forces are positive
+    # (avoids differences in negative-amplitude handling between GPU and CPU)
+    mf = cpu_scf.RHF(mol)
+    mf.verbose = 0
+    mf.kernel()
+    dm = mf.make_rdm1()
 
     # Build GPU GOSTSHYP
     gostshyp_gpu = GOSTSHYP(mol)
@@ -561,154 +496,22 @@ def test_benchmark_gostshyp_biphenyl(basis, cart, results_bag):
 # =============================================================================
 
 def gostshyp_gradient_cpu_reference(mol, dm, pressure_mpa=50000, npoints=110,
-                                     scaling_factor=1.2):
+                                     scaling_factor=1.2, cavity='vdw/occ'):
     """
-    CPU reference implementation of GOSTSHYP gradient using PySCF's libcint.
+    CPU reference implementation of GOSTSHYP gradient using pyscf-forge.
 
     Returns the total gradient (natm, 3).
     """
-    from pyscf import lib
-    from pyscf.solvent.pcm import gen_surface, modified_Bondi
-    from pyscf.solvent.grad.pcm import get_dF_dA
-    from .utils import fakemol_for_gaussian
-
-    pressure_au = pressure_mpa * 3.3989309735473356e-08
-    radii = scaling_factor * modified_Bondi
-    surface_dict = gen_surface(mol, ng=npoints, rad=radii)
-    areas = np.asarray(surface_dict['area'])
-    grid_coords = np.asarray(surface_dict['grid_coords'])
-    atom_coords = mol.atom_coords()
-    gslice_by_atom = surface_dict['gslice_by_atom']
-
-    atom_idx = np.zeros(len(areas), dtype=int)
-    for ia, (p0, p1) in enumerate(gslice_by_atom):
-        atom_idx[p0:p1] = ia
-
-    ref_coords = atom_coords[atom_idx]
-    dr = ref_coords - grid_coords
-    dr_norm = np.linalg.norm(dr, axis=1, keepdims=True)
-    surface_normals = dr / dr_norm
-    widths = np.pi * np.log(2) / areas
-    N_j = (widths / np.pi) ** 1.5  # normalization factor
-    nao = mol.nao
-    n_gaussian = len(areas)
-
-    # Energy quantities
-    gmol = fakemol_for_gaussian(grid_coords, widths, l=0, cart=mol.cart, coeffs=N_j)
-    gmol_p = fakemol_for_gaussian(grid_coords, widths, l=1, cart=mol.cart,
-                                   coeffs=2.0 * widths * N_j)
-    supermol = mol + gmol
-    supermol_p = mol + gmol_p
-    slices = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol.nbas)
-
-    overlap3_s = supermol.intor("int3c1e", shls_slice=slices, aosym="s1")
-    overlap3_p = supermol_p.intor("int3c1e", shls_slice=slices, aosym="s1")
-    overlap3_p = overlap3_p.reshape(nao, nao, n_gaussian, 3)
-    force_operators = np.einsum('ijgc,gc->ijg', overlap3_p, surface_normals,
-                                optimize=True)
-    forces = np.einsum('ij,ijg->g', dm, force_operators, optimize=True)
-    gtilde_expval = np.einsum('ij,ijg->g', dm, overlap3_s, optimize=True)
-    amplitudes = pressure_au * areas / forces
-
-    # Area derivatives
-    surface_dict_np = {
-        'grid_coords': grid_coords, 'area': areas,
-        'gslice_by_atom': gslice_by_atom,
-        'R_vdw': np.asarray(surface_dict['R_vdw']),
-        'switch_fun': np.asarray(surface_dict['switch_fun']),
-        'R_in_J': np.asarray(surface_dict['R_in_J']),
-        'R_sw_J': np.asarray(surface_dict['R_sw_J']),
-        'atom_coords': np.asarray(surface_dict['atom_coords']),
-    }
-    _, dareas = get_dF_dA(surface_dict_np)
-    dareas = dareas.transpose(1, 2, 0)
-
-    wgrad_prefs = -np.pi * np.log(2) / (areas ** 2)
-
-    # dE1
-    dE1 = pressure_au * np.einsum('acg,g->ac', dareas, gtilde_expval / forces,
-                                   optimize=True)
-
-    # dE2
-    dPQ = supermol.intor("int3c1e_ip1", shls_slice=slices)
-    dPQ = np.einsum('xijn,n->xij', dPQ, amplitudes, optimize=True)
-    slices_g = (mol.nbas, mol.nbas + gmol.nbas, 0, mol.nbas, 0, mol.nbas)
-    dG = supermol.intor("int3c1e_ip1", shls_slice=slices_g)
-    aoslice = mol.aoslice_by_atom()
-    dgtilde_braket = np.einsum('xij,ij->ix', dPQ, dm, optimize=True)
-    dgtilde_braket += np.einsum('xij,ji->ix', dPQ, dm, optimize=True)
-    dgtilde_gaussian = np.einsum('xnij,n,ij->nx', dG, amplitudes, dm,
-                                  optimize=True)
-    gtilde_operator_grad = np.asarray(
-        [np.sum(dgtilde_braket[p0:p1], axis=0) for p0, p1 in aoslice[:, 2:]])
-    np.add.at(gtilde_operator_grad, atom_idx, dgtilde_gaussian)
-    gtilde_operator_grad *= -1.0
-
-    gmol_d = fakemol_for_gaussian(grid_coords, widths, l=2,
-                                   coeffs=wgrad_prefs * amplitudes * N_j, cart=True)
-    supermol_d = mol + gmol_d
-    supermol_d.cart = True
-    slices_d = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_d.nbas)
-    nao_cart = mol.nao_nr(cart=True)
-    overlap3d = supermol_d.intor("int3c1e", shls_slice=slices_d).reshape(
-        nao_cart, nao_cart, -1, 6)
-    if not mol.cart:
-        c2s = mol.cart2sph_coeff(normalized="sp")
-        overlap3d = np.einsum('ij,jkgd,kl->ilgd', c2s.T, overlap3d, c2s,
-                              optimize=True)
-    diagd = overlap3d[:, :, :, 0] + overlap3d[:, :, :, 3] + overlap3d[:, :, :, 5]
-    imd = np.einsum('ijg,ij->g', diagd, dm, optimize=True)
-    dE_d = -1.0 * np.einsum('acg,g->ac', dareas, imd, optimize=True)
-    dE2 = gtilde_operator_grad + dE_d
-
-    # dE3
-    coeffs = -2.0 * pressure_au * areas * gtilde_expval * widths / (forces * forces)
-    gmol_p2 = fakemol_for_gaussian(grid_coords, widths, l=1, coeffs=coeffs * N_j)
-    supermol_p2 = mol + gmol_p2
-    slices_p2 = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_p2.nbas)
-    dpq = supermol_p2.intor("int3c1e_ip1", shls_slice=slices_p2).reshape(
-        3, nao, nao, -1, 3)
-    dpq[:, :, :] *= surface_normals
-    slices_g2 = (mol.nbas, mol.nbas + gmol_p2.nbas, 0, mol.nbas, 0, mol.nbas)
-    dG2 = supermol_p2.intor("int3c1e_ip1", shls_slice=slices_g2).reshape(
-        3, -1, 3, nao, nao)
-    dpq_ix = np.einsum('xijnp,ij->ix', dpq, dm, optimize=True)
-    dpq_ix += np.einsum('xijnp,ji->ix', dpq, dm, optimize=True)
-    dG2 = np.einsum('xnpij,np->xnij', dG2, surface_normals, optimize=True)
-    dG2 = np.einsum('xnij,ij->nx', dG2, dm, optimize=True)
-    force_operator_grad = np.asarray(
-        [np.sum(dpq_ix[p0:p1], axis=0) for p0, p1 in aoslice[:, 2:]])
-    np.add.at(force_operator_grad, atom_idx, dG2)
-    force_operator_grad *= -1.0
-
-    f_coeffs_val = -2.0 * widths * wgrad_prefs
-    gmol_f = fakemol_for_gaussian(grid_coords, widths, l=3, coeffs=f_coeffs_val * N_j,
-                                   cart=True)
-    supermol_f = mol + gmol_f
-    supermol_f.cart = True
-    slices_f = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_f.nbas)
-    overlap3f = supermol_f.intor("int3c1e", shls_slice=slices_f).reshape(
-        nao_cart, nao_cart, -1, 10)
-    if not mol.cart:
-        c2s = mol.cart2sph_coeff(normalized="sp")
-        overlap3f = np.einsum('ij,jkgd,kl->ilgd', c2s.T, overlap3f, c2s,
-                              optimize=True)
-    xf = overlap3f[:, :, :, 0] + overlap3f[:, :, :, 3] + overlap3f[:, :, :, 5]
-    yf = overlap3f[:, :, :, 1] + overlap3f[:, :, :, 6] + overlap3f[:, :, :, 8]
-    zf = overlap3f[:, :, :, 2] + overlap3f[:, :, :, 7] + overlap3f[:, :, :, 9]
-    dx = np.einsum('ijg,ij->g', xf, dm, optimize=True)
-    dy = np.einsum('ijg,ij->g', yf, dm, optimize=True)
-    dz = np.einsum('ijg,ij->g', zf, dm, optimize=True)
-    dr_f = np.vstack((dx, dy, dz)).T
-    rf2 = 1.0 / (forces * forces)
-    dr_f *= surface_normals
-    dFdR = dareas * wgrad_prefs * forces / widths
-    dFdR += np.einsum('gc,axg->axg', dr_f, dareas, optimize=True)
-    width_grad_ftype = -pressure_au * np.einsum(
-        'g,g,axg,g->ax', areas, gtilde_expval, dFdR, rf2, optimize=True)
-    dE3 = force_operator_grad + width_grad_ftype
-
-    return dE1 + dE2 + dE3
+    cpu = GOSTSHYP_CPU(mol, options={
+        'pressure_mpa': pressure_mpa,
+        'npoints': npoints,
+        'scaling_factor': scaling_factor,
+        'cavity': cavity,
+        'direct': False,
+    })
+    cpu.build()
+    cpu.kernel(dm)
+    return cpu.grad(dm)
 
 
 @pytest.mark.parametrize("basis", ['def2-svp', 'def2-tzvp'])
@@ -722,16 +525,18 @@ def test_benchmark_gostshyp_gradient_biphenyl(basis, cart, results_bag):
     - Gtilde operator gradient with ip1 s-type + ip2 + d-type width (dE2)
     - Force operator gradient with ip1 p-type + ip2 + f-type width (dE3)
     """
+    from pyscf import scf as cpu_scf
     from gpu4pyscf.solvent.gostshyp import GOSTSHYP
     from gpu4pyscf.solvent.grad.gostshyp import Gradients as GOSTSHYPGradients
 
     mol = create_biphenyl(basis=basis, cart=cart)
     nao = mol.nao
 
-    # Create test density matrix (random symmetric)
-    np.random.seed(42)
-    dm = np.random.randn(nao, nao)
-    dm = (dm + dm.T) / 2
+    # Use converged SCF DM to ensure all forces are positive
+    mf = cpu_scf.RHF(mol)
+    mf.verbose = 0
+    mf.kernel()
+    dm = mf.make_rdm1()
 
     # Build GPU GOSTSHYP and run energy first (gradient needs cached values)
     gostshyp_gpu = GOSTSHYP(mol)

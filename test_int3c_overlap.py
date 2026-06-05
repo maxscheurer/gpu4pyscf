@@ -8,6 +8,7 @@ against a CPU reference using PySCF's existing integral machinery.
 
 import numpy as np
 from pyscf import gto, scf, lib
+from pyscf.solvent.gostshyp import fakemol_for_gaussian
 from gpu4pyscf.gto import int3c_overlap
 from gpu4pyscf.gto.int3c1e import VHFOpt
 
@@ -40,59 +41,21 @@ def make_test_molecule(name='h2o'):
     return mol
 
 
-def fakemol_for_gaussian(coords, exponents, l=0, cart=True, coeffs=None):
-    """Create a fake molecule for auxiliary Gaussians (from CPU GOSTSHYP reference)."""
-    nbas = coords.shape[0]
-    if coeffs is None:
-        coeffs = np.ones_like(exponents)
-    angmom = np.zeros_like(exponents)
-    angmom[:] = l
-
-    ang_norm = {
-        0: 2.0 * np.sqrt(np.pi),
-        1: 2.0 * np.sqrt(np.pi / 3),
-        2: 1.0,
-        3: 1.0,
-    }
-
-    fakeatm = np.zeros((nbas, gto.mole.ATM_SLOTS), dtype=np.int32)
-    fakebas = np.zeros((nbas, gto.mole.BAS_SLOTS), dtype=np.int32)
-    fakeenv = [0] * gto.mole.PTR_ENV_START
-    ptr = gto.mole.PTR_ENV_START
-    fakeatm[:, gto.mole.PTR_COORD] = np.arange(ptr, ptr + nbas * 3, 3)
-    fakeenv.append(coords.ravel())
-    ptr += nbas * 3
-    fakebas[:, gto.mole.ATOM_OF] = np.arange(nbas)
-    fakebas[:, gto.mole.ANG_OF] = angmom
-    fakebas[:, gto.mole.NPRIM_OF] = 1
-    fakebas[:, gto.mole.NCTR_OF] = 1
-    fakebas[:, gto.mole.PTR_EXP] = ptr + np.arange(nbas) * 2
-    fakebas[:, gto.mole.PTR_COEFF] = ptr + np.arange(nbas) * 2 + 1
-    # angular normalization
-    coeff = ang_norm[l] * coeffs
-    fakeenv.append(np.vstack((exponents, coeff)).T.ravel())
-
-    fakemol = gto.Mole()
-    fakemol.cart = cart
-    fakemol._atm = fakeatm
-    fakemol._bas = fakebas
-    fakemol._env = np.hstack(fakeenv)
-    fakemol._built = True
-    return fakemol
-
-
 def compute_int3c_overlap_cpu(mol, aux_coords, aux_exponents, aux_l=0):
     """
     Compute 3-center overlap integrals using PySCF's int3c1e with supermol approach.
 
-    This matches the CPU GOSTSHYP reference implementation.
+    Includes N_j = (γ/π)^{3/2} normalization to match the GPU kernel convention.
     """
     nao = mol.nao
     ngrids = len(aux_coords)
     ncart_aux = (aux_l + 1) * (aux_l + 2) // 2
 
+    # GPU kernel uses (gamma/pi)^{3/2} prefactor in the integral
+    N_j = (aux_exponents / np.pi) ** 1.5
+
     # Build fake molecule for auxiliary Gaussians
-    gmol = fakemol_for_gaussian(aux_coords, aux_exponents, l=aux_l, cart=mol.cart)
+    gmol = fakemol_for_gaussian(aux_coords, aux_exponents, l=aux_l, cart=mol.cart, coeffs=N_j)
 
     # Create supermolecule and compute integrals
     supermol = mol + gmol

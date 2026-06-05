@@ -23,74 +23,12 @@ import time
 import numpy as np
 import cupy as cp
 from pyscf import gto
-
-
-def fakemol_for_gaussian(coords, exponents, l=0, cart=True, coeffs=None):
-    """
-    Create a fake molecule for auxiliary Gaussians (from CPU GOSTSHYP reference).
-
-    Parameters
-    ----------
-    coords : ndarray of shape (ngrids, 3)
-        Coordinates of Gaussian centers
-    exponents : ndarray of shape (ngrids,)
-        Gaussian exponents
-    l : int, optional
-        Angular momentum (default: 0)
-    cart : bool, optional
-        Use Cartesian basis functions (default: True)
-    coeffs : ndarray, optional
-        Contraction coefficients (default: ones)
-
-    Returns
-    -------
-    fakemol : pyscf.gto.Mole
-        Fake molecule object representing auxiliary Gaussians
-    """
-    nbas = coords.shape[0]
-    if coeffs is None:
-        coeffs = np.ones_like(exponents)
-    angmom = np.zeros_like(exponents)
-    angmom[:] = l
-
-    ang_norm = {
-        0: 2.0 * np.sqrt(np.pi),
-        1: 2.0 * np.sqrt(np.pi / 3),
-        2: 1.0,
-        3: 1.0,
-    }
-
-    fakeatm = np.zeros((nbas, gto.mole.ATM_SLOTS), dtype=np.int32)
-    fakebas = np.zeros((nbas, gto.mole.BAS_SLOTS), dtype=np.int32)
-    fakeenv = [0] * gto.mole.PTR_ENV_START
-    ptr = gto.mole.PTR_ENV_START
-    fakeatm[:, gto.mole.PTR_COORD] = np.arange(ptr, ptr + nbas * 3, 3)
-    fakeenv.append(coords.ravel())
-    ptr += nbas * 3
-    fakebas[:, gto.mole.ATOM_OF] = np.arange(nbas)
-    fakebas[:, gto.mole.ANG_OF] = angmom
-    fakebas[:, gto.mole.NPRIM_OF] = 1
-    fakebas[:, gto.mole.NCTR_OF] = 1
-    fakebas[:, gto.mole.PTR_EXP] = ptr + np.arange(nbas) * 2
-    fakebas[:, gto.mole.PTR_COEFF] = ptr + np.arange(nbas) * 2 + 1
-    # angular normalization
-    coeff = ang_norm[l] * coeffs
-    fakeenv.append(np.vstack((exponents, coeff)).T.ravel())
-
-    fakemol = gto.Mole()
-    fakemol.cart = cart
-    fakemol._atm = fakeatm
-    fakemol._bas = fakebas
-    fakemol._env = np.hstack(fakeenv)
-    fakemol._built = True
-    return fakemol
+from pyscf.solvent.gostshyp import fakemol_for_gaussian
 
 
 def compute_int3c_overlap_cpu(mol, aux_coords, aux_exponents, aux_l=0, aux_cart=True):
     """
     Compute 3-center overlap integrals using PySCF's int3c1e with supermol approach.
-
-    This matches the CPU GOSTSHYP reference implementation.
 
     Parameters
     ----------
