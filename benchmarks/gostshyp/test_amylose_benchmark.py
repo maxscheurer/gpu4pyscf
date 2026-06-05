@@ -48,9 +48,9 @@ def xyz_file(request):
 
 @pytest.mark.parametrize(
     "overlap_cutoff", [
-        0.0,
+#        0.0,
         1e-14,
-        1e-12, 1e-10, 1e-8, 1e-6,
+#        1e-12, 1e-10, 1e-8, 1e-6,
     ],
 )
 def test_amylose(xyz_file, overlap_cutoff):

@@ -30,6 +30,7 @@ from gpu4pyscf.solvent.pcm import gen_surface, modified_Bondi
 from gpu4pyscf.gto.int3c1e import VHFOpt
 from gpu4pyscf.gto import int3c_overlap
 from gpu4pyscf.lib import logger
+from pyscf.data.radii import BOHR
 
 
 @lib.with_doc(_attach_solvent._for_scf.__doc__)
@@ -213,6 +214,31 @@ class GOSTSHYP(lib.StreamObject):
     def n_gaussian(self):
         """Number of surface Gaussians."""
         return len(self.areas) if hasattr(self, 'areas') else 0
+
+    def export_cavity_xyz(self, filename):
+        """Export cavity surface grid points as an XYZ file.
+
+        Parameters
+        ----------
+        filename : str
+            Path to the output XYZ file.
+        """
+        if not hasattr(self, 'grid_coords') or self.grid_coords is None:
+            raise RuntimeError('No surface data. Call build() first.')
+
+        coords_ang = self.grid_coords.get() * BOHR
+        areas = self.areas.get()
+        ngrids = len(coords_ang)
+        total_area = float(areas.sum()) * BOHR**2
+
+        with open(filename, 'w') as f:
+            f.write(f'{ngrids}\n')
+            f.write(f'cavity={self.cavity}  pressure={self.pressure_mpa:.1f} MPa  '
+                    f'area={total_area:.4f} Ang^2\n')
+            for i in range(ngrids):
+                sym = self.mol.atom_symbol(int(self.atom_idx[i]))
+                f.write(f'{sym:2s} {coords_ang[i,0]:16.10f} {coords_ang[i,1]:16.10f} '
+                        f'{coords_ang[i,2]:16.10f}\n')
 
     def _compute_gtilde(self):
         """Compute s-type 3-center overlap integrals (cached)."""
