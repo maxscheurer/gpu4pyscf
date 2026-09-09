@@ -73,7 +73,9 @@ class GOSTSHYP(lib.StreamObject):
         'mol', 'pressure_mpa', 'npoints', 'scaling_factor',
         'surface', 'intopt', 'frozen', 'equilibrium_solvation',
         'e', 'v', 'amplitudes', 'forces', 'gtilde_expval',
-        'overlap_cutoff', 'cavity', 'r_ext',
+        'overlap_cutoff', 'cavity', 'r_ext', 'drop_kwargs',
+        'grid_coords', 'areas', 'widths', 'atom_idx', 'surface_normals',
+        'surface_distances',
     }
 
     def __init__(self, mol, options=None):
@@ -89,11 +91,16 @@ class GOSTSHYP(lib.StreamObject):
         self.npoints = options.get('npoints', 110)
         self.scaling_factor = options.get('scaling_factor', 1.2)
         self.overlap_cutoff = options.get('overlap_cutoff', 1e-14)
-        self.cavity = options.get('cavity', 'vdw/occ')     # 'vdw' or 'vdw/occ'
+        self.cavity = options.get('cavity', 'vdw/occ')
         self.r_ext = options.get('r_ext', 0.4724)          # Bohr (0.25 Ang)
+        self.drop_kwargs = dict(options.get('drop_kwargs') or {})
 
         # Internal state
         self.surface = {}
+        self._outer_surface = None
+        self._occ_ratio_sq = None
+        self._drop_cavity = None
+        self._surface_derivatives = None
         self.intopt = None
         self.frozen = False
         self.equilibrium_solvation = False
@@ -111,6 +118,9 @@ class GOSTSHYP(lib.StreamObject):
         # Timing (GPU ms accumulated via CUDA events)
         self._t_gpu_ms = 0.0
         self._t_wall = 0.0
+        self._grad_t_wall = 0.0
+        self._t_moist_build = 0.0
+        self._t_moist_grad = 0.0
         self._n_kernel = 0
 
     @property
@@ -128,86 +138,126 @@ class GOSTSHYP(lib.StreamObject):
         logger.info(self, 'cavity = %s', self.cavity)
         if self.cavity == 'vdw/occ':
             logger.info(self, 'r_ext = %.4f Bohr (%.4f Ang)', self.r_ext, self.r_ext * 0.529177)
+        elif self.cavity == 'drop':
+            logger.info(self, 'using MOIST DROPSvdW cavity')
         logger.info(self, 'frozen = %s', self.frozen)
         logger.info(self, 'equilibrium_solvation = %s', self.equilibrium_solvation)
-        if self.surface:
-            ngrids = len(self.surface['area'])
-            logger.info(self, 'n_surface_points = %d', ngrids)
+        if hasattr(self, 'areas') and self.areas is not None:
+            logger.info(self, 'n_surface_points = %d', len(self.areas))
         return self
 
-    def build(self, mol=None):
-        """
-        Build surface tessellation and integral options.
+    def check_sanity(self):
+        if self.pressure_mpa <= 0:
+            raise ValueError(f'pressure_mpa must be positive, got {self.pressure_mpa}')
+        if self.scaling_factor <= 0:
+            raise ValueError(
+                f'scaling_factor must be positive, got {self.scaling_factor}')
+        if self.cavity not in ('vdw', 'vdw/occ', 'drop'):
+            raise ValueError(
+                "cavity must be 'vdw', 'vdw/occ', or 'drop', "
+                f"got '{self.cavity}'")
+        if self.cavity == 'vdw/occ' and self.r_ext <= 0:
+            raise ValueError(
+                f'r_ext must be positive for vdw/occ, got {self.r_ext}')
+        return self
 
-        Parameters
-        ----------
-        mol : pyscf.gto.Mole, optional
-            Molecular object (uses self.mol if not provided)
-        """
+    def _build_gen_surface(self, mol):
+        """Build a PCM surface and return its common surface arrays."""
+        rad = self.scaling_factor * modified_Bondi
+        if self.cavity == 'vdw/occ':
+            self.surface = gen_surface(
+                mol, ng=self.npoints, rad=rad + self.r_ext)
+            self._outer_surface = dict(self.surface)
+
+            norm_vec = self.surface['norm_vec']
+            grid_outer = self.surface['grid_coords']
+            grid_inner = grid_outer - self.r_ext * norm_vec
+            R_outer = self.surface['R_vdw']
+            R_inner = R_outer - self.r_ext
+            self._occ_ratio_sq = (R_inner / R_outer) ** 2
+
+            self.surface['grid_coords_outer'] = grid_outer
+            self.surface['grid_coords'] = grid_inner
+            self.surface['area'] = (
+                self.surface['area'] * self._occ_ratio_sq)
+            self.surface['R_vdw'] = R_inner
+        else:
+            self.surface = gen_surface(mol, ng=self.npoints, rad=rad)
+            self._outer_surface = None
+            self._occ_ratio_sq = None
+
+        atom_idx = np.empty(len(self.surface['area']), dtype=np.int32)
+        for ia, (p0, p1) in enumerate(self.surface['gslice_by_atom']):
+            atom_idx[p0:p1] = ia
+        self._drop_cavity = None
+        return self.surface['grid_coords'], self.surface['area'], atom_idx
+
+    def _build_drop_surface(self, mol):
+        """Build a MOIST DROP surface and return its common surface arrays."""
+        from gpu4pyscf.solvent.moist import build_drop_cavity, get_surface_data
+
+        t0 = logger.perf_counter()
+        self._drop_cavity = build_drop_cavity(
+            mol, nleb=self.npoints, **self.drop_kwargs)
+        grid_coords, areas, atom_idx = get_surface_data(self._drop_cavity)
+        self._t_moist_build += logger.perf_counter() - t0
+        self.surface = None
+        self._outer_surface = None
+        self._occ_ratio_sq = None
+        return grid_coords, areas, atom_idx
+
+    def _finalize_surface(self, mol, grid_coords, areas, atom_idx):
+        """Normalize cavity output and initialize shared GPU state."""
+        self.grid_coords = cp.ascontiguousarray(
+            cp.asarray(grid_coords, dtype=cp.float64))
+        self.areas = cp.ascontiguousarray(cp.asarray(areas, dtype=cp.float64))
+        self.atom_idx = np.ascontiguousarray(atom_idx, dtype=np.int32)
+
+        ngrids = len(self.areas)
+        if self.grid_coords.shape != (ngrids, 3):
+            raise ValueError(
+                f'Expected grid coordinates ({ngrids}, 3), '
+                f'got {self.grid_coords.shape}')
+        if self.atom_idx.shape != (ngrids,):
+            raise ValueError(
+                f'Expected {ngrids} surface owners, got {self.atom_idx.shape}')
+        if ngrids == 0 or bool(cp.any(self.areas <= 0)):
+            raise ValueError('DROP/VDW cavity has no grids or non-positive areas')
+        if np.any(self.atom_idx < 0) or np.any(self.atom_idx >= mol.natm):
+            raise ValueError('Surface owner index is outside the molecule')
+
+        self.widths = cp.float64(np.pi * np.log(2)) / self.areas
+        owner_gpu = cp.asarray(self.atom_idx)
+        atom_coords = cp.asarray(mol.atom_coords(), dtype=cp.float64)
+        displacement = atom_coords[owner_gpu] - self.grid_coords
+        distance = cp.linalg.norm(displacement, axis=1)
+        if bool(cp.any(distance < 1e-14)):
+            raise ValueError('Surface grid point coincides with its owner atom')
+        self.surface_distances = distance
+        self.surface_normals = displacement / distance[:, None]
+
+        self.intopt = VHFOpt(mol)
+        self.intopt.build(1e-20, aosym=True)
+        self._gtilde = None
+        self._force_operators = None
+        self._surface_derivatives = None
+        return ngrids
+
+    def build(self, mol=None):
+        """Build the selected cavity and common integral state."""
         if mol is not None:
             self.mol = mol
         mol = self.mol
+        self.check_sanity()
 
-        # Generate surface using PCM infrastructure
-        rad = self.scaling_factor * modified_Bondi
-
-        if self.cavity == 'vdw/occ':
-            r_ext = self.r_ext
-            # Build OUTER surface (inflated radii) -- switching is crevice-free
-            rad_outer = rad + r_ext  # add r_ext to all elements
-            self.surface = gen_surface(mol, ng=self.npoints, rad=rad_outer)
-
-            # Project grid coords inward to actual vdW surface
-            norm_vec = self.surface['norm_vec']        # Lebedev unit vectors (outward)
-            grid_outer = self.surface['grid_coords']   # outer positions (cupy)
-            grid_inner = grid_outer - r_ext * norm_vec # inner positions (cupy)
-
-            # Scale areas: w * R_inner^2 * swf_outer (instead of w * R_outer^2 * swf_outer)
-            R_outer_per_grid = self.surface['R_vdw']   # per-grid outer radius
-            R_inner_per_grid = R_outer_per_grid - r_ext
-            ratio_sq = (R_inner_per_grid / R_outer_per_grid) ** 2
-            area_occ = self.surface['area'] * ratio_sq
-
-            # Store both sets of coords; GOSTSHYP energy uses inner, gradient uses outer
-            self.surface['grid_coords_outer'] = grid_outer  # for get_dF_dA
-            self.surface['grid_coords'] = grid_inner         # for overlap integrals
-            self.surface['area'] = area_occ
-            self.surface['R_vdw'] = R_inner_per_grid         # inner radii
+        if self.cavity == 'drop':
+            surface_data = self._build_drop_surface(mol)
         else:
-            # Plain vdW (current behavior, unchanged)
-            self.surface = gen_surface(mol, ng=self.npoints, rad=rad)
+            surface_data = self._build_gen_surface(mol)
+        ngrids = self._finalize_surface(mol, *surface_data)
 
-        # Compute Gaussian widths from areas (eq. 4 in GOSTSHYP paper)
-        # width = pi * ln(2) / area
-        # Keep grid data on GPU; gen_surface returns cupy arrays.
-        self.areas = self.surface['area']              # cupy [ngrids]
-        self.grid_coords = self.surface['grid_coords'] # cupy [ngrids, 3]
-        atom_coords = self.surface['atom_coords']      # cupy [natm, 3]
-        self.widths = cp.float64(np.pi * np.log(2)) / self.areas  # cupy [ngrids]
-        gslice_by_atom = self.surface['gslice_by_atom']
-
-        ngrids = len(self.areas)
-        atom_idx = np.zeros(ngrids, dtype=np.int32)
-        for ia, (p0, p1) in enumerate(gslice_by_atom):
-            atom_idx[p0:p1] = ia
-        self.atom_idx = atom_idx  # numpy (small, used for CPU scatter)
-
-        # Compute inward-pointing normals on GPU
-        atom_idx_gpu = cp.asarray(atom_idx)
-        ref_coords = atom_coords[atom_idx_gpu]
-        dr = ref_coords - self.grid_coords
-        dr_norm = cp.linalg.norm(dr, axis=1, keepdims=True)
-        self.surface_normals = dr / dr_norm  # cupy [ngrids, 3]
-
-        # Build VHFOpt for AO shell pairs
-        self.intopt = VHFOpt(mol)
-        self.intopt.build(1e-20, aosym=True)
-
-        # Clear cached operators
-        self._gtilde = None
-        self._force_operators = None
-
-        logger.info(self, 'GOSTSHYP: %d surface Gaussians', ngrids)
+        logger.info(self, 'GOSTSHYP: %d surface Gaussians (cavity=%s)',
+                    ngrids, self.cavity)
         return self
 
     @property
@@ -379,13 +429,43 @@ class GOSTSHYP(lib.StreamObject):
         return energy, self.v
 
     def reset(self, mol=None):
-        """Reset molecule and rebuild surface (for geometry optimization)."""
+        """Reset molecule and rebuild a responsive surface.
+
+        A frozen solvent represents a fixed external potential.  Preserve its
+        cached energy and potential across the standard SCF reset path.
+        """
         if mol is not None:
             self.mol = mol
-            self._gtilde = None
-            self._force_operators = None
-            self.build()
-        return self
+        if self.frozen:
+            return self
+        self.e = None
+        self.v = None
+        self.amplitudes = None
+        self.forces = None
+        self.gtilde_expval = None
+        self._surface_derivatives = None
+        return self.build()
+
+    def to_cpu(self):
+        """Create the corresponding pyscf-forge GOSTSHYP object."""
+        from pyscf.solvent.gostshyp import GOSTSHYP as CPU_GOSTSHYP
+
+        options = {
+            'pressure_mpa': self.pressure_mpa,
+            'npoints': self.npoints,
+            'scaling_factor': self.scaling_factor,
+            'cavity': self.cavity,
+            'r_ext': self.r_ext,
+            'drop_kwargs': dict(self.drop_kwargs),
+        }
+        out = CPU_GOSTSHYP(self.mol, options=options)
+        out.frozen = self.frozen
+        for name in ('e', 'v', 'amplitudes', 'forces', 'gtilde_expval'):
+            value = getattr(self, name, None)
+            if isinstance(value, cp.ndarray):
+                value = cp.asnumpy(value)
+            setattr(out, name, value)
+        return out
 
     def nuc_grad_method(self):
         """Return gradient object for nuclear gradients."""

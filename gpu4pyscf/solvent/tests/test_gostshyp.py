@@ -21,6 +21,7 @@ from pyscf-forge (pyscf.solvent.gostshyp).
 """
 
 import unittest
+from unittest import mock
 import numpy as np
 import cupy as cp
 from pyscf import gto, scf as cpu_scf
@@ -29,6 +30,7 @@ from pyscf.solvent.gostshyp import GOSTSHYP as GOSTSHYP_CPU
 from gpu4pyscf import scf
 from gpu4pyscf.solvent import _attach_solvent
 from gpu4pyscf.solvent.gostshyp import GOSTSHYP
+from gpu4pyscf.solvent.moist import HAS_MOIST
 
 
 def cpu_reference(mol, dm, options=None):
@@ -318,6 +320,11 @@ class TestGOSTSHYPBuild(unittest.TestCase):
 
         self.assertTrue(np.all(gostshyp.widths > 0))
 
+    def test_invalid_cavity(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 1', basis='sto-3g', verbose=0)
+        with self.assertRaisesRegex(ValueError, 'cavity must be'):
+            GOSTSHYP(mol, options={'cavity': 'unknown'}).build()
+
     def test_reset(self):
         """Test reset() clears cached data."""
         mol = gto.M(
@@ -559,6 +566,264 @@ class TestGOSTSHYPGradient(unittest.TestCase):
         ratio2 = errors[1] / errors[2]
         self.assertGreater(ratio1, 50, "FD convergence not O(h^2)")
         self.assertGreater(ratio2, 10, "FD convergence not O(h^2)")
+
+
+class TestMOISTAdapter(unittest.TestCase):
+    def test_missing_moist_error_from_public_build(self):
+        from gpu4pyscf.solvent import moist as moist_adapter
+        mol = gto.M(atom='H 0 0 0; H 0 0 1', basis='sto-3g', verbose=0)
+        with mock.patch.object(moist_adapter, 'HAS_MOIST', False), \
+             mock.patch.object(moist_adapter, '_MOIST_IMPORT_ERROR', None):
+            with self.assertRaisesRegex(ImportError, 'gpu4pyscf\\[moist\\]'):
+                GOSTSHYP(mol, options={'cavity': 'drop'}).build()
+
+    def test_broken_moist_import_preserves_cause(self):
+        from gpu4pyscf.solvent import moist as moist_adapter
+        cause = ImportError('cannot load libmoist.so')
+        with mock.patch.object(moist_adapter, 'HAS_MOIST', False), \
+             mock.patch.object(moist_adapter, '_MOIST_IMPORT_ERROR', cause):
+            with self.assertRaisesRegex(ImportError, 'could not be imported') as ctx:
+                moist_adapter._require_moist()
+        self.assertIs(ctx.exception.__cause__, cause)
+
+
+@unittest.skipUnless(HAS_MOIST, 'MOIST library not available')
+class TestDROPCavity(unittest.TestCase):
+    def setUp(self):
+        self.options = {'cavity': 'drop', 'npoints': 26}
+        self.mol = gto.M(
+            atom='H 0 0 0; F 0 0 1', basis='sto-3g', cart=True,
+            verbose=0)
+        self.dm = converged_dm(self.mol)
+
+    def test_surface_energy_fock_and_fused_kernels(self):
+        from gpu4pyscf.gto import int3c_overlap
+
+        gost = GOSTSHYP(self.mol, options=self.options).build()
+        self.assertGreater(gost.n_gaussian, 0)
+        self.assertTrue(bool(cp.all(gost.areas > 0)))
+        self.assertEqual(gost.grid_coords.shape, (gost.n_gaussian, 3))
+        self.assertEqual(gost.atom_idx.shape, (gost.n_gaussian,))
+        np.testing.assert_allclose(
+            cp.asnumpy(cp.linalg.norm(gost.surface_normals, axis=1)),
+            1.0, atol=1e-12)
+
+        with mock.patch.object(
+                int3c_overlap, 'get_int3c_overlap_density_contracted_sp',
+                wraps=int3c_overlap.get_int3c_overlap_density_contracted_sp
+        ) as density_sp, mock.patch.object(
+                int3c_overlap, 'get_int3c_overlap_amplitude_contracted_sp',
+                wraps=int3c_overlap.get_int3c_overlap_amplitude_contracted_sp
+        ) as amplitude_sp:
+            energy, fock = gost.kernel(self.dm)
+
+        self.assertEqual(density_sp.call_count, 1)
+        self.assertEqual(amplitude_sp.call_count, 1)
+        self.assertEqual(density_sp.call_args.args[1].shape,
+                         (gost.n_gaussian, 3))
+        self.assertEqual(amplitude_sp.call_args.kwargs['amp_p'].shape,
+                         (gost.n_gaussian, 3))
+
+        cpu = cpu_reference(self.mol, self.dm, options=self.options)
+        np.testing.assert_allclose(energy, cpu.e, atol=1e-7, rtol=1e-7)
+        fock = cp.asnumpy(fock)
+        np.testing.assert_allclose(fock, cpu.v, atol=1e-7, rtol=1e-7)
+        np.testing.assert_allclose(fock, fock.T, atol=1e-12)
+        np.testing.assert_allclose(
+            cp.asnumpy(gost.forces), cpu.forces, atol=1e-7, rtol=1e-7)
+        np.testing.assert_allclose(
+            cp.asnumpy(gost.amplitudes), cpu.amplitudes,
+            atol=1e-7, rtol=1e-7)
+
+    def test_attached_scf_and_frozen_reset(self):
+        gost = GOSTSHYP(self.mol, options=self.options)
+        mf = scf.RHF(self.mol)
+        mf.conv_tol = 1e-9
+        mf = _attach_solvent._for_scf(mf, gost)
+        mf.kernel()
+        self.assertTrue(mf.converged)
+        np.testing.assert_allclose(
+            cp.asnumpy(gost.v), cp.asnumpy(gost.v).T, atol=1e-12)
+
+        frozen = GOSTSHYP(self.mol, options=self.options)
+        frozen_mf = _attach_solvent._for_scf(
+            scf.RHF(self.mol), frozen, dm=self.dm)
+        energy_before = frozen.e
+        potential_before = frozen.v.copy()
+        frozen_mf.reset(self.mol)
+        self.assertEqual(frozen.e, energy_before)
+        np.testing.assert_allclose(
+            cp.asnumpy(frozen.v), cp.asnumpy(potential_before), atol=0.0)
+        veff = frozen_mf.get_veff(self.mol, cp.asarray(self.dm))
+        self.assertEqual(veff.v_solvent.shape, potential_before.shape)
+
+    def test_to_cpu_direct_and_attached(self):
+        gost = GOSTSHYP(self.mol, options=self.options).build()
+        energy_gpu, _ = gost.kernel(self.dm)
+        cpu = gost.to_cpu()
+        self.assertEqual(cpu.cavity, 'drop')
+        self.assertEqual(cpu._drop_kwargs, {})
+        energy_cpu, _ = cpu.kernel(self.dm)
+        np.testing.assert_allclose(energy_cpu, energy_gpu, atol=1e-7)
+
+        attached = _attach_solvent._for_scf(
+            scf.RHF(self.mol), gost, dm=self.dm)
+        attached_cpu = attached.to_cpu()
+        self.assertEqual(attached_cpu.with_solvent.cavity, 'drop')
+        self.assertTrue(attached_cpu.with_solvent.frozen)
+        attached_cpu.get_veff(self.mol, self.dm)
+
+    def test_moist_work_is_cached_outside_kernel(self):
+        from gpu4pyscf.solvent import moist as moist_adapter
+        from gpu4pyscf.solvent.grad.gostshyp import _get_surface_derivatives
+
+        gost = GOSTSHYP(self.mol, options=self.options).build()
+        with mock.patch.object(
+                moist_adapter, 'get_anchor_gradient',
+                wraps=moist_adapter.get_anchor_gradient) as anchor_gradient:
+            gost.kernel(self.dm)
+            gost.kernel(self.dm)
+            self.assertEqual(anchor_gradient.call_count, 0)
+
+            first = _get_surface_derivatives(gost)
+            second = _get_surface_derivatives(gost)
+            self.assertIs(first, second)
+            self.assertEqual(anchor_gradient.call_count, 1)
+
+            gost.reset()
+            _get_surface_derivatives(gost)
+            self.assertEqual(anchor_gradient.call_count, 2)
+
+
+@unittest.skipUnless(HAS_MOIST, 'MOIST library not available')
+class TestDROPGradient(unittest.TestCase):
+    def _gradient(self, mol, dm):
+        from gpu4pyscf.solvent.grad.gostshyp import Gradients
+        gost = GOSTSHYP(
+            mol, options={'cavity': 'drop', 'npoints': 26}).build()
+        gost.kernel(dm)
+        return gost, Gradients(gost).kernel(dm)
+
+    def _finite_difference(self, mol, dm, step=1e-3):
+        coords = mol.atom_coords().copy()
+        gradient = np.zeros((mol.natm, 3))
+        for atom in range(mol.natm):
+            for axis in range(3):
+                energies = []
+                for sign in (1.0, -1.0):
+                    displaced = mol.copy()
+                    displaced_coords = coords.copy()
+                    displaced_coords[atom, axis] += sign * step
+                    displaced.set_geom_(displaced_coords, unit='Bohr')
+                    displaced.build()
+                    gost = GOSTSHYP(
+                        displaced,
+                        options={'cavity': 'drop', 'npoints': 26}).build()
+                    energies.append(gost.kernel(dm)[0])
+                gradient[atom, axis] = (
+                    energies[0] - energies[1]) / (2.0 * step)
+        return gradient
+
+    def test_gradient_matches_cpu_and_kernel_sequence(self):
+        from gpu4pyscf.gto import int3c_overlap
+
+        mol = gto.M(
+            atom='H 0 0 0; F 0 0 1', basis='sto-3g', cart=True,
+            verbose=0)
+        dm = converged_dm(mol)
+        with mock.patch.object(
+                int3c_overlap, 'get_int3c_overlap_density_contracted',
+                wraps=int3c_overlap.get_int3c_overlap_density_contracted
+        ) as density_contracted:
+            _, grad_gpu = self._gradient(mol, dm)
+
+        aux_ls = [call.kwargs['aux_l']
+                  for call in density_contracted.call_args_list]
+        self.assertEqual(aux_ls, [1, 2, 0, 3])
+
+        cpu = cpu_reference(
+            mol, dm, options={'cavity': 'drop', 'npoints': 26})
+        np.testing.assert_allclose(
+            grad_gpu, cpu.grad(dm), atol=1e-6, rtol=1e-6)
+
+    def test_gradient_water_and_translational_invariance(self):
+        mol = gto.M(
+            atom='O 0 0 0.1174; H -0.757 0 -0.4696; '
+                 'H 0.757 0 -0.4696',
+            basis='sto-3g', cart=True, verbose=0)
+        dm = converged_dm(mol)
+        _, grad_gpu = self._gradient(mol, dm)
+        cpu = cpu_reference(
+            mol, dm, options={'cavity': 'drop', 'npoints': 26})
+        np.testing.assert_allclose(
+            grad_gpu, cpu.grad(dm), atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(grad_gpu.sum(axis=0), 0.0, atol=1e-7)
+
+    def test_gradient_spherical_basis(self):
+        mol = gto.M(
+            atom='H 0 0 0; F 0 0 1', basis='cc-pvdz', cart=False,
+            verbose=0)
+        self.assertNotEqual(mol.nao_nr(), mol.nao_nr(cart=True))
+        dm = converged_dm(mol)
+        gost, grad_gpu = self._gradient(mol, dm)
+        cpu = cpu_reference(
+            mol, dm, options={'cavity': 'drop', 'npoints': 26})
+        np.testing.assert_allclose(gost.e, cpu.e, atol=1e-7, rtol=1e-7)
+        np.testing.assert_allclose(
+            cp.asnumpy(gost.v), cpu.v, atol=1e-7, rtol=1e-7)
+        np.testing.assert_allclose(
+            grad_gpu, cpu.grad(dm), atol=1e-6, rtol=1e-6)
+
+    def test_gradient_finite_difference(self):
+        mol = gto.M(
+            atom='H 0 0 0; F 0 0 1', basis='sto-3g', cart=True,
+            verbose=0)
+        dm = converged_dm(mol)
+        _, analytic = self._gradient(mol, dm)
+        np.testing.assert_allclose(
+            analytic, self._finite_difference(mol, dm),
+            atol=1e-5, rtol=1e-5)
+
+    def test_polyatomic_gradient_finite_difference(self):
+        mol = gto.M(
+            atom='O 0 0 0.1174; H -0.757 0 -0.4696; '
+                 'H 0.757 0 -0.4696',
+            basis='sto-3g', cart=True, verbose=0)
+        dm = converged_dm(mol)
+        _, analytic = self._gradient(mol, dm)
+        np.testing.assert_allclose(
+            analytic, self._finite_difference(mol, dm),
+            atol=1e-5, rtol=1e-5)
+
+    def test_surface_response_components_are_active(self):
+        from gpu4pyscf.solvent.grad.gostshyp import (
+            _apply_grid_coordinate_response, _get_surface_derivatives)
+
+        mol = gto.M(
+            atom='O 0 0 0.1174; H -0.757 0 -0.4696; '
+                 'H 0.757 0 -0.4696',
+            basis='sto-3g', cart=True, verbose=0)
+        gost = GOSTSHYP(
+            mol, options={'cavity': 'drop', 'npoints': 26}).build()
+        dareas, dcoords = _get_surface_derivatives(gost)
+        self.assertGreater(float(cp.linalg.norm(dareas)), 0.0)
+        self.assertGreater(float(np.linalg.norm(dcoords)), 0.0)
+
+        rng = np.random.default_rng(2)
+        shape = (gost.n_gaussian, 3)
+        gtilde_grid = cp.asarray(rng.standard_normal(shape))
+        force_grid = cp.asarray(rng.standard_normal(shape))
+        p_contracted = cp.asarray(rng.standard_normal(shape))
+        force_coeffs = cp.asarray(rng.standard_normal(gost.n_gaussian))
+        gtilde_grad = cp.zeros((mol.natm, 3))
+        force_grad = cp.zeros((mol.natm, 3))
+        normal_grad = _apply_grid_coordinate_response(
+            gost, gtilde_grad, force_grad, gtilde_grid, force_grid,
+            p_contracted, force_coeffs, dcoords)
+
+        self.assertGreater(float(cp.linalg.norm(gtilde_grad)), 0.0)
+        self.assertGreater(float(cp.linalg.norm(force_grad)), 0.0)
+        self.assertGreater(float(cp.linalg.norm(normal_grad)), 0.0)
 
 
 if __name__ == "__main__":
