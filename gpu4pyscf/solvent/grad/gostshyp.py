@@ -41,12 +41,79 @@ def _per_atom_sum(per_ao, aoslice):
 
 
 def _scatter_add(target, indices, values):
-    """Scatter-add values[g, :] into target[indices[g], :] on GPU.
+    """Scatter-add values[g, :] into target[indices[g], :] on GPU."""
+    cp.add.at(target, cp.asarray(indices), values)
 
-    indices is a numpy int array (length ngrids), values is cupy (ngrids, 3).
-    """
-    indices_gpu = cp.asarray(indices)
-    cp.add.at(target, indices_gpu, values)
+
+def _get_surface_derivatives(gostshyp):
+    """Return cached area and optional non-rigid coordinate derivatives."""
+    if gostshyp._surface_derivatives is not None:
+        return gostshyp._surface_derivatives
+
+    if gostshyp.cavity == 'drop':
+        from gpu4pyscf.solvent.moist import get_anchor_gradient
+        t0 = logger.perf_counter()
+        dareas, dcoords = get_anchor_gradient(gostshyp._drop_cavity)
+        gostshyp._t_moist_grad += logger.perf_counter() - t0
+        expected_da = (gostshyp.mol.natm, 3, gostshyp.n_gaussian)
+        expected_dx = (3, 3, gostshyp.mol.natm, gostshyp.n_gaussian)
+        if dareas.shape != expected_da or dcoords.shape != expected_dx:
+            raise ValueError(
+                'Unexpected MOIST derivative shapes: '
+                f'{dareas.shape}, {dcoords.shape}; expected '
+                f'{expected_da}, {expected_dx}')
+        result = (cp.asarray(dareas), dcoords)
+    else:
+        surface = (gostshyp._outer_surface
+                   if gostshyp._outer_surface is not None
+                   else gostshyp.surface)
+        _, dareas = get_dF_dA(surface)
+        dareas = dareas.transpose(2, 0, 1)
+        if gostshyp._occ_ratio_sq is not None:
+            dareas *= gostshyp._occ_ratio_sq[None, None, :]
+        result = (dareas, None)
+
+    gostshyp._surface_derivatives = result
+    return result
+
+
+def _apply_grid_coordinate_response(gostshyp, gtilde_grad, force_grad,
+                                    gtilde_grid, force_grid, p_contracted,
+                                    force_coeffs, dcoords):
+    """Apply grid-center and normal response without duplicating cavity paths."""
+    if dcoords is None:
+        _scatter_add(gtilde_grad, gostshyp.atom_idx, -gtilde_grid)
+        _scatter_add(force_grad, gostshyp.atom_idx, -force_grid)
+        return cp.zeros_like(gtilde_grad)
+
+    natm = gostshyp.mol.natm
+    ngrids = gostshyp.n_gaussian
+    normal_grad = cp.zeros_like(gtilde_grad)
+
+    # Transfer the large host derivative tensor once per grid chunk and use it
+    # for both Gaussian-center terms and the normal response.
+    free_memory, _ = cp.cuda.runtime.memGetInfo()
+    bytes_per_grid = max(1, 9 * natm * np.dtype(np.float64).itemsize)
+    chunk_size = max(1, min(ngrids, int(0.1 * free_memory / bytes_per_grid)))
+
+    for p0 in range(0, ngrids, chunk_size):
+        p1 = min(ngrids, p0 + chunk_size)
+        dcoords_c = cp.asarray(np.ascontiguousarray(dcoords[..., p0:p1]))
+        gtilde_grad -= cp.einsum(
+            'gx,xaAg->Aa', gtilde_grid[p0:p1], dcoords_c)
+        force_grad -= cp.einsum(
+            'gx,xaAg->Aa', force_grid[p0:p1], dcoords_c)
+
+        normals_c = gostshyp.surface_normals[p0:p1]
+        q = force_coeffs[p0:p1, None] * p_contracted[p0:p1]
+        q_tangent = q - normals_c * cp.sum(q * normals_c, axis=1)[:, None]
+        q_tangent /= gostshyp.surface_distances[p0:p1, None]
+
+        owners_c = gostshyp.atom_idx[p0:p1]
+        _scatter_add(normal_grad, owners_c, q_tangent)
+        normal_grad -= cp.einsum('gc,caAg->Aa', q_tangent, dcoords_c)
+
+    return normal_grad
 
 
 class Gradients(lib.StreamObject):
@@ -96,21 +163,10 @@ class Gradients(lib.StreamObject):
         ngrids = len(areas)
         aoslice = mol.aoslice_by_atom()
 
-        # ---- Area derivatives (GPU — PCM infrastructure) ----
-        # Use outer grid coords for switching gradient (OCC), inner coords otherwise
-        gc_for_switching = gostshyp.surface.get('grid_coords_outer', grid_coords)
-        surface_dict = {
-            'grid_coords': gc_for_switching,
-            'area': areas,
-            'gslice_by_atom': gostshyp.surface['gslice_by_atom'],
-            'R_vdw': gostshyp.surface['R_vdw'],
-            'switch_fun': gostshyp.surface['switch_fun'],
-            'R_in_J': gostshyp.surface['R_in_J'],
-            'R_sw_J': gostshyp.surface['R_sw_J'],
-            'atom_coords': gostshyp.surface['atom_coords'],
-        }
-        _, dareas = get_dF_dA(surface_dict)
-        dareas = dareas.transpose(2, 0, 1)  # [3, ngrids, natm] -> [natm, 3, ngrids]
+        # Normalize PCM and MOIST derivatives to [natm, 3, ngrids].
+        # DROP coordinate derivatives stay on the host and are transferred once
+        # per chunk when all coordinate-dependent terms are available.
+        dareas, dcoords = _get_surface_derivatives(gostshyp)
 
         # Width gradient prefactors
         wgrad_prefs = -cp.float64(np.pi * np.log(2)) / (areas ** 2)
@@ -142,8 +198,6 @@ class Gradients(lib.StreamObject):
             mol, grid_coords, widths, aux_l=1, dm=dm, intopt=intopt, cutoff=cutoff)
         # p_contracted: cupy [ngrids, 3]
         dgtilde_gaussian = amplitudes[:, None] * 2.0 * widths[:, None] * p_contracted
-        _scatter_add(gtilde_operator_grad, atom_idx, -dgtilde_gaussian)
-        gtilde_operator_grad *= -1.0  # dr -> -dR
 
         # --- Part C: d-type width gradient ---
         d_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
@@ -152,8 +206,6 @@ class Gradients(lib.StreamObject):
         trace_d = d_contracted[:, 0] + d_contracted[:, 3] + d_contracted[:, 5]
         imd = wgrad_prefs * amplitudes * trace_d
         dE_d = -1.0 * cp.einsum('acg,g->ac', dareas, imd)
-
-        dE2 = gtilde_operator_grad + dE_d
 
         # ==================================================================
         # Term dE3: Force operator gradient
@@ -192,8 +244,15 @@ class Gradients(lib.StreamObject):
         dS_p_dC[:, 2, 2] = two_gamma * d_contracted[:, 5] - s_val
 
         dG = cp.einsum('gxp,gp,g->gx', dS_p_dC, normals, coeffs)
-        _scatter_add(force_operator_grad, atom_idx, -dG)
+
+        # Apply both Gaussian-center responses together.  For DROP this also
+        # adds normal response while reusing p_contracted from dE2.
+        dE_normal = _apply_grid_coordinate_response(
+            gostshyp, gtilde_operator_grad, force_operator_grad,
+            dgtilde_gaussian, dG, p_contracted, coeffs, dcoords)
+        gtilde_operator_grad *= -1.0  # dr -> -dR
         force_operator_grad *= -1.0  # dr -> -dR
+        dE2 = gtilde_operator_grad + dE_d
 
         # --- Part C: f-type width gradient ---
         f_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
@@ -215,7 +274,7 @@ class Gradients(lib.StreamObject):
         width_grad_ftype = -P * cp.einsum(
             'g,g,axg,g->ax', areas, gtilde_expval, dFdR, rf2)
 
-        dE3 = force_operator_grad + width_grad_ftype
+        dE3 = force_operator_grad + dE_normal + width_grad_ftype
 
         gradient = dE1 + dE2 + dE3
 
