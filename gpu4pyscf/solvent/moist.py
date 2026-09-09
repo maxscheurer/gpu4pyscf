@@ -21,20 +21,34 @@ cross the NumPy/CuPy boundary in :mod:`gpu4pyscf.solvent.gostshyp`.
 
 import numpy as np
 
+_MOIST_IMPORT_ERROR = None
 try:
     from moist import CavityDROPSvdW, Structure
     HAS_MOIST = True
-except ImportError:
+except ModuleNotFoundError as err:
+    if err.name != 'moist':
+        _MOIST_IMPORT_ERROR = err
+    CavityDROPSvdW = None
+    Structure = None
+    HAS_MOIST = False
+except ImportError as err:
+    _MOIST_IMPORT_ERROR = err
     CavityDROPSvdW = None
     Structure = None
     HAS_MOIST = False
 
 
 def _require_moist():
-    if not HAS_MOIST:
+    if HAS_MOIST:
+        return
+    if _MOIST_IMPORT_ERROR is not None:
         raise ImportError(
-            'MOIST is required for cavity="drop". Install the optional '
-            'dependency with gpu4pyscf[moist].')
+            'MOIST is installed but could not be imported; inspect the '
+            'chained exception for the native-loader or API error.'
+        ) from _MOIST_IMPORT_ERROR
+    raise ImportError(
+        'MOIST is required for cavity="drop". Install the optional '
+        'dependency with gpu4pyscf[moist].')
 
 
 def build_drop_cavity(mol, nleb=110, **kwargs):

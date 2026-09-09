@@ -429,9 +429,15 @@ class GOSTSHYP(lib.StreamObject):
         return energy, self.v
 
     def reset(self, mol=None):
-        """Reset molecule and rebuild surface (for geometry optimization)."""
+        """Reset molecule and rebuild a responsive surface.
+
+        A frozen solvent represents a fixed external potential.  Preserve its
+        cached energy and potential across the standard SCF reset path.
+        """
         if mol is not None:
             self.mol = mol
+        if self.frozen:
+            return self
         self.e = None
         self.v = None
         self.amplitudes = None
@@ -439,6 +445,27 @@ class GOSTSHYP(lib.StreamObject):
         self.gtilde_expval = None
         self._surface_derivatives = None
         return self.build()
+
+    def to_cpu(self):
+        """Create the corresponding pyscf-forge GOSTSHYP object."""
+        from pyscf.solvent.gostshyp import GOSTSHYP as CPU_GOSTSHYP
+
+        options = {
+            'pressure_mpa': self.pressure_mpa,
+            'npoints': self.npoints,
+            'scaling_factor': self.scaling_factor,
+            'cavity': self.cavity,
+            'r_ext': self.r_ext,
+            'drop_kwargs': dict(self.drop_kwargs),
+        }
+        out = CPU_GOSTSHYP(self.mol, options=options)
+        out.frozen = self.frozen
+        for name in ('e', 'v', 'amplitudes', 'forces', 'gtilde_expval'):
+            value = getattr(self, name, None)
+            if isinstance(value, cp.ndarray):
+                value = cp.asnumpy(value)
+            setattr(out, name, value)
+        return out
 
     def nuc_grad_method(self):
         """Return gradient object for nuclear gradients."""
