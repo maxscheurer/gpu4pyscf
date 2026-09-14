@@ -144,5 +144,11 @@ setup(
         f'cupy-cuda{CUDA_VERSION}>=13.0,!=13.4.0', # Due to expm in cupyx.scipy.linalg and cutensor 2.0
         'geometric',
         f'gpu4pyscf-libxc-cuda{CUDA_VERSION}==0.5',
-    ]
+    ],
+    extras_require={
+        'moist': [
+            'moist @ git+https://github.com/lukaswittmann/moist.git'
+            '@bb46e22ae53b37e725b90f7991c1a12b74282464#subdirectory=python'
+        ],
+    },
 )
