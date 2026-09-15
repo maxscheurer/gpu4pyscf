@@ -47,9 +47,11 @@ def _scatter_add(target, indices, values):
 
 def _get_surface_derivatives(gostshyp):
     """Return cached area and optional non-rigid coordinate derivatives."""
+    if gostshyp.cavity == 'cavjax':
+        raise RuntimeError(
+            'CavJAX uses compact surface cotangents, not dense derivatives')
     if gostshyp._surface_derivatives is not None:
         return gostshyp._surface_derivatives
-
     if gostshyp.cavity == 'drop':
         from gpu4pyscf.solvent.moist import get_anchor_gradient
         t0 = logger.perf_counter()
@@ -77,43 +79,44 @@ def _get_surface_derivatives(gostshyp):
     return result
 
 
-def _apply_grid_coordinate_response(gostshyp, gtilde_grad, force_grad,
-                                    gtilde_grid, force_grid, p_contracted,
-                                    force_coeffs, dcoords):
-    """Apply grid-center and normal response without duplicating cavity paths."""
+def _surface_cotangent_response(gostshyp, point_cotangent, area_cotangent,
+                                 normal_cotangent):
+    """Contract compact surface cotangents through the cavity geometry."""
+    if gostshyp.cavity == 'cavjax':
+        cp.cuda.Device().synchronize()
+        response = gostshyp._cavjax_backend.response(
+            gostshyp.mol.atom_coords(), cp.asnumpy(point_cotangent),
+            cp.asnumpy(area_cotangent), cp.asnumpy(normal_cotangent))
+        return cp.asarray(response)
+
+    dareas, dcoords = _get_surface_derivatives(gostshyp)
+    response = cp.einsum('acg,g->ac', dareas, area_cotangent)
     if dcoords is None:
-        _scatter_add(gtilde_grad, gostshyp.atom_idx, -gtilde_grid)
-        _scatter_add(force_grad, gostshyp.atom_idx, -force_grid)
-        return cp.zeros_like(gtilde_grad)
+        if gostshyp.atom_idx is None:
+            raise RuntimeError(
+                'Ownerless surface points cannot use rigid atom scattering')
+        _scatter_add(response, gostshyp.atom_idx, point_cotangent)
+        return response
 
     natm = gostshyp.mol.natm
     ngrids = gostshyp.n_gaussian
-    normal_grad = cp.zeros_like(gtilde_grad)
-
-    # Transfer the large host derivative tensor once per grid chunk and use it
-    # for both Gaussian-center terms and the normal response.
     free_memory, _ = cp.cuda.runtime.memGetInfo()
     bytes_per_grid = max(1, 9 * natm * np.dtype(np.float64).itemsize)
     chunk_size = max(1, min(ngrids, int(0.1 * free_memory / bytes_per_grid)))
-
     for p0 in range(0, ngrids, chunk_size):
         p1 = min(ngrids, p0 + chunk_size)
         dcoords_c = cp.asarray(np.ascontiguousarray(dcoords[..., p0:p1]))
-        gtilde_grad -= cp.einsum(
-            'gx,xaAg->Aa', gtilde_grid[p0:p1], dcoords_c)
-        force_grad -= cp.einsum(
-            'gx,xaAg->Aa', force_grid[p0:p1], dcoords_c)
+        response += cp.einsum(
+            'gx,xaAg->Aa', point_cotangent[p0:p1], dcoords_c)
 
         normals_c = gostshyp.surface_normals[p0:p1]
-        q = force_coeffs[p0:p1, None] * p_contracted[p0:p1]
-        q_tangent = q - normals_c * cp.sum(q * normals_c, axis=1)[:, None]
-        q_tangent /= gostshyp.surface_distances[p0:p1, None]
-
-        owners_c = gostshyp.atom_idx[p0:p1]
-        _scatter_add(normal_grad, owners_c, q_tangent)
-        normal_grad -= cp.einsum('gc,caAg->Aa', q_tangent, dcoords_c)
-
-    return normal_grad
+        normal_c = normal_cotangent[p0:p1]
+        tangent = normal_c - normals_c * cp.sum(
+            normal_c * normals_c, axis=1)[:, None]
+        tangent /= gostshyp.surface_distances[p0:p1, None]
+        _scatter_add(response, gostshyp.atom_idx[p0:p1], tangent)
+        response -= cp.einsum('gc,caAg->Aa', tangent, dcoords_c)
+    return response
 
 
 class Gradients(lib.StreamObject):
@@ -141,7 +144,6 @@ class Gradients(lib.StreamObject):
         t0 = logger.init_timer(self)
         gostshyp = self.gostshyp
         mol = self.mol
-        natm = mol.natm
 
         # Ensure dm is cupy on GPU
         dm = cp.asarray(dm)
@@ -149,6 +151,8 @@ class Gradients(lib.StreamObject):
             dm = dm[0] + dm[1]
 
         # Cached values from energy calculation (all cupy)
+        if gostshyp.forces is None:
+            raise RuntimeError('kernel() must be called before grad()')
         forces = gostshyp.forces
         amplitudes = gostshyp.amplitudes
         gtilde_expval = gostshyp.gtilde_expval
@@ -156,81 +160,68 @@ class Gradients(lib.StreamObject):
         areas = gostshyp.areas
         grid_coords = gostshyp.grid_coords
         normals = gostshyp.surface_normals
-        atom_idx = gostshyp.atom_idx  # numpy int array
         intopt = gostshyp.intopt
         P = gostshyp.pressure_au
         cutoff = gostshyp.overlap_cutoff
         ngrids = len(areas)
         aoslice = mol.aoslice_by_atom()
 
-        # Normalize PCM and MOIST derivatives to [natm, 3, ngrids].
-        # DROP coordinate derivatives stay on the host and are transferred once
-        # per chunk when all coordinate-dependent terms are available.
-        dareas, dcoords = _get_surface_derivatives(gostshyp)
+        gostshyp._grad_t_integrals = 0.0
+        gostshyp._grad_t_cotangent = 0.0
+        gostshyp._grad_t_cavjax_vjp = 0.0
+        integral_wall = 0.0
 
-        # Width gradient prefactors
+        def timed_integral(function, *args, **kwargs):
+            nonlocal integral_wall
+            started = logger.perf_counter()
+            value = function(*args, **kwargs)
+            integral_wall += logger.perf_counter() - started
+            return value
+
+        # Compact surface cotangents are shared by every cavity backend.
         wgrad_prefs = -cp.float64(np.pi * np.log(2)) / (areas ** 2)
+        area_cotangent = P * gtilde_expval / forces
 
-        # ==================================================================
-        # Term dE1: Area derivative
-        # ==================================================================
-        dE1 = P * cp.einsum(
-            'acg,g->ac', dareas, gtilde_expval / forces)
-
-        # ==================================================================
-        # Term dE2: Gtilde operator gradient
-        # ==================================================================
-
-        # --- Part A: AO center derivative (ip1 of s-type overlap) ---
-        # ip1 returns nabla_1 = -d/dA (PySCF convention). Result is cupy.
-        dPQ = int3c_overlap_ip.get_int3c_overlap_ip1_amplitude_contracted(
+        # AO-center and Gaussian-center response of the s-type operator.
+        dPQ = timed_integral(
+            int3c_overlap_ip.get_int3c_overlap_ip1_amplitude_contracted,
             mol, grid_coords, widths, aux_l=0,
             amplitudes=amplitudes[:, None], intopt=intopt, cutoff=cutoff)
-        # dPQ: cupy [3, nao, nao]
-
         dgtilde_braket = cp.einsum('xij,ij->ix', dPQ, dm)
         dgtilde_braket += cp.einsum('xij,ji->ix', dPQ, dm)
-        gtilde_operator_grad = _per_atom_sum(dgtilde_braket, aoslice)
+        explicit_nuclear = -_per_atom_sum(dgtilde_braket, aoslice)
 
-        # --- Part B: Aux center derivative (ip2 of s-type overlap) ---
-        # d/dC_x S(l=0) = 2*gamma * S(l=1, px), negated to nabla convention
-        p_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, grid_coords, widths, aux_l=1, dm=dm, intopt=intopt, cutoff=cutoff)
-        # p_contracted: cupy [ngrids, 3]
-        dgtilde_gaussian = amplitudes[:, None] * 2.0 * widths[:, None] * p_contracted
+        p_contracted = timed_integral(
+            int3c_overlap.get_int3c_overlap_density_contracted,
+            mol, grid_coords, widths, aux_l=1, dm=dm,
+            intopt=intopt, cutoff=cutoff)
+        point_cotangent = (
+            amplitudes[:, None] * 2.0 * widths[:, None] * p_contracted)
 
-        # --- Part C: d-type width gradient ---
-        d_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, grid_coords, widths, aux_l=2, dm=dm, intopt=intopt, cutoff=cutoff)
-        # d_contracted: cupy [ngrids, 6]
+        # Width and normalization response of the s-type operator.
+        d_contracted = timed_integral(
+            int3c_overlap.get_int3c_overlap_density_contracted,
+            mol, grid_coords, widths, aux_l=2, dm=dm,
+            intopt=intopt, cutoff=cutoff)
         trace_d = d_contracted[:, 0] + d_contracted[:, 3] + d_contracted[:, 5]
-        imd = wgrad_prefs * amplitudes * trace_d
-        dE_d = -1.0 * cp.einsum('acg,g->ac', dareas, imd)
+        area_cotangent -= wgrad_prefs * amplitudes * trace_d
 
-        # ==================================================================
-        # Term dE3: Force operator gradient
-        # ==================================================================
-
+        # AO-center and Gaussian-center response of the p-type force operator.
         coeffs = -2.0 * P * areas * gtilde_expval * widths / (forces * forces)
-
-        # --- Part A: AO center derivative (ip1 of p-type overlap) ---
-        # ip1 returns nabla_1 = -d/dA (PySCF convention). Result is cupy.
         weighted_amp = coeffs[:, None] * normals
-        dpq = int3c_overlap_ip.get_int3c_overlap_ip1_amplitude_contracted(
+        dpq = timed_integral(
+            int3c_overlap_ip.get_int3c_overlap_ip1_amplitude_contracted,
             mol, grid_coords, widths, aux_l=1,
             amplitudes=weighted_amp, intopt=intopt, cutoff=cutoff)
-        # dpq: cupy [3, nao, nao]
-
         dpq_ix = cp.einsum('xij,ij->ix', dpq, dm)
         dpq_ix += cp.einsum('xij,ji->ix', dpq, dm)
-        force_operator_grad = _per_atom_sum(dpq_ix, aoslice)
+        explicit_nuclear -= _per_atom_sum(dpq_ix, aoslice)
 
-        # --- Part B: Aux center derivative (ip2 of p-type overlap) ---
-        s_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, grid_coords, widths, aux_l=0, dm=dm, intopt=intopt, cutoff=cutoff)
-        s_val = s_contracted[:, 0]  # cupy [ngrids]
-
-        # Build 3x3 derivative matrix on GPU: dS_p_dC[g, x, p]
+        s_contracted = timed_integral(
+            int3c_overlap.get_int3c_overlap_density_contracted,
+            mol, grid_coords, widths, aux_l=0, dm=dm,
+            intopt=intopt, cutoff=cutoff)
+        s_val = s_contracted[:, 0]
         two_gamma = 2.0 * widths
         dS_p_dC = cp.zeros((ngrids, 3, 3))
         dS_p_dC[:, 0, 0] = two_gamma * d_contracted[:, 0] - s_val
@@ -242,41 +233,43 @@ class Gradients(lib.StreamObject):
         dS_p_dC[:, 2, 0] = two_gamma * d_contracted[:, 2]
         dS_p_dC[:, 2, 1] = two_gamma * d_contracted[:, 4]
         dS_p_dC[:, 2, 2] = two_gamma * d_contracted[:, 5] - s_val
+        point_cotangent += cp.einsum(
+            'gxp,gp,g->gx', dS_p_dC, normals, coeffs)
 
-        dG = cp.einsum('gxp,gp,g->gx', dS_p_dC, normals, coeffs)
+        # The force is linear in the stored inward normal.
+        normal_cotangent = coeffs[:, None] * p_contracted
 
-        # Apply both Gaussian-center responses together.  For DROP this also
-        # adds normal response while reusing p_contracted from dE2.
-        dE_normal = _apply_grid_coordinate_response(
-            gostshyp, gtilde_operator_grad, force_operator_grad,
-            dgtilde_gaussian, dG, p_contracted, coeffs, dcoords)
-        gtilde_operator_grad *= -1.0  # dr -> -dR
-        force_operator_grad *= -1.0  # dr -> -dR
-        dE2 = gtilde_operator_grad + dE_d
-
-        # --- Part C: f-type width gradient ---
-        f_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, grid_coords, widths, aux_l=3, dm=dm, intopt=intopt, cutoff=cutoff)
-        # f_contracted: cupy [ngrids, 10]
-        xf = f_contracted[:, 0] + f_contracted[:, 3] + f_contracted[:, 5]
-        yf = f_contracted[:, 1] + f_contracted[:, 6] + f_contracted[:, 8]
-        zf = f_contracted[:, 2] + f_contracted[:, 7] + f_contracted[:, 9]
-
-        f_coeffs = -2.0 * widths * wgrad_prefs
-        dr = cp.stack([xf, yf, zf], axis=1) * f_coeffs[:, None]
-
-        rf2 = 1.0 / (forces * forces)
+        # Width and normalization response of the force operator.
+        f_contracted = timed_integral(
+            int3c_overlap.get_int3c_overlap_density_contracted,
+            mol, grid_coords, widths, aux_l=3, dm=dm,
+            intopt=intopt, cutoff=cutoff)
+        traced_f = cp.stack([
+            f_contracted[:, 0] + f_contracted[:, 3] + f_contracted[:, 5],
+            f_contracted[:, 1] + f_contracted[:, 6] + f_contracted[:, 8],
+            f_contracted[:, 2] + f_contracted[:, 7] + f_contracted[:, 9],
+        ], axis=1)
+        dr = traced_f * (-2.0 * widths * wgrad_prefs)[:, None]
         dr *= normals
+        dF_darea = (wgrad_prefs * forces / widths
+                     + cp.sum(dr, axis=1))
+        dE_dF = -P * areas * gtilde_expval / (forces * forces)
+        area_cotangent += dE_dF * dF_darea
 
-        dFdR = dareas * (wgrad_prefs * forces / widths)[None, None, :]
-        dFdR += cp.einsum('gc,axg->axg', dr, dareas)
-
-        width_grad_ftype = -P * cp.einsum(
-            'g,g,axg,g->ax', areas, gtilde_expval, dFdR, rf2)
-
-        dE3 = force_operator_grad + dE_normal + width_grad_ftype
-
-        gradient = dE1 + dE2 + dE3
+        # Synchronize before timing/host transfer because int3c uses auxiliary
+        # CUDA streams and CavJAX response runs on the CPU.
+        cp.cuda.Device().synchronize()
+        before_response = logger.perf_counter()
+        gostshyp._grad_t_integrals = integral_wall
+        gostshyp._grad_t_cotangent = max(
+            0.0, before_response - _w0 - integral_wall)
+        response_started = logger.perf_counter()
+        geometry_response = _surface_cotangent_response(
+            gostshyp, point_cotangent, area_cotangent, normal_cotangent)
+        if gostshyp.cavity == 'cavjax':
+            gostshyp._grad_t_cavjax_vjp = (
+                logger.perf_counter() - response_started)
+        gradient = explicit_nuclear + geometry_response
 
         # Full device sync to catch errors from non-default streams used by
         # int3c kernels before returning control to the solute gradient.

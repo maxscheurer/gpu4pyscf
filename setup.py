@@ -150,5 +150,8 @@ setup(
             'moist @ git+https://github.com/lukaswittmann/moist.git'
             '@bb46e22ae53b37e725b90f7991c1a12b74282464#subdirectory=python'
         ],
+        'cavjax': [
+            'cavjax @ git+https://github.com/maxscheurer/cavjax.git@b2d0aa8'
+        ],
     },
 )
