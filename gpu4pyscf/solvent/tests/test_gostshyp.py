@@ -192,7 +192,7 @@ class TestGOSTSHYPSCF(unittest.TestCase):
         gostshyp = GOSTSHYP(mol)
         mf = _attach_solvent._for_scf(mf, gostshyp)
 
-        e_tot = mf.kernel()
+        mf.kernel()
         self.assertTrue(mf.converged, "UHF+GOSTSHYP did not converge")
 
     def test_custom_cutoff(self):
@@ -797,7 +797,7 @@ class TestDROPGradient(unittest.TestCase):
 
     def test_surface_response_components_are_active(self):
         from gpu4pyscf.solvent.grad.gostshyp import (
-            _apply_grid_coordinate_response, _get_surface_derivatives)
+            _get_surface_derivatives, _surface_cotangent_response)
 
         mol = gto.M(
             atom='O 0 0 0.1174; H -0.757 0 -0.4696; '
@@ -810,20 +810,17 @@ class TestDROPGradient(unittest.TestCase):
         self.assertGreater(float(np.linalg.norm(dcoords)), 0.0)
 
         rng = np.random.default_rng(2)
-        shape = (gost.n_gaussian, 3)
-        gtilde_grid = cp.asarray(rng.standard_normal(shape))
-        force_grid = cp.asarray(rng.standard_normal(shape))
-        p_contracted = cp.asarray(rng.standard_normal(shape))
-        force_coeffs = cp.asarray(rng.standard_normal(gost.n_gaussian))
-        gtilde_grad = cp.zeros((mol.natm, 3))
-        force_grad = cp.zeros((mol.natm, 3))
-        normal_grad = _apply_grid_coordinate_response(
-            gost, gtilde_grad, force_grad, gtilde_grid, force_grid,
-            p_contracted, force_coeffs, dcoords)
-
-        self.assertGreater(float(cp.linalg.norm(gtilde_grad)), 0.0)
-        self.assertGreater(float(cp.linalg.norm(force_grad)), 0.0)
-        self.assertGreater(float(cp.linalg.norm(normal_grad)), 0.0)
+        point = cp.asarray(rng.standard_normal((gost.n_gaussian, 3)))
+        area = cp.asarray(rng.standard_normal(gost.n_gaussian))
+        normal = cp.asarray(rng.standard_normal((gost.n_gaussian, 3)))
+        zeros_point = cp.zeros_like(point)
+        zeros_area = cp.zeros_like(area)
+        for cotangents in (
+                (point, zeros_area, zeros_point),
+                (zeros_point, area, zeros_point),
+                (zeros_point, zeros_area, normal)):
+            response = _surface_cotangent_response(gost, *cotangents)
+            self.assertGreater(float(cp.linalg.norm(response)), 0.0)
 
 
 if __name__ == "__main__":

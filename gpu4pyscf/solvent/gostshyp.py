@@ -21,6 +21,8 @@ References:
 """
 
 import ctypes
+from collections.abc import Mapping
+
 import numpy as np
 import cupy as cp
 from pyscf import lib
@@ -67,13 +69,13 @@ class GOSTSHYP(lib.StreamObject):
         VDW radii scaling factor (default: 1.2)
     """
 
-    from gpu4pyscf.lib.utils import to_gpu, device, to_cpu
+    from gpu4pyscf.lib.utils import to_gpu, device
 
     _keys = {
         'mol', 'pressure_mpa', 'npoints', 'scaling_factor',
         'surface', 'intopt', 'frozen', 'equilibrium_solvation',
         'e', 'v', 'amplitudes', 'forces', 'gtilde_expval',
-        'overlap_cutoff', 'cavity', 'r_ext', 'drop_kwargs',
+        'overlap_cutoff', 'cavity', 'r_ext', 'drop_kwargs', 'cavjax_kwargs',
         'grid_coords', 'areas', 'widths', 'atom_idx', 'surface_normals',
         'surface_distances',
     }
@@ -87,6 +89,8 @@ class GOSTSHYP(lib.StreamObject):
         # GOSTSHYP parameters
         if options is None:
             options = {}
+        if not isinstance(options, Mapping):
+            raise TypeError('GOSTSHYP options must be a mapping')
         self.pressure_mpa = options.get('pressure_mpa', 50_000)  # 50 GPa default
         self.npoints = options.get('npoints', 110)
         self.scaling_factor = options.get('scaling_factor', 1.2)
@@ -94,12 +98,20 @@ class GOSTSHYP(lib.StreamObject):
         self.cavity = options.get('cavity', 'vdw/occ')
         self.r_ext = options.get('r_ext', 0.4724)          # Bohr (0.25 Ang)
         self.drop_kwargs = dict(options.get('drop_kwargs') or {})
+        cavjax_kwargs = options.get('cavjax_kwargs')
+        if cavjax_kwargs is None:
+            cavjax_kwargs = {}
+        if not isinstance(cavjax_kwargs, Mapping):
+            raise TypeError('cavjax_kwargs must be a mapping')
+        self.cavjax_kwargs = dict(cavjax_kwargs)
 
         # Internal state
         self.surface = {}
         self._outer_surface = None
         self._occ_ratio_sq = None
         self._drop_cavity = None
+        self._cavjax_backend = None
+        self._cavjax_atomic_numbers = None
         self._surface_derivatives = None
         self.intopt = None
         self.frozen = False
@@ -121,6 +133,10 @@ class GOSTSHYP(lib.StreamObject):
         self._grad_t_wall = 0.0
         self._t_moist_build = 0.0
         self._t_moist_grad = 0.0
+        self._t_cavjax_build = 0.0
+        self._grad_t_integrals = 0.0
+        self._grad_t_cotangent = 0.0
+        self._grad_t_cavjax_vjp = 0.0
         self._n_kernel = 0
 
     @property
@@ -140,6 +156,19 @@ class GOSTSHYP(lib.StreamObject):
             logger.info(self, 'r_ext = %.4f Bohr (%.4f Ang)', self.r_ext, self.r_ext * 0.529177)
         elif self.cavity == 'drop':
             logger.info(self, 'using MOIST DROPSvdW cavity')
+        elif self.cavity == 'cavjax':
+            logger.info(self, 'CavJAX options = %s', self.cavjax_kwargs)
+            if self._cavjax_backend is not None:
+                logger.info(
+                    self, 'CavJAX resolved points = %d, shape directions = %d',
+                    self._cavjax_backend.n_points,
+                    self._cavjax_backend.n_shape_directions)
+            logger.info(self, 'CavJAX build wall time = %.3f s',
+                        self._t_cavjax_build)
+            logger.info(self, 'CavJAX gradient timings: integrals %.3f s, '
+                        'cotangents %.3f s, VJP %.3f s',
+                        self._grad_t_integrals, self._grad_t_cotangent,
+                        self._grad_t_cavjax_vjp)
         logger.info(self, 'frozen = %s', self.frozen)
         logger.info(self, 'equilibrium_solvation = %s', self.equilibrium_solvation)
         if hasattr(self, 'areas') and self.areas is not None:
@@ -152,9 +181,9 @@ class GOSTSHYP(lib.StreamObject):
         if self.scaling_factor <= 0:
             raise ValueError(
                 f'scaling_factor must be positive, got {self.scaling_factor}')
-        if self.cavity not in ('vdw', 'vdw/occ', 'drop'):
+        if self.cavity not in ('vdw', 'vdw/occ', 'drop', 'cavjax'):
             raise ValueError(
-                "cavity must be 'vdw', 'vdw/occ', or 'drop', "
+                "cavity must be 'vdw', 'vdw/occ', 'drop', or 'cavjax', "
                 f"got '{self.cavity}'")
         if self.cavity == 'vdw/occ' and self.r_ext <= 0:
             raise ValueError(
@@ -206,55 +235,116 @@ class GOSTSHYP(lib.StreamObject):
         self._occ_ratio_sq = None
         return grid_coords, areas, atom_idx
 
-    def _finalize_surface(self, mol, grid_coords, areas, atom_idx):
+    def _build_cavjax_surface(self, mol):
+        """Build an ownerless global surface with the retained CavJAX model."""
+        from gpu4pyscf.solvent.cavjax import CavJAXBackend
+
+        numbers = tuple(int(z) for z in mol.atom_charges())
+        if self._cavjax_backend is None:
+            self._cavjax_backend = CavJAXBackend(numbers, self.cavjax_kwargs)
+            self._cavjax_atomic_numbers = numbers
+        elif numbers != self._cavjax_atomic_numbers:
+            raise ValueError(
+                'CavJAX fixes atomic identities and order at construction; '
+                'create a new GOSTSHYP object for the changed composition')
+
+        grid_coords, areas, inward_normals = self._cavjax_backend.build(
+            mol.atom_coords())
+        self.surface = None
+        self._outer_surface = None
+        self._occ_ratio_sq = None
+        self._drop_cavity = None
+        return grid_coords, areas, None, inward_normals
+
+    def _invalidate_model_state(self):
+        """Invalidate quantities derived from a surface or density matrix."""
+        self.e = None
+        self.v = None
+        self.amplitudes = None
+        self.forces = None
+        self.gtilde_expval = None
+        self._gtilde = None
+        self._force_operators = None
+        self._surface_derivatives = None
+
+    def _finalize_surface(self, mol, grid_coords, areas, atom_idx,
+                          surface_normals=None):
         """Normalize cavity output and initialize shared GPU state."""
         self.grid_coords = cp.ascontiguousarray(
             cp.asarray(grid_coords, dtype=cp.float64))
         self.areas = cp.ascontiguousarray(cp.asarray(areas, dtype=cp.float64))
-        self.atom_idx = np.ascontiguousarray(atom_idx, dtype=np.int32)
+        self.atom_idx = (None if atom_idx is None else
+                         np.ascontiguousarray(atom_idx, dtype=np.int32))
 
         ngrids = len(self.areas)
         if self.grid_coords.shape != (ngrids, 3):
             raise ValueError(
                 f'Expected grid coordinates ({ngrids}, 3), '
                 f'got {self.grid_coords.shape}')
-        if self.atom_idx.shape != (ngrids,):
-            raise ValueError(
-                f'Expected {ngrids} surface owners, got {self.atom_idx.shape}')
         if ngrids == 0 or bool(cp.any(self.areas <= 0)):
-            raise ValueError('DROP/VDW cavity has no grids or non-positive areas')
-        if np.any(self.atom_idx < 0) or np.any(self.atom_idx >= mol.natm):
-            raise ValueError('Surface owner index is outside the molecule')
+            raise ValueError('Cavity has no grids or non-positive areas')
 
         self.widths = cp.float64(np.pi * np.log(2)) / self.areas
-        owner_gpu = cp.asarray(self.atom_idx)
-        atom_coords = cp.asarray(mol.atom_coords(), dtype=cp.float64)
-        displacement = atom_coords[owner_gpu] - self.grid_coords
-        distance = cp.linalg.norm(displacement, axis=1)
-        if bool(cp.any(distance < 1e-14)):
-            raise ValueError('Surface grid point coincides with its owner atom')
-        self.surface_distances = distance
-        self.surface_normals = displacement / distance[:, None]
+        if self.atom_idx is None:
+            if surface_normals is None:
+                raise ValueError('Ownerless cavity requires explicit normals')
+            normals = cp.ascontiguousarray(
+                cp.asarray(surface_normals, dtype=cp.float64))
+            if normals.shape != (ngrids, 3):
+                raise ValueError(
+                    f'Expected surface normals ({ngrids}, 3), '
+                    f'got {normals.shape}')
+            norm = cp.linalg.norm(normals, axis=1)
+            if bool(cp.any(~cp.isfinite(norm))) or not bool(cp.allclose(
+                    norm, 1.0, rtol=1e-10, atol=1e-10)):
+                raise ValueError('Ownerless cavity returned invalid unit normals')
+            self.surface_normals = normals
+            self.surface_distances = None
+        else:
+            if self.atom_idx.shape != (ngrids,):
+                raise ValueError(
+                    f'Expected {ngrids} surface owners, got {self.atom_idx.shape}')
+            if np.any(self.atom_idx < 0) or np.any(self.atom_idx >= mol.natm):
+                raise ValueError('Surface owner index is outside the molecule')
+            owner_gpu = cp.asarray(self.atom_idx)
+            atom_coords = cp.asarray(mol.atom_coords(), dtype=cp.float64)
+            displacement = atom_coords[owner_gpu] - self.grid_coords
+            distance = cp.linalg.norm(displacement, axis=1)
+            if bool(cp.any(distance < 1e-14)):
+                raise ValueError('Surface grid point coincides with its owner atom')
+            self.surface_distances = distance
+            self.surface_normals = displacement / distance[:, None]
 
         self.intopt = VHFOpt(mol)
         self.intopt.build(1e-20, aosym=True)
-        self._gtilde = None
-        self._force_operators = None
-        self._surface_derivatives = None
+        self._invalidate_model_state()
         return ngrids
 
     def build(self, mol=None):
         """Build the selected cavity and common integral state."""
         if mol is not None:
+            numbers = tuple(int(z) for z in mol.atom_charges())
+            if (self.cavity == 'cavjax'
+                    and self._cavjax_atomic_numbers is not None
+                    and numbers != self._cavjax_atomic_numbers):
+                raise ValueError(
+                    'CavJAX fixes atomic identities and order at construction; '
+                    'create a new GOSTSHYP object for the changed composition')
             self.mol = mol
         mol = self.mol
         self.check_sanity()
 
         if self.cavity == 'drop':
             surface_data = self._build_drop_surface(mol)
+        elif self.cavity == 'cavjax':
+            started = logger.perf_counter()
+            surface_data = self._build_cavjax_surface(mol)
         else:
             surface_data = self._build_gen_surface(mol)
         ngrids = self._finalize_surface(mol, *surface_data)
+        if self.cavity == 'cavjax':
+            cp.cuda.Device().synchronize()
+            self._t_cavjax_build = logger.perf_counter() - started
 
         logger.info(self, 'GOSTSHYP: %d surface Gaussians (cavity=%s)',
                     ngrids, self.cavity)
@@ -286,18 +376,19 @@ class GOSTSHYP(lib.StreamObject):
             f.write(f'cavity={self.cavity}  pressure={self.pressure_mpa:.1f} MPa  '
                     f'area={total_area:.4f} Ang^2\n')
             for i in range(ngrids):
-                sym = self.mol.atom_symbol(int(self.atom_idx[i]))
+                sym = ('X' if self.atom_idx is None else
+                       self.mol.atom_symbol(int(self.atom_idx[i])))
                 f.write(f'{sym:2s} {coords_ang[i,0]:16.10f} {coords_ang[i,1]:16.10f} '
                         f'{coords_ang[i,2]:16.10f}\n')
 
     def _compute_gtilde(self):
         """Compute s-type 3-center overlap integrals (cached)."""
+        if self.cavity == 'cavjax':
+            raise RuntimeError('CavJAX supports direct integral evaluation only')
         if self._gtilde is not None:
             return self._gtilde
 
         mol = self.mol
-        nao = mol.nao
-        ngrids = self.n_gaussian
 
         # Compute full tensor for s-type aux
         gtilde = int3c_overlap.get_int3c_overlap(
@@ -309,12 +400,12 @@ class GOSTSHYP(lib.StreamObject):
 
     def _compute_force_operators(self):
         """Compute p-type 3-center overlap contracted with normals (cached)."""
+        if self.cavity == 'cavjax':
+            raise RuntimeError('CavJAX supports direct integral evaluation only')
         if self._force_operators is not None:
             return self._force_operators
 
         mol = self.mol
-        nao = mol.nao
-        ngrids = self.n_gaussian
 
         # p-type coefficients: 2 * width (derivative of Gaussian)
         p_coeffs = 2.0 * self.widths
@@ -354,7 +445,8 @@ class GOSTSHYP(lib.StreamObject):
             GOSTSHYP contribution to Fock matrix
         """
         # Always record wall + GPU time for accumulation, regardless of verbose
-        _e0 = cp.cuda.Event(); _e0.record()
+        _e0 = cp.cuda.Event()
+        _e0.record()
         _w0 = logger.perf_counter()
         t0 = logger.init_timer(self)
         if not hasattr(self, 'areas') or self.areas is None:
@@ -421,7 +513,9 @@ class GOSTSHYP(lib.StreamObject):
         self.v = fock
 
         self._n_kernel += 1
-        _e1 = cp.cuda.Event(); _e1.record(); _e1.synchronize()
+        _e1 = cp.cuda.Event()
+        _e1.record()
+        _e1.synchronize()
         self._t_wall += logger.perf_counter() - _w0
         self._t_gpu_ms += cp.cuda.get_elapsed_time(_e0, _e1)
         logger.info(self, 'GOSTSHYP energy: %.10f', energy)
@@ -431,19 +525,31 @@ class GOSTSHYP(lib.StreamObject):
     def reset(self, mol=None):
         """Reset molecule and rebuild a responsive surface.
 
-        A frozen solvent represents a fixed external potential.  Preserve its
+        A frozen solvent represents a fixed external potential. Preserve its
         cached energy and potential across the standard SCF reset path.
         """
         if mol is not None:
+            numbers = tuple(int(z) for z in mol.atom_charges())
+            if (self.cavity == 'cavjax'
+                    and self._cavjax_atomic_numbers is not None
+                    and numbers != self._cavjax_atomic_numbers):
+                raise ValueError(
+                    'CavJAX fixes atomic identities and order at construction; '
+                    'create a new GOSTSHYP object for the changed composition')
             self.mol = mol
         if self.frozen:
             return self
-        self.e = None
-        self.v = None
-        self.amplitudes = None
-        self.forces = None
-        self.gtilde_expval = None
-        self._surface_derivatives = None
+        self._invalidate_model_state()
+        self._t_gpu_ms = 0.0
+        self._t_wall = 0.0
+        self._grad_t_wall = 0.0
+        self._t_moist_build = 0.0
+        self._t_moist_grad = 0.0
+        self._t_cavjax_build = 0.0
+        self._grad_t_integrals = 0.0
+        self._grad_t_cotangent = 0.0
+        self._grad_t_cavjax_vjp = 0.0
+        self._n_kernel = 0
         return self.build()
 
     def to_cpu(self):
@@ -457,6 +563,8 @@ class GOSTSHYP(lib.StreamObject):
             'cavity': self.cavity,
             'r_ext': self.r_ext,
             'drop_kwargs': dict(self.drop_kwargs),
+            'cavjax_kwargs': dict(self.cavjax_kwargs),
+            'direct': True,
         }
         out = CPU_GOSTSHYP(self.mol, options=options)
         out.frozen = self.frozen
