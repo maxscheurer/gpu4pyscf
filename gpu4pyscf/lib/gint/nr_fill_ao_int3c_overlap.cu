@@ -726,6 +726,7 @@ int GINTovlp_screen(
     int* counts, int* tiles_out, const int* pair_ptr,
     const double* tile_sphere, const double* tile_gamma, const int ntiles,
     const double* super_sphere, const double* super_gamma, const int tiles_per_super,
+    const double* block_sphere, const double* block_gamma, const int tiles_per_block,
     const double thresh, const int fill)
 {
     const ContractionProdType* cp_ij = bpcache->cptype + cp_ij_id;
@@ -739,7 +740,7 @@ int GINTovlp_screen(
     GINTovlp_screen_kernel<<<nblocks, nthreads, 0, stream>>>(
         counts, tiles_out, pair_ptr, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
         tile_sphere, tile_gamma, ntiles, super_sphere, super_gamma, tiles_per_super,
-        thresh, fill);
+        block_sphere, block_gamma, tiles_per_block, thresh, fill);
     return ovlp_check(__func__);
 }
 

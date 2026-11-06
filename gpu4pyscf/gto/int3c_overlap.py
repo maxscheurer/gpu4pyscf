@@ -621,7 +621,8 @@ def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, aux_cart=True,
 # ---------------------------------------------------------------------------
 
 OVLP_TILE = int(libgint.GINTovlp_tile_size())  # points per tile (CUDA side)
-OVLP_TILES_PER_SUPER = max(1, 512 // OVLP_TILE)  # ~512 points per superblock
+OVLP_TILES_PER_BLOCK = max(1, 32 // OVLP_TILE)   # 32 points per block
+OVLP_TILES_PER_SUPER = max(1, 512 // OVLP_TILE)  # 512 points per superblock
 
 
 def _part1by2(v):
@@ -678,20 +679,22 @@ class OverlapScreen:
         self.tile_gamma = cp.ascontiguousarray(
             cp.stack([tg.min(axis=1), tg.max(axis=1)], axis=1))
 
-        # superblocks of consecutive tiles for the pair-level pre-test
-        S = OVLP_TILES_PER_SUPER
-        nsuper = (ntiles + S - 1) // S
-        sidx = cp.minimum(cp.arange(nsuper * S), ntiles - 1).reshape(nsuper, S)
-        sc = center[sidx]
-        scenter = sc.mean(axis=1)
-        sradius = (cp.sqrt(((sc - scenter[:, None]) ** 2).sum(axis=2))
-                   + radius[sidx]).max(axis=1)
-        sradius = sradius * (1 + 1e-12) + 1e-12
-        self.super_sphere = cp.ascontiguousarray(
-            cp.hstack([scenter, sradius[:, None]]))
-        self.super_gamma = cp.ascontiguousarray(cp.stack(
-            [self.tile_gamma[sidx, 0].min(axis=1),
-             self.tile_gamma[sidx, 1].max(axis=1)], axis=1))
+        # blocks and superblocks of consecutive tiles for pair-level pre-tests
+        def group(S):
+            ngroup = (ntiles + S - 1) // S
+            gidx = cp.minimum(cp.arange(ngroup * S), ntiles - 1).reshape(ngroup, S)
+            gc = center[gidx]
+            gcenter = gc.mean(axis=1)
+            gradius = (cp.sqrt(((gc - gcenter[:, None]) ** 2).sum(axis=2))
+                       + radius[gidx]).max(axis=1)
+            gradius = gradius * (1 + 1e-12) + 1e-12
+            sphere = cp.ascontiguousarray(cp.hstack([gcenter, gradius[:, None]]))
+            gamma = cp.ascontiguousarray(cp.stack(
+                [self.tile_gamma[gidx, 0].min(axis=1),
+                 self.tile_gamma[gidx, 1].max(axis=1)], axis=1))
+            return sphere, gamma
+        self.super_sphere, self.super_gamma = group(OVLP_TILES_PER_SUPER)
+        self.block_sphere, self.block_gamma = group(OVLP_TILES_PER_BLOCK)
 
         npairs = int(intopt.bas_pairs_locs[-1])
         counts = cp.zeros(npairs, dtype=np.int32)
@@ -717,6 +720,9 @@ class OverlapScreen:
                     ctypes.c_void_p(self.super_sphere.data.ptr),
                     ctypes.c_void_p(self.super_gamma.data.ptr),
                     ctypes.c_int(OVLP_TILES_PER_SUPER),
+                    ctypes.c_void_p(self.block_sphere.data.ptr),
+                    ctypes.c_void_p(self.block_gamma.data.ptr),
+                    ctypes.c_int(OVLP_TILES_PER_BLOCK),
                     ctypes.c_double(thresh), ctypes.c_int(fill))
                 if err != 0:
                     raise RuntimeError('GINTovlp_screen failed')

@@ -30,7 +30,7 @@
  */
 
 #ifndef OVLP_TILE
-#define OVLP_TILE 8
+#define OVLP_TILE 1
 #endif
 #define OVLP_TPW (32 / OVLP_TILE)  // tiles processed concurrently per warp
 #define OVLP_WARPS_PER_BLOCK 4
@@ -62,6 +62,9 @@ __global__ void GINTovlp_screen_kernel(
     const double* __restrict__ super_sphere, // [nsuper, 4]
     const double* __restrict__ super_gamma,  // [nsuper, 2]
     const int tiles_per_super,
+    const double* __restrict__ block_sphere, // [nblock, 4]
+    const double* __restrict__ block_gamma,  // [nblock, 2]
+    const int tiles_per_block,               // tiles_per_super % tiles_per_block == 0
     const double thresh, const int fill)
 {
     // one warp per shell pair; lanes test superblocks / tiles in parallel
@@ -108,8 +111,29 @@ __global__ void GINTovlp_screen_kernel(
         while (smask) {
             const int s = sb0 + __ffs(smask) - 1;
             smask &= smask - 1;
-            const int tb = s * tiles_per_super;
-            const int te = min(ntiles, tb + tiles_per_super);
+            // middle level: blocks of tiles_per_block tiles inside superblock s
+            const int blocks_per_super = tiles_per_super / tiles_per_block;
+            const int nblock = (ntiles + tiles_per_block - 1) / tiles_per_block;
+            const int bb = s * blocks_per_super;
+            const int be = min(nblock, bb + blocks_per_super);
+            for (int b0 = bb; b0 < be; b0 += 32) {
+            const int bk = b0 + lane;
+            bool bpass = false;
+            if (bk < be) {
+                const double dx = px - block_sphere[bk * 4 + 0];
+                const double dy = py - block_sphere[bk * 4 + 1];
+                const double dz = pz - block_sphere[bk * 4 + 2];
+                double d = sqrt(dx * dx + dy * dy + dz * dz) - rp - block_sphere[bk * 4 + 3];
+                d = d > 0.0 ? d : 0.0;
+                bpass = ovlp_bound(amin, emax, d * d, block_gamma[bk * 2 + 0],
+                                   block_gamma[bk * 2 + 1]) >= thresh;
+            }
+            unsigned bmask = __ballot_sync(0xffffffffu, bpass);
+            while (bmask) {
+            const int blk = b0 + __ffs(bmask) - 1;
+            bmask &= bmask - 1;
+            const int tb = blk * tiles_per_block;
+            const int te = min(ntiles, tb + tiles_per_block);
             for (int t0 = tb; t0 < te; t0 += 32) {
                 const int t = t0 + lane;
                 bool keep = false;
@@ -135,6 +159,8 @@ __global__ void GINTovlp_screen_kernel(
                 const unsigned kmask = __ballot_sync(0xffffffffu, keep);
                 if (fill && keep) tiles_out[out0 + n + __popc(kmask & lt_mask)] = t;
                 n += __popc(kmask);
+            }
+            }  // blocks
             }
         }
     }
