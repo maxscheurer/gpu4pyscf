@@ -734,8 +734,9 @@ int GINTovlp_screen(
     const int ntasks_ij = bpcache->bas_pairs_locs[cp_ij_id + 1] - bas_ij0;
     const int prim_ij0 = bpcache->primitive_pairs_locs[cp_ij_id];
     if (ntasks_ij <= 0) return 0;
-    const int nthreads = 128;
-    GINTovlp_screen_kernel<<<(ntasks_ij + nthreads - 1) / nthreads, nthreads, 0, stream>>>(
+    const int nthreads = 128;  // 4 warps, one shell pair per warp
+    const int nblocks = (ntasks_ij + 3) / 4;
+    GINTovlp_screen_kernel<<<nblocks, nthreads, 0, stream>>>(
         counts, tiles_out, pair_ptr, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
         tile_sphere, tile_gamma, ntiles, super_sphere, super_gamma, tiles_per_super,
         thresh, fill);

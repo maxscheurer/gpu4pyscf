@@ -64,7 +64,9 @@ __global__ void GINTovlp_screen_kernel(
     const int tiles_per_super,
     const double thresh, const int fill)
 {
-    const int task = blockIdx.x * blockDim.x + threadIdx.x;
+    // one warp per shell pair; lanes test superblocks / tiles in parallel
+    const int lane = threadIdx.x & 31;
+    const int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (task >= ntasks_ij) return;
     const int bas_ij = bas_ij0 + task;
     const int p0 = prim_ij0 + task * nprim_ij;
@@ -86,45 +88,57 @@ __global__ void GINTovlp_screen_kernel(
     }
     rp = rp * (1.0 + 1e-12) + 1e-12;
 
+    const unsigned lt_mask = (1u << lane) - 1u;
     int n = 0;
     const int out0 = fill ? pair_ptr[bas_ij] : 0;
     const int nsuper = (ntiles + tiles_per_super - 1) / tiles_per_super;
-    for (int sb = 0; sb < nsuper; ++sb) {
-        {
+    for (int sb0 = 0; sb0 < nsuper; sb0 += 32) {
+        const int sb = sb0 + lane;
+        bool pass = false;
+        if (sb < nsuper) {
             const double dx = px - super_sphere[sb * 4 + 0];
             const double dy = py - super_sphere[sb * 4 + 1];
             const double dz = pz - super_sphere[sb * 4 + 2];
             double d = sqrt(dx * dx + dy * dy + dz * dz) - rp - super_sphere[sb * 4 + 3];
             d = d > 0.0 ? d : 0.0;
-            if (ovlp_bound(amin, emax, d * d, super_gamma[sb * 2 + 0],
-                           super_gamma[sb * 2 + 1]) < thresh) continue;
+            pass = ovlp_bound(amin, emax, d * d, super_gamma[sb * 2 + 0],
+                              super_gamma[sb * 2 + 1]) >= thresh;
         }
-        const int tb = sb * tiles_per_super;
-        const int te = min(ntiles, tb + tiles_per_super);
-        for (int t = tb; t < te; ++t) {
-            const double cx = tile_sphere[t * 4 + 0];
-            const double cy = tile_sphere[t * 4 + 1];
-            const double cz = tile_sphere[t * 4 + 2];
-            const double R  = tile_sphere[t * 4 + 3];
-            const double gmin = tile_gamma[t * 2 + 0];
-            const double gmax = tile_gamma[t * 2 + 1];
-            bool keep = false;
-            for (int ij = p0; ij < p0 + nprim_ij; ++ij) {
-                const double dx = c_bpcache.x12[ij] - cx;
-                const double dy = c_bpcache.y12[ij] - cy;
-                const double dz = c_bpcache.z12[ij] - cz;
-                double d = sqrt(dx * dx + dy * dy + dz * dz) - R;
-                d = d > 0.0 ? d : 0.0;
-                if (ovlp_bound(c_bpcache.a12[ij], fabs(c_bpcache.e12[ij]), d * d,
-                               gmin, gmax) >= thresh) { keep = true; break; }
-            }
-            if (keep) {
-                if (fill) tiles_out[out0 + n] = t;
-                ++n;
+        unsigned smask = __ballot_sync(0xffffffffu, pass);
+        while (smask) {
+            const int s = sb0 + __ffs(smask) - 1;
+            smask &= smask - 1;
+            const int tb = s * tiles_per_super;
+            const int te = min(ntiles, tb + tiles_per_super);
+            for (int t0 = tb; t0 < te; t0 += 32) {
+                const int t = t0 + lane;
+                bool keep = false;
+                if (t < te) {
+                    const double cx = tile_sphere[t * 4 + 0];
+                    const double cy = tile_sphere[t * 4 + 1];
+                    const double cz = tile_sphere[t * 4 + 2];
+                    const double R  = tile_sphere[t * 4 + 3];
+                    const double gmin = tile_gamma[t * 2 + 0];
+                    const double gmax = tile_gamma[t * 2 + 1];
+                    for (int ij = p0; ij < p0 + nprim_ij; ++ij) {
+                        const double dx = c_bpcache.x12[ij] - cx;
+                        const double dy = c_bpcache.y12[ij] - cy;
+                        const double dz = c_bpcache.z12[ij] - cz;
+                        double d = sqrt(dx * dx + dy * dy + dz * dz) - R;
+                        d = d > 0.0 ? d : 0.0;
+                        if (ovlp_bound(c_bpcache.a12[ij], fabs(c_bpcache.e12[ij]),
+                                       d * d, gmin, gmax) >= thresh) {
+                            keep = true; break;
+                        }
+                    }
+                }
+                const unsigned kmask = __ballot_sync(0xffffffffu, keep);
+                if (fill && keep) tiles_out[out0 + n + __popc(kmask & lt_mask)] = t;
+                n += __popc(kmask);
             }
         }
     }
-    if (!fill) counts[bas_ij] = n;
+    if (!fill && lane == 0) counts[bas_ij] = n;
 }
 
 // Shared prologue of the per-primitive work (identical arithmetic to the
