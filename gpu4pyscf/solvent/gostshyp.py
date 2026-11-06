@@ -114,6 +114,7 @@ class GOSTSHYP(lib.StreamObject):
         # Cached operators
         self._gtilde = None
         self._force_operators = None
+        self._screen = None
 
         # Timing (GPU ms accumulated via CUDA events)
         self._t_gpu_ms = 0.0
@@ -241,6 +242,7 @@ class GOSTSHYP(lib.StreamObject):
         self._gtilde = None
         self._force_operators = None
         self._surface_derivatives = None
+        self._screen = None
         return ngrids
 
     def build(self, mol=None):
@@ -259,6 +261,15 @@ class GOSTSHYP(lib.StreamObject):
         logger.info(self, 'GOSTSHYP: %d surface Gaussians (cavity=%s)',
                     ngrids, self.cavity)
         return self
+
+    def get_screen(self):
+        """Spatial (shell pair, grid tile) screening lists (cached)."""
+        scr = self._screen
+        if scr is None or not scr.matches(self.intopt, self.grid_coords,
+                                          self.overlap_cutoff):
+            scr = self._screen = int3c_overlap.OverlapScreen(
+                self.intopt, self.grid_coords, self.widths, self.overlap_cutoff)
+        return scr
 
     @property
     def n_gaussian(self):
@@ -372,12 +383,12 @@ class GOSTSHYP(lib.StreamObject):
         # All grid data (areas, widths, surface_normals, grid_coords) is already on GPU.
         p_coeffs = 2.0 * self.widths  # cupy [ngrids]
 
-        cutoff = self.overlap_cutoff
+        screen = self.get_screen()
 
         # Fused pass 1: density-contracted s+p integrals in one kernel pass
-        s_contracted, p_contracted = int3c_overlap.get_int3c_overlap_density_contracted_sp(
-            mol, self.grid_coords, self.widths, dm=dm, intopt=self.intopt, cutoff=cutoff)
-        gtilde_expval = s_contracted[:, 0]
+        sp_contracted = screen.density(mol, dm, kmax=1)
+        gtilde_expval = sp_contracted[:, 0]
+        p_contracted = sp_contracted[:, 1:4]
         forces = cp.sum(p_contracted * self.surface_normals * p_coeffs[:, None], axis=1)
 
         # Compute amplitudes = P * A_g / forces
@@ -408,10 +419,7 @@ class GOSTSHYP(lib.StreamObject):
         # Fused pass 2: amplitude-contracted s+p integrals in one kernel pass
         response_coeff = -self.pressure_au * self.areas * gtilde_expval / (forces ** 2)
         weighted_amp = response_coeff[:, None] * self.surface_normals * p_coeffs[:, None]
-        fock = int3c_overlap.get_int3c_overlap_amplitude_contracted_sp(
-            mol, self.grid_coords, self.widths,
-            amp_s=amplitudes, amp_p=weighted_amp,
-            intopt=self.intopt, cutoff=cutoff)
+        fock = screen.fock_sp(mol, amplitudes, weighted_amp)
 
         # Store results on GPU
         self.forces = forces

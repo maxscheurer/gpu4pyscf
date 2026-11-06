@@ -181,28 +181,28 @@ class Gradients(lib.StreamObject):
         # Term dE2: Gtilde operator gradient
         # ==================================================================
 
-        # --- Part A: AO center derivative (ip1 of s-type overlap) ---
-        # ip1 returns nabla_1 = -d/dA (PySCF convention). Result is cupy.
-        dPQ = int3c_overlap_ip.get_int3c_overlap_ip1_amplitude_contracted(
-            mol, grid_coords, widths, aux_l=0,
-            amplitudes=amplitudes[:, None], intopt=intopt, cutoff=cutoff)
-        # dPQ: cupy [3, nao, nao]
+        # One fused screened pass for all density contractions (aux l=0..3)
+        screen = gostshyp.get_screen()
+        dens = screen.density(mol, dm, kmax=3)
+        s_val = dens[:, 0]
+        p_contracted = dens[:, 1:4]
+        d_contracted = dens[:, 4:10]
+        f_contracted = dens[:, 10:20]
 
-        dgtilde_braket = cp.einsum('xij,ij->ix', dPQ, dm)
-        dgtilde_braket += cp.einsum('xij,ji->ix', dPQ, dm)
-        gtilde_operator_grad = _per_atom_sum(dgtilde_braket, aoslice)
+        coeffs = -2.0 * P * areas * gtilde_expval * widths / (forces * forces)
+        weighted_amp = coeffs[:, None] * normals
+
+        # --- Part A (dE2 + dE3): AO center derivatives of the s- and p-type
+        # operators, contracted with D + D^T and summed per atom in one pass.
+        gtilde_operator_grad = screen.ip1_sp_atoms(
+            mol, dm, amplitudes, weighted_amp)
+        force_operator_grad = cp.zeros_like(gtilde_operator_grad)
 
         # --- Part B: Aux center derivative (ip2 of s-type overlap) ---
         # d/dC_x S(l=0) = 2*gamma * S(l=1, px), negated to nabla convention
-        p_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, grid_coords, widths, aux_l=1, dm=dm, intopt=intopt, cutoff=cutoff)
-        # p_contracted: cupy [ngrids, 3]
         dgtilde_gaussian = amplitudes[:, None] * 2.0 * widths[:, None] * p_contracted
 
         # --- Part C: d-type width gradient ---
-        d_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, grid_coords, widths, aux_l=2, dm=dm, intopt=intopt, cutoff=cutoff)
-        # d_contracted: cupy [ngrids, 6]
         trace_d = d_contracted[:, 0] + d_contracted[:, 3] + d_contracted[:, 5]
         imd = wgrad_prefs * amplitudes * trace_d
         dE_d = -1.0 * cp.einsum('acg,g->ac', dareas, imd)
@@ -210,25 +210,6 @@ class Gradients(lib.StreamObject):
         # ==================================================================
         # Term dE3: Force operator gradient
         # ==================================================================
-
-        coeffs = -2.0 * P * areas * gtilde_expval * widths / (forces * forces)
-
-        # --- Part A: AO center derivative (ip1 of p-type overlap) ---
-        # ip1 returns nabla_1 = -d/dA (PySCF convention). Result is cupy.
-        weighted_amp = coeffs[:, None] * normals
-        dpq = int3c_overlap_ip.get_int3c_overlap_ip1_amplitude_contracted(
-            mol, grid_coords, widths, aux_l=1,
-            amplitudes=weighted_amp, intopt=intopt, cutoff=cutoff)
-        # dpq: cupy [3, nao, nao]
-
-        dpq_ix = cp.einsum('xij,ij->ix', dpq, dm)
-        dpq_ix += cp.einsum('xij,ji->ix', dpq, dm)
-        force_operator_grad = _per_atom_sum(dpq_ix, aoslice)
-
-        # --- Part B: Aux center derivative (ip2 of p-type overlap) ---
-        s_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, grid_coords, widths, aux_l=0, dm=dm, intopt=intopt, cutoff=cutoff)
-        s_val = s_contracted[:, 0]  # cupy [ngrids]
 
         # Build 3x3 derivative matrix on GPU: dS_p_dC[g, x, p]
         two_gamma = 2.0 * widths
@@ -255,9 +236,6 @@ class Gradients(lib.StreamObject):
         dE2 = gtilde_operator_grad + dE_d
 
         # --- Part C: f-type width gradient ---
-        f_contracted = int3c_overlap.get_int3c_overlap_density_contracted(
-            mol, grid_coords, widths, aux_l=3, dm=dm, intopt=intopt, cutoff=cutoff)
-        # f_contracted: cupy [ngrids, 10]
         xf = f_contracted[:, 0] + f_contracted[:, 3] + f_contracted[:, 5]
         yf = f_contracted[:, 1] + f_contracted[:, 6] + f_contracted[:, 8]
         zf = f_contracted[:, 2] + f_contracted[:, 7] + f_contracted[:, 9]

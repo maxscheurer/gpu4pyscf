@@ -608,20 +608,19 @@ class TestDROPCavity(unittest.TestCase):
             cp.asnumpy(cp.linalg.norm(gost.surface_normals, axis=1)),
             1.0, atol=1e-12)
 
+        screen_cls = int3c_overlap.OverlapScreen
         with mock.patch.object(
-                int3c_overlap, 'get_int3c_overlap_density_contracted_sp',
-                wraps=int3c_overlap.get_int3c_overlap_density_contracted_sp
-        ) as density_sp, mock.patch.object(
-                int3c_overlap, 'get_int3c_overlap_amplitude_contracted_sp',
-                wraps=int3c_overlap.get_int3c_overlap_amplitude_contracted_sp
-        ) as amplitude_sp:
+                screen_cls, 'density', autospec=True,
+                side_effect=screen_cls.density) as density, \
+             mock.patch.object(
+                screen_cls, 'fock_sp', autospec=True,
+                side_effect=screen_cls.fock_sp) as fock_sp:
             energy, fock = gost.kernel(self.dm)
 
-        self.assertEqual(density_sp.call_count, 1)
-        self.assertEqual(amplitude_sp.call_count, 1)
-        self.assertEqual(density_sp.call_args.args[1].shape,
-                         (gost.n_gaussian, 3))
-        self.assertEqual(amplitude_sp.call_args.kwargs['amp_p'].shape,
+        self.assertEqual(density.call_count, 1)
+        self.assertEqual(density.call_args.kwargs['kmax'], 1)
+        self.assertEqual(fock_sp.call_count, 1)
+        self.assertEqual(fock_sp.call_args.args[3].shape,
                          (gost.n_gaussian, 3))
 
         cpu = cpu_reference(self.mol, self.dm, options=self.options)
@@ -731,15 +730,19 @@ class TestDROPGradient(unittest.TestCase):
             atom='H 0 0 0; F 0 0 1', basis='sto-3g', cart=True,
             verbose=0)
         dm = converged_dm(mol)
+        screen_cls = int3c_overlap.OverlapScreen
         with mock.patch.object(
-                int3c_overlap, 'get_int3c_overlap_density_contracted',
-                wraps=int3c_overlap.get_int3c_overlap_density_contracted
-        ) as density_contracted:
+                screen_cls, 'density', autospec=True,
+                side_effect=screen_cls.density) as density, \
+             mock.patch.object(
+                screen_cls, 'ip1_sp_atoms', autospec=True,
+                side_effect=screen_cls.ip1_sp_atoms) as ip1:
             _, grad_gpu = self._gradient(mol, dm)
 
-        aux_ls = [call.kwargs['aux_l']
-                  for call in density_contracted.call_args_list]
-        self.assertEqual(aux_ls, [1, 2, 0, 3])
+        # kernel(): one s+p density pass; gradient: one fused s/p/d/f pass
+        kmaxs = [call.kwargs['kmax'] for call in density.call_args_list]
+        self.assertEqual(kmaxs, [1, 3])
+        self.assertEqual(ip1.call_count, 1)
 
         cpu = cpu_reference(
             mol, dm, options={'cavity': 'drop', 'npoints': 26})

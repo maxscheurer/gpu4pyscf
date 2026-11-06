@@ -614,3 +614,169 @@ def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, aux_cart=True,
     else:
         return get_int3c_overlap_amplitude_contracted(
             mol, aux_coords, aux_exponents, aux_l, amplitudes, intopt, cutoff)
+
+
+# ---------------------------------------------------------------------------
+# Spatially screened kernels
+# ---------------------------------------------------------------------------
+
+OVLP_TILE = 32
+
+
+def _part1by2(v):
+    """Spread the low 21 bits of v (uint64) to every third bit."""
+    v = v & np.uint64(0x1fffff)
+    v = (v | (v << np.uint64(32))) & np.uint64(0x1f00000000ffff)
+    v = (v | (v << np.uint64(16))) & np.uint64(0x1f0000ff0000ff)
+    v = (v | (v << np.uint64(8))) & np.uint64(0x100f00f00f00f00f)
+    v = (v | (v << np.uint64(4))) & np.uint64(0x10c30c30c30c30c3)
+    v = (v | (v << np.uint64(2))) & np.uint64(0x1249249249249249)
+    return v
+
+
+def _morton_order(coords):
+    lo = coords.min(axis=0)
+    span = float((coords.max(axis=0) - lo).max()) + 1e-12
+    q = ((coords - lo) * ((2**21 - 1) / span)).astype(cp.uint64)
+    code = (_part1by2(q[:, 0]) | (_part1by2(q[:, 1]) << np.uint64(1))
+            | (_part1by2(q[:, 2]) << np.uint64(2)))
+    return cp.argsort(code)
+
+
+class OverlapScreen:
+    """Rigorous (shell pair, grid tile) screening lists for one cavity.
+
+    Surface Gaussians are Morton-sorted and grouped into tiles of OVLP_TILE
+    points. A tile is kept for a shell pair if an upper bound of any primitive
+    prefactor over the tile reaches 0.5 * cutoff, so every primitive skipped by
+    screening would also be skipped by the kernels' own cutoff test.
+    """
+
+    def __init__(self, intopt, coords, exponents, cutoff):
+        coords = cp.ascontiguousarray(cp.asarray(coords, dtype=np.float64))
+        exponents = cp.ascontiguousarray(cp.asarray(exponents, dtype=np.float64))
+        self.intopt = intopt
+        self.cutoff = cutoff
+        ngrids = self.ngrids = coords.shape[0]
+        perm = _morton_order(coords)
+        self.perm = perm
+        self.coords = cp.ascontiguousarray(coords[perm])
+        self.exps = cp.ascontiguousarray(exponents[perm])
+
+        ntiles = self.ntiles = (ngrids + OVLP_TILE - 1) // OVLP_TILE
+        pad = ntiles * OVLP_TILE - ngrids
+        idx = cp.concatenate([cp.arange(ngrids), cp.full(pad, ngrids - 1)])
+        tc = self.coords[idx].reshape(ntiles, OVLP_TILE, 3)
+        tg = self.exps[idx].reshape(ntiles, OVLP_TILE)
+        center = tc.mean(axis=1)
+        radius = cp.sqrt(((tc - center[:, None]) ** 2).sum(axis=2)).max(axis=1)
+        # inflate slightly to absorb rounding of center/radius
+        radius = radius * (1 + 1e-12) + 1e-12
+        self.tile_sphere = cp.ascontiguousarray(
+            cp.hstack([center, radius[:, None]]))
+        self.tile_gamma = cp.ascontiguousarray(
+            cp.stack([tg.min(axis=1), tg.max(axis=1)], axis=1))
+
+        npairs = int(intopt.bas_pairs_locs[-1])
+        counts = cp.zeros(npairs, dtype=np.int32)
+        thresh = 0.5 * cutoff
+        libgint.GINTset_int3c_overlap_constants(intopt.bpcache, ctypes.c_double(cutoff))
+        stream = cp.cuda.get_current_stream()
+        null = ctypes.c_void_p(0)
+        for fill in (0, 1):
+            if fill:
+                ptr = cp.zeros(npairs + 1, dtype=np.int32)
+                cp.cumsum(counts, out=ptr[1:])
+                nnz = int(ptr[-1])
+                tiles = cp.empty(max(nnz, 1), dtype=np.int32)
+            for cp_ij_id in range(len(intopt.log_qs)):
+                err = libgint.GINTovlp_screen(
+                    ctypes.c_void_p(stream.ptr), intopt.bpcache, ctypes.c_int(cp_ij_id),
+                    ctypes.c_void_p(counts.data.ptr),
+                    ctypes.c_void_p(tiles.data.ptr) if fill else null,
+                    ctypes.c_void_p(ptr.data.ptr) if fill else null,
+                    ctypes.c_void_p(self.tile_sphere.data.ptr),
+                    ctypes.c_void_p(self.tile_gamma.data.ptr),
+                    ctypes.c_int(ntiles), ctypes.c_double(thresh), ctypes.c_int(fill))
+                if err != 0:
+                    raise RuntimeError('GINTovlp_screen failed')
+        self.pair_ptr = ptr
+        self.pair_tiles = tiles
+        self.nnz = nnz
+
+    def matches(self, intopt, coords, cutoff):
+        return (intopt is self.intopt and cutoff == self.cutoff
+                and coords.shape[0] == self.ngrids)
+
+    def _launch(self, fn, *args):
+        intopt = self.intopt
+        libgint.GINTset_int3c_overlap_constants(intopt.bpcache, ctypes.c_double(self.cutoff))
+        stream = cp.cuda.get_current_stream()
+        tail = (ctypes.c_void_p(self.pair_ptr.data.ptr),
+                ctypes.c_void_p(self.pair_tiles.data.ptr),
+                ctypes.c_void_p(self.coords.data.ptr),
+                ctypes.c_void_p(self.exps.data.ptr),
+                ctypes.c_int(self.ngrids))
+        for cp_ij_id in range(len(intopt.log_qs)):
+            err = fn(ctypes.c_void_p(stream.ptr), intopt.bpcache,
+                     ctypes.c_int(cp_ij_id), *args, *tail)
+            if err != 0:
+                raise RuntimeError(f'{fn.__name__} failed')
+
+    def _sorted_cart_dm(self, mol, dm):
+        intopt = self.intopt
+        dm = intopt.sort_orbitals(cp.asarray(dm), [0, 1])
+        if not mol.cart:
+            c2s = intopt.cart2sph
+            dm = c2s @ dm @ c2s.T
+        return cp.ascontiguousarray(dm)
+
+    def density(self, mol, dm, kmax):
+        """sum_ij D_ij S_ij,(g,c) for aux l = 0..kmax -> [ngrids, ncomp]."""
+        ncomp = (kmax + 1) * (kmax + 2) * (kmax + 3) // 6
+        dm_c = self._sorted_cart_dm(mol, dm)
+        nao_cart = dm_c.shape[0]
+        out = cp.zeros((self.ngrids, ncomp))
+        self._launch(libgint.GINTovlp_density_screened,
+                     ctypes.c_void_p(out.data.ptr), ctypes.c_int(ncomp),
+                     ctypes.c_void_p(dm_c.data.ptr), ctypes.c_int(nao_cart),
+                     ctypes.c_int(kmax))
+        res = cp.empty_like(out)
+        res[self.perm] = out
+        return res
+
+    def fock_sp(self, mol, amp_s, amp_p):
+        intopt = self.intopt
+        amp_s = cp.ascontiguousarray(cp.asarray(amp_s, dtype=np.float64).ravel()[self.perm])
+        amp_p = cp.ascontiguousarray(
+            cp.asarray(amp_p, dtype=np.float64).reshape(-1, 3)[self.perm])
+        nao_cart = intopt._sorted_mol.nao
+        fock = cp.zeros((nao_cart, nao_cart))
+        self._launch(libgint.GINTovlp_fock_sp_screened,
+                     ctypes.c_void_p(fock.data.ptr), ctypes.c_int(nao_cart),
+                     ctypes.c_void_p(amp_s.data.ptr), ctypes.c_void_p(amp_p.data.ptr))
+        row, col = np.tril_indices(nao_cart)
+        fock[row, col] = fock[col, row]
+        if not mol.cart:
+            c2s = intopt.cart2sph
+            fock = c2s.T @ fock @ c2s
+        return intopt.unsort_orbitals(fock, axis=[0, 1])
+
+    def ip1_sp_atoms(self, mol, dm, amp_s, amp_p):
+        """-sum over AO-center derivatives contracted with D+D^T, per atom.
+
+        Equals the per-atom sum of einsum('xij,ij->ix') + einsum('xij,ji->ix')
+        of get_int3c_overlap_ip1_amplitude_contracted (s amplitudes amp_s plus
+        p amplitudes amp_p).
+        """
+        dm_c = self._sorted_cart_dm(mol, dm)
+        dsym = cp.ascontiguousarray(dm_c + dm_c.T)
+        amp_s = cp.ascontiguousarray(cp.asarray(amp_s, dtype=np.float64).ravel()[self.perm])
+        amp_p = cp.ascontiguousarray(
+            cp.asarray(amp_p, dtype=np.float64).reshape(-1, 3)[self.perm])
+        grad = cp.zeros((mol.natm, 3))
+        self._launch(libgint.GINTovlp_ip1_sp_atoms_screened,
+                     ctypes.c_void_p(grad.data.ptr),
+                     ctypes.c_void_p(dsym.data.ptr), ctypes.c_int(dsym.shape[0]),
+                     ctypes.c_void_p(amp_s.data.ptr), ctypes.c_void_p(amp_p.data.ptr))
+        return -grad

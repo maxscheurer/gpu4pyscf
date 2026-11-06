@@ -37,6 +37,7 @@
 __constant__ double c_overlap_cutoff;
 
 #include "g3c_overlap.cu"
+#include "g3c_overlap_screened.cu"
 
 // Dispatch macro for MAX_L_TOTAL templated kernels
 #define DISPATCH_BY_L_TOTAL(L_TOTAL, KERNEL_FUNC, ...) \
@@ -631,6 +632,111 @@ int GINTfill_int3c_overlap_amplitude_contracted_sp(
     }
 
     return 0;
+}
+
+
+/* ---------------- spatially screened kernels ---------------- */
+
+#define OVLP_SWITCH_L(LT, KERNEL, ...)                                         \
+    switch (LT) {                                                              \
+    case 0: KERNEL<0><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;     \
+    case 1: KERNEL<1><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;     \
+    case 2: KERNEL<2><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;     \
+    case 3: KERNEL<3><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;     \
+    case 4: KERNEL<4><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;     \
+    case 5: KERNEL<5><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;     \
+    case 6: KERNEL<6><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;     \
+    case 7: KERNEL<7><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;     \
+    case 8: KERNEL<8><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;     \
+    case 9: KERNEL<9><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;     \
+    case 10: KERNEL<10><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;   \
+    case 11: KERNEL<11><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;   \
+    default:                                                                   \
+        fprintf(stderr, "%s: l_total = %d out of range\n", __func__, LT);      \
+        return 1;                                                              \
+    }
+
+#define OVLP_TYPE_INFO                                                         \
+    const ContractionProdType* cp_ij = bpcache->cptype + cp_ij_id;             \
+    const int i_l = cp_ij->l_bra;                                              \
+    const int j_l = cp_ij->l_ket;                                              \
+    const int nprim_ij = cp_ij->nprim_12;                                      \
+    const int bas_ij0 = bpcache->bas_pairs_locs[cp_ij_id];                     \
+    const int ntasks_ij = bpcache->bas_pairs_locs[cp_ij_id + 1] - bas_ij0;     \
+    const int prim_ij0 = bpcache->primitive_pairs_locs[cp_ij_id];              \
+    if (ntasks_ij <= 0) return 0;                                              \
+    const dim3 threads(32 * OVLP_WARPS_PER_BLOCK);                             \
+    const dim3 blocks((ntasks_ij + OVLP_WARPS_PER_BLOCK - 1) / OVLP_WARPS_PER_BLOCK);
+
+static int ovlp_check(const char* name) {
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in %s: %s\n", name, cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+int GINTovlp_screen(
+    const cudaStream_t stream, const BasisProdCache* bpcache, const int cp_ij_id,
+    int* counts, int* tiles_out, const int* pair_ptr,
+    const double* tile_sphere, const double* tile_gamma, const int ntiles,
+    const double thresh, const int fill)
+{
+    const ContractionProdType* cp_ij = bpcache->cptype + cp_ij_id;
+    const int nprim_ij = cp_ij->nprim_12;
+    const int bas_ij0 = bpcache->bas_pairs_locs[cp_ij_id];
+    const int ntasks_ij = bpcache->bas_pairs_locs[cp_ij_id + 1] - bas_ij0;
+    const int prim_ij0 = bpcache->primitive_pairs_locs[cp_ij_id];
+    if (ntasks_ij <= 0) return 0;
+    const int nthreads = 128;
+    GINTovlp_screen_kernel<<<(ntasks_ij + nthreads - 1) / nthreads, nthreads, 0, stream>>>(
+        counts, tiles_out, pair_ptr, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
+        tile_sphere, tile_gamma, ntiles, thresh, fill);
+    return ovlp_check(__func__);
+}
+
+int GINTovlp_density_screened(
+    const cudaStream_t stream, const BasisProdCache* bpcache, const int cp_ij_id,
+    double* out, const int ncomp, const double* dm, const int nao, const int kmax,
+    const int* pair_ptr, const int* pair_tiles,
+    const double* coords, const double* exps, const int ngrids)
+{
+    OVLP_TYPE_INFO
+    const int lt = i_l + j_l + kmax;
+    OVLP_SWITCH_L(lt, GINTovlp_density_screened_kernel,
+        out, ncomp, dm, nao, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
+        i_l, j_l, kmax, pair_ptr, pair_tiles, coords, exps, ngrids)
+    return ovlp_check(__func__);
+}
+
+int GINTovlp_fock_sp_screened(
+    const cudaStream_t stream, const BasisProdCache* bpcache, const int cp_ij_id,
+    double* fock, const int nao, const double* amp_s, const double* amp_p,
+    const int* pair_ptr, const int* pair_tiles,
+    const double* coords, const double* exps, const int ngrids)
+{
+    OVLP_TYPE_INFO
+    const int lt = i_l + j_l + 1;
+    OVLP_SWITCH_L(lt, GINTovlp_fock_sp_screened_kernel,
+        fock, nao, amp_s, amp_p, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
+        i_l, j_l, pair_ptr, pair_tiles, coords, exps, ngrids)
+    return ovlp_check(__func__);
+}
+
+int GINTovlp_ip1_sp_atoms_screened(
+    const cudaStream_t stream, const BasisProdCache* bpcache, const int cp_ij_id,
+    double* grad, const double* dsym, const int nao,
+    const double* amp_s, const double* amp_p,
+    const int* pair_ptr, const int* pair_tiles,
+    const double* coords, const double* exps, const int ngrids)
+{
+    OVLP_TYPE_INFO
+    const int lt = i_l + j_l + 3;
+    OVLP_SWITCH_L(lt, GINTovlp_ip1_sp_atoms_screened_kernel,
+        grad, dsym, nao, amp_s, amp_p, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
+        i_l, j_l, pair_ptr, pair_tiles, coords, exps, ngrids)
+    return ovlp_check(__func__);
 }
 
 }  // extern "C"
