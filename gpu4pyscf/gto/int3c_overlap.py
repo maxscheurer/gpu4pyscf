@@ -621,6 +621,7 @@ def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, aux_cart=True,
 # ---------------------------------------------------------------------------
 
 OVLP_TILE = 32
+OVLP_TILES_PER_SUPER = 16
 
 
 def _part1by2(v):
@@ -677,6 +678,21 @@ class OverlapScreen:
         self.tile_gamma = cp.ascontiguousarray(
             cp.stack([tg.min(axis=1), tg.max(axis=1)], axis=1))
 
+        # superblocks of consecutive tiles for the pair-level pre-test
+        S = OVLP_TILES_PER_SUPER
+        nsuper = (ntiles + S - 1) // S
+        sidx = cp.minimum(cp.arange(nsuper * S), ntiles - 1).reshape(nsuper, S)
+        sc = center[sidx]
+        scenter = sc.mean(axis=1)
+        sradius = (cp.sqrt(((sc - scenter[:, None]) ** 2).sum(axis=2))
+                   + radius[sidx]).max(axis=1)
+        sradius = sradius * (1 + 1e-12) + 1e-12
+        self.super_sphere = cp.ascontiguousarray(
+            cp.hstack([scenter, sradius[:, None]]))
+        self.super_gamma = cp.ascontiguousarray(cp.stack(
+            [self.tile_gamma[sidx, 0].min(axis=1),
+             self.tile_gamma[sidx, 1].max(axis=1)], axis=1))
+
         npairs = int(intopt.bas_pairs_locs[-1])
         counts = cp.zeros(npairs, dtype=np.int32)
         thresh = 0.5 * cutoff
@@ -697,7 +713,11 @@ class OverlapScreen:
                     ctypes.c_void_p(ptr.data.ptr) if fill else null,
                     ctypes.c_void_p(self.tile_sphere.data.ptr),
                     ctypes.c_void_p(self.tile_gamma.data.ptr),
-                    ctypes.c_int(ntiles), ctypes.c_double(thresh), ctypes.c_int(fill))
+                    ctypes.c_int(ntiles),
+                    ctypes.c_void_p(self.super_sphere.data.ptr),
+                    ctypes.c_void_p(self.super_gamma.data.ptr),
+                    ctypes.c_int(OVLP_TILES_PER_SUPER),
+                    ctypes.c_double(thresh), ctypes.c_int(fill))
                 if err != 0:
                     raise RuntimeError('GINTovlp_screen failed')
         self.pair_ptr = ptr

@@ -34,8 +34,20 @@
 
 /*
  * Thread per shell pair: count (fill == 0) or write (fill == 1) the tiles that
- * may contain a non-negligible primitive prefactor.
+ * may contain a non-negligible primitive prefactor. Two levels: superblocks of
+ * `tiles_per_super` consecutive tiles are first tested with a pair-level bound
+ * (min exponent, max |e12|, bounding sphere of the primitive centers P), then
+ * individual tiles with the per-primitive bound.
  */
+__device__ __forceinline__ double ovlp_bound(double aij, double e, double d2,
+                                             double gmin, double gmax)
+{
+    const double mu = aij * gmin / (aij + gmin);
+    double f = gmax / (aij + gmax);
+    f = f * sqrt(f);
+    return f * e * exp(-mu * d2);
+}
+
 __global__ void GINTovlp_screen_kernel(
     int* __restrict__ counts,          // [n_bas_pairs] (count pass)
     int* __restrict__ tiles_out,       // [nnz]         (fill pass)
@@ -43,38 +55,70 @@ __global__ void GINTovlp_screen_kernel(
     const int bas_ij0, const int prim_ij0, const int ntasks_ij, const int nprim_ij,
     const double* __restrict__ tile_sphere,  // [ntiles, 4]: cx, cy, cz, R
     const double* __restrict__ tile_gamma,   // [ntiles, 2]: gmin, gmax
-    const int ntiles, const double thresh, const int fill)
+    const int ntiles,
+    const double* __restrict__ super_sphere, // [nsuper, 4]
+    const double* __restrict__ super_gamma,  // [nsuper, 2]
+    const int tiles_per_super,
+    const double thresh, const int fill)
 {
     const int task = blockIdx.x * blockDim.x + threadIdx.x;
     if (task >= ntasks_ij) return;
     const int bas_ij = bas_ij0 + task;
     const int p0 = prim_ij0 + task * nprim_ij;
+
+    // pair-level aggregate over primitives
+    double amin = 1e300, emax = 0.0, px = 0.0, py = 0.0, pz = 0.0;
+    for (int ij = p0; ij < p0 + nprim_ij; ++ij) {
+        amin = fmin(amin, c_bpcache.a12[ij]);
+        emax = fmax(emax, fabs(c_bpcache.e12[ij]));
+        px += c_bpcache.x12[ij]; py += c_bpcache.y12[ij]; pz += c_bpcache.z12[ij];
+    }
+    px /= nprim_ij; py /= nprim_ij; pz /= nprim_ij;
+    double rp = 0.0;
+    for (int ij = p0; ij < p0 + nprim_ij; ++ij) {
+        const double dx = c_bpcache.x12[ij] - px;
+        const double dy = c_bpcache.y12[ij] - py;
+        const double dz = c_bpcache.z12[ij] - pz;
+        rp = fmax(rp, sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    rp = rp * (1.0 + 1e-12) + 1e-12;
+
     int n = 0;
-    int out0 = fill ? pair_ptr[bas_ij] : 0;
-    for (int t = 0; t < ntiles; ++t) {
-        const double cx = tile_sphere[t * 4 + 0];
-        const double cy = tile_sphere[t * 4 + 1];
-        const double cz = tile_sphere[t * 4 + 2];
-        const double R  = tile_sphere[t * 4 + 3];
-        const double gmin = tile_gamma[t * 2 + 0];
-        const double gmax = tile_gamma[t * 2 + 1];
-        bool keep = false;
-        for (int ij = p0; ij < p0 + nprim_ij; ++ij) {
-            const double aij = c_bpcache.a12[ij];
-            const double e = fabs(c_bpcache.e12[ij]);
-            const double dx = c_bpcache.x12[ij] - cx;
-            const double dy = c_bpcache.y12[ij] - cy;
-            const double dz = c_bpcache.z12[ij] - cz;
-            double d = sqrt(dx * dx + dy * dy + dz * dz) - R;
+    const int out0 = fill ? pair_ptr[bas_ij] : 0;
+    const int nsuper = (ntiles + tiles_per_super - 1) / tiles_per_super;
+    for (int sb = 0; sb < nsuper; ++sb) {
+        {
+            const double dx = px - super_sphere[sb * 4 + 0];
+            const double dy = py - super_sphere[sb * 4 + 1];
+            const double dz = pz - super_sphere[sb * 4 + 2];
+            double d = sqrt(dx * dx + dy * dy + dz * dz) - rp - super_sphere[sb * 4 + 3];
             d = d > 0.0 ? d : 0.0;
-            const double mu = aij * gmin / (aij + gmin);
-            double f = gmax / (aij + gmax);
-            f = f * sqrt(f);
-            if (f * e * exp(-mu * d * d) >= thresh) { keep = true; break; }
+            if (ovlp_bound(amin, emax, d * d, super_gamma[sb * 2 + 0],
+                           super_gamma[sb * 2 + 1]) < thresh) continue;
         }
-        if (keep) {
-            if (fill) tiles_out[out0 + n] = t;
-            ++n;
+        const int tb = sb * tiles_per_super;
+        const int te = min(ntiles, tb + tiles_per_super);
+        for (int t = tb; t < te; ++t) {
+            const double cx = tile_sphere[t * 4 + 0];
+            const double cy = tile_sphere[t * 4 + 1];
+            const double cz = tile_sphere[t * 4 + 2];
+            const double R  = tile_sphere[t * 4 + 3];
+            const double gmin = tile_gamma[t * 2 + 0];
+            const double gmax = tile_gamma[t * 2 + 1];
+            bool keep = false;
+            for (int ij = p0; ij < p0 + nprim_ij; ++ij) {
+                const double dx = c_bpcache.x12[ij] - cx;
+                const double dy = c_bpcache.y12[ij] - cy;
+                const double dz = c_bpcache.z12[ij] - cz;
+                double d = sqrt(dx * dx + dy * dy + dz * dz) - R;
+                d = d > 0.0 ? d : 0.0;
+                if (ovlp_bound(c_bpcache.a12[ij], fabs(c_bpcache.e12[ij]), d * d,
+                               gmin, gmax) >= thresh) { keep = true; break; }
+            }
+            if (keep) {
+                if (fill) tiles_out[out0 + n] = t;
+                ++n;
+            }
         }
     }
     if (!fill) counts[bas_ij] = n;
