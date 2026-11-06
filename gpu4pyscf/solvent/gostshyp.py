@@ -33,6 +33,72 @@ from gpu4pyscf.lib import logger
 from pyscf.data.radii import BOHR
 
 
+def _gen_surface(mol, ng=110, rad=modified_Bondi):
+    """Vectorized equivalent of gpu4pyscf.solvent.pcm.gen_surface.
+
+    Same quantities and ordering, but all atoms are processed in a few batched
+    GPU operations with a single host synchronization instead of a Python loop
+    with two synchronizations per atom.
+    """
+    from gpu4pyscf.solvent.pcm import switch_h, XI, PI, libdft
+    from gpu4pyscf.lib.cupy_helper import dist_matrix
+    unit_sphere = np.empty((ng, 4))
+    libdft.MakeAngularGrid(unit_sphere.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(ng))
+    unit_sphere = cp.asarray(unit_sphere)
+
+    natm = mol.natm
+    atom_coords = cp.asarray(mol.atom_coords(unit='B'))
+    charges = mol.atom_charges()
+    N_J = ng * cp.ones(natm)
+    R_J = cp.asarray([rad[chg] for chg in charges])
+    R_sw_J = R_J * (14.0 / N_J)**0.5
+    alpha_J = 1.0/2.0 + R_J/R_sw_J - ((R_J/R_sw_J)**2 - 1.0/28)**0.5
+    R_in_J = R_J - alpha_J * R_sw_J
+
+    r_atm = np.array([rad[gto.charge(mol.atom_symbol(ia))] for ia in range(natm)])
+    r_atm_gpu = cp.asarray(r_atm)
+    w = unit_sphere[:, 3] * 4.0 * PI
+    swf = cp.empty((natm, ng))
+    chunk = max(1, (1 << 25) // max(1, ng * natm))
+    for a0 in range(0, natm, chunk):
+        a1 = min(natm, a0 + chunk)
+        na = a1 - a0
+        atom_grid = (r_atm_gpu[a0:a1, None, None] * unit_sphere[None, :, :3]
+                     + atom_coords[a0:a1, None, :])
+        riJ = dist_matrix(atom_grid.reshape(-1, 3), atom_coords).reshape(na, ng, natm)
+        diJ = (riJ - R_in_J) / R_sw_J
+        own = cp.arange(na)
+        diJ[own, :, a0 + own] = 1.0
+        diJ[diJ < 1e-8] = 0.0
+        swf[a0:a1] = cp.prod(switch_h(diJ), axis=2)
+
+    mask = (w[None, :] * swf) > 1e-12
+    counts = cp.asnumpy(mask.sum(axis=1))
+    offsets = np.append(0, np.cumsum(counts))
+    gslice_by_atom = [[int(offsets[i]), int(offsets[i + 1])] for i in range(natm)]
+
+    owner = cp.repeat(cp.arange(natm), ng).reshape(natm, ng)[mask]
+    sph = cp.broadcast_to(unit_sphere[None], (natm, ng, 4))[mask]
+    r_own = r_atm_gpu[owner]
+    w_sel = sph[:, 3] * 4.0 * PI
+    swf_sel = swf[mask]
+    grid_coords = r_own[:, None] * sph[:, :3] + atom_coords[owner]
+    return {
+        'ng': ng,
+        'gslice_by_atom': gslice_by_atom,
+        'grid_coords': grid_coords,
+        'weights': w_sel,
+        'charge_exp': XI[ng] / (r_own * w_sel**0.5),
+        'switch_fun': swf_sel,
+        'R_vdw': r_own,
+        'norm_vec': cp.ascontiguousarray(sph[:, :3]),
+        'area': w_sel * r_own**2 * swf_sel,
+        'R_in_J': R_in_J,
+        'R_sw_J': R_sw_J,
+        'atom_coords': atom_coords,
+    }
+
+
 @lib.with_doc(_attach_solvent._for_scf.__doc__)
 def gostshyp_for_scf(mf, solvent_obj=None, dm=None):
     """Attach GOSTSHYP solvent model to SCF method."""
@@ -166,7 +232,7 @@ class GOSTSHYP(lib.StreamObject):
         """Build a PCM surface and return its common surface arrays."""
         rad = self.scaling_factor * modified_Bondi
         if self.cavity == 'vdw/occ':
-            self.surface = gen_surface(
+            self.surface = _gen_surface(
                 mol, ng=self.npoints, rad=rad + self.r_ext)
             self._outer_surface = dict(self.surface)
 
@@ -183,7 +249,7 @@ class GOSTSHYP(lib.StreamObject):
                 self.surface['area'] * self._occ_ratio_sq)
             self.surface['R_vdw'] = R_inner
         else:
-            self.surface = gen_surface(mol, ng=self.npoints, rad=rad)
+            self.surface = _gen_surface(mol, ng=self.npoints, rad=rad)
             self._outer_surface = None
             self._occ_ratio_sq = None
 
