@@ -743,13 +743,43 @@ class OverlapScreen:
             if err != 0:
                 raise RuntimeError(f'{fn.__name__} failed')
 
-    def _sorted_cart_dm(self, mol, dm):
+    def _transform(self, mol):
+        """Sparse T (nao_cart_sorted x nao) with dm_cart_sorted = T dm T^T.
+
+        T combines the AO sorting permutation with the block-diagonal
+        cart2sph transformation of the sorted basis.
+        """
+        T = getattr(self, '_T', None)
+        if T is not None and self._T_cart == mol.cart:
+            return T
+        import cupyx.scipy.sparse as sp
         intopt = self.intopt
-        dm = intopt.sort_orbitals(cp.asarray(dm), [0, 1])
-        if not mol.cart:
-            c2s = intopt.cart2sph
-            dm = c2s @ dm @ c2s.T
-        return cp.ascontiguousarray(dm)
+        idx = cp.asarray(intopt._ao_idx)
+        nao = len(intopt._ao_idx)
+        nao_cart = intopt._sorted_mol.nao
+        if mol.cart:
+            rows = cp.arange(nao_cart)
+            data = cp.ones(nao_cart)
+            cols = idx
+        else:
+            c2s = sp.coo_matrix(intopt.cart2sph)
+            rows, data = c2s.row, c2s.data
+            cols = idx[c2s.col]
+        T = sp.csr_matrix((data, (rows, cols)), shape=(nao_cart, nao))
+        self._T, self._Tt, self._T_cart = T, T.T.tocsr(), mol.cart
+        return T
+
+    def _sorted_cart_dm(self, mol, dm):
+        T = self._transform(mol)
+        dm = cp.asarray(dm, dtype=np.float64)
+        x = T @ cp.ascontiguousarray(dm.T)          # T dm^T
+        return cp.ascontiguousarray(T @ cp.ascontiguousarray(x.T))  # T dm T^T
+
+    def _unsort_fock(self, mol, fock_c):
+        self._transform(mol)
+        Tt = self._Tt
+        x = Tt @ cp.ascontiguousarray(fock_c.T)      # T^T F^T
+        return Tt @ cp.ascontiguousarray(x.T)        # T^T F T
 
     def density(self, mol, dm, kmax):
         """sum_ij D_ij S_ij,(g,c) for aux l = 0..kmax -> [ngrids, ncomp]."""
@@ -775,12 +805,8 @@ class OverlapScreen:
         self._launch(libgint.GINTovlp_fock_sp_screened,
                      ctypes.c_void_p(fock.data.ptr), ctypes.c_int(nao_cart),
                      ctypes.c_void_p(amp_s.data.ptr), ctypes.c_void_p(amp_p.data.ptr))
-        row, col = np.tril_indices(nao_cart)
-        fock[row, col] = fock[col, row]
-        if not mol.cart:
-            c2s = intopt.cart2sph
-            fock = c2s.T @ fock @ c2s
-        return intopt.unsort_orbitals(fock, axis=[0, 1])
+        # The kernel writes both (i,j) and (j,i), so fock is already symmetric.
+        return self._unsort_fock(mol, fock)
 
     def ip1_sp_atoms(self, mol, dm, amp_s, amp_p):
         """-sum over AO-center derivatives contracted with D+D^T, per atom.
