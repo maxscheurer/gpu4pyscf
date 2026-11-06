@@ -38,6 +38,7 @@ __constant__ double c_overlap_cutoff;
 
 #include "g3c_overlap.cu"
 #include "g3c_overlap_screened.cu"
+#include "g3c_overlap_screened_t.cu"
 
 // Dispatch macro for MAX_L_TOTAL templated kernels
 #define DISPATCH_BY_L_TOTAL(L_TOTAL, KERNEL_FUNC, ...) \
@@ -668,6 +669,47 @@ int GINTfill_int3c_overlap_amplitude_contracted_sp(
     const dim3 threads(32 * OVLP_WARPS_PER_BLOCK);                             \
     const dim3 blocks((ntasks_ij + OVLP_WARPS_PER_BLOCK - 1) / OVLP_WARPS_PER_BLOCK);
 
+// Dispatch over (LI, LJ) in {0,1,2}^2; extra template args follow LI, LJ.
+#define OVLP_T_CASE(LI_, LJ_, KERNEL, EXTRA, ...)                              \
+    case LI_ * 3 + LJ_:                                                        \
+        KERNEL<LI_, LJ_ EXTRA><<<blocks, threads, 0, stream>>>(__VA_ARGS__); break;
+#define OVLP_T_SWITCH(KERNEL, EXTRA, ...)                                      \
+    switch (i_l * 3 + j_l) {                                                   \
+    OVLP_T_CASE(0, 0, KERNEL, EXTRA, __VA_ARGS__)                              \
+    OVLP_T_CASE(0, 1, KERNEL, EXTRA, __VA_ARGS__)                              \
+    OVLP_T_CASE(0, 2, KERNEL, EXTRA, __VA_ARGS__)                              \
+    OVLP_T_CASE(1, 0, KERNEL, EXTRA, __VA_ARGS__)                              \
+    OVLP_T_CASE(1, 1, KERNEL, EXTRA, __VA_ARGS__)                              \
+    OVLP_T_CASE(1, 2, KERNEL, EXTRA, __VA_ARGS__)                              \
+    OVLP_T_CASE(2, 0, KERNEL, EXTRA, __VA_ARGS__)                              \
+    OVLP_T_CASE(2, 1, KERNEL, EXTRA, __VA_ARGS__)                              \
+    OVLP_T_CASE(2, 2, KERNEL, EXTRA, __VA_ARGS__)                              \
+    }
+
+extern "C++" {
+template <int KMAX>
+static void ovlp_launch_density_t(
+    const int i_l, const int j_l, const dim3 blocks, const dim3 threads,
+    const cudaStream_t stream, double* out, const double* dm, const int nao,
+    const int bas_ij0, const int prim_ij0, const int ntasks_ij, const int nprim_ij,
+    const int* pair_ptr, const int* pair_tiles,
+    const double* coords, const double* exps, const int ngrids)
+{
+#define OVLP_DENS_CASE(LI_, LJ_)                                               \
+    case LI_ * 3 + LJ_:                                                        \
+        GINTovlp_density_screened_t_kernel<LI_, LJ_, KMAX>                     \
+            <<<blocks, threads, 0, stream>>>(out, dm, nao, bas_ij0, prim_ij0,  \
+            ntasks_ij, nprim_ij, pair_ptr, pair_tiles, coords, exps, ngrids);  \
+        break;
+    switch (i_l * 3 + j_l) {
+    OVLP_DENS_CASE(0, 0) OVLP_DENS_CASE(0, 1) OVLP_DENS_CASE(0, 2)
+    OVLP_DENS_CASE(1, 0) OVLP_DENS_CASE(1, 1) OVLP_DENS_CASE(1, 2)
+    OVLP_DENS_CASE(2, 0) OVLP_DENS_CASE(2, 1) OVLP_DENS_CASE(2, 2)
+    }
+#undef OVLP_DENS_CASE
+}
+}  // extern "C++"
+
 static int ovlp_check(const char* name) {
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -705,6 +747,18 @@ int GINTovlp_density_screened(
     const double* coords, const double* exps, const int ngrids)
 {
     OVLP_TYPE_INFO
+    if (i_l <= 2 && j_l <= 2 && (kmax == 1 || kmax == 3)) {
+        if (kmax == 1) {
+            ovlp_launch_density_t<1>(i_l, j_l, blocks, threads, stream,
+                out, dm, nao, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
+                pair_ptr, pair_tiles, coords, exps, ngrids);
+        } else {
+            ovlp_launch_density_t<3>(i_l, j_l, blocks, threads, stream,
+                out, dm, nao, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
+                pair_ptr, pair_tiles, coords, exps, ngrids);
+        }
+        return ovlp_check(__func__);
+    }
     const int lt = i_l + j_l + kmax;
     OVLP_SWITCH_L(lt, GINTovlp_density_screened_kernel,
         out, ncomp, dm, nao, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
@@ -719,6 +773,12 @@ int GINTovlp_fock_sp_screened(
     const double* coords, const double* exps, const int ngrids)
 {
     OVLP_TYPE_INFO
+    if (i_l <= 2 && j_l <= 2) {
+        OVLP_T_SWITCH(GINTovlp_fock_sp_screened_t_kernel, ,
+            fock, nao, amp_s, amp_p, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
+            pair_ptr, pair_tiles, coords, exps, ngrids)
+        return ovlp_check(__func__);
+    }
     const int lt = i_l + j_l + 1;
     OVLP_SWITCH_L(lt, GINTovlp_fock_sp_screened_kernel,
         fock, nao, amp_s, amp_p, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
@@ -734,6 +794,12 @@ int GINTovlp_ip1_sp_atoms_screened(
     const double* coords, const double* exps, const int ngrids)
 {
     OVLP_TYPE_INFO
+    if (i_l <= 2 && j_l <= 2) {
+        OVLP_T_SWITCH(GINTovlp_ip1_sp_atoms_screened_t_kernel, ,
+            grad, dsym, nao, amp_s, amp_p, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
+            pair_ptr, pair_tiles, coords, exps, ngrids)
+        return ovlp_check(__func__);
+    }
     const int lt = i_l + j_l + 3;
     OVLP_SWITCH_L(lt, GINTovlp_ip1_sp_atoms_screened_kernel,
         grad, dsym, nao, amp_s, amp_p, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
