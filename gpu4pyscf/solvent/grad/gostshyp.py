@@ -77,6 +77,57 @@ def _get_surface_derivatives(gostshyp):
     return result
 
 
+def _contract_dareas(gostshyp, weights, chunk_bytes=1 << 28):
+    """Return sum_g dA_g/dR_(a,x) * weights_g as [natm, 3].
+
+    For PCM-type cavities (vdw, vdw/occ) this evaluates the area derivative of
+    pcm.grad.get_dF_dA directly in grid chunks without materializing the dense
+    [natm, 3, ngrids] tensor. DROP cavities use the cached MOIST derivatives.
+    """
+    if gostshyp.cavity == 'drop':
+        dareas, _ = _get_surface_derivatives(gostshyp)
+        return cp.einsum('acg,g->ac', dareas, weights)
+
+    from gpu4pyscf.solvent.pcm import switch_h
+    from gpu4pyscf.solvent.grad.pcm import grad_switch_h
+    surface = (gostshyp._outer_surface
+               if gostshyp._outer_surface is not None
+               else gostshyp.surface)
+    atom_coords = surface['atom_coords']
+    grid_coords = surface['grid_coords']
+    R_in_J = surface['R_in_J']
+    R_sw_J = surface['R_sw_J']
+    natm = atom_coords.shape[0]
+    ngrids = grid_coords.shape[0]
+    wA = weights * surface['area']
+    if gostshyp._occ_ratio_sq is not None:
+        wA = wA * gostshyp._occ_ratio_sq
+    owner = cp.asarray(gostshyp.atom_idx)
+
+    out = cp.zeros((natm, 3))
+    chunk = max(1, chunk_bytes // (natm * 3 * 8))
+    for p0 in range(0, ngrids, chunk):
+        p1 = min(ngrids, p0 + chunk)
+        n = p1 - p0
+        own = owner[p0:p1]
+        rows = cp.arange(n)
+        ri_rJ = grid_coords[p0:p1, None, :] - atom_coords[None, :, :]
+        riJ = cp.linalg.norm(ri_rJ, axis=-1)
+        diJ = (riJ - R_in_J) / R_sw_J
+        diJ[rows, own] = 1.0
+        small = diJ < 1e-8
+        diJ[small] = 0.0
+        ri_rJ[rows, own, :] = 0.0
+        ri_rJ[small] = 0.0
+        fiJ = switch_h(diJ)
+        dfiJ = (grad_switch_h(diJ) / (fiJ * riJ * R_sw_J))[:, :, None] * ri_rJ
+        w = wA[p0:p1]
+        # owner-atom response: + A_i sum_J dfiJ ; other atoms: - A_i dfiJ
+        cp.add.at(out, own, w[:, None] * dfiJ.sum(axis=1))
+        out -= cp.einsum('i,iJx->Jx', w, dfiJ)
+    return out
+
+
 def _apply_grid_coordinate_response(gostshyp, gtilde_grad, force_grad,
                                     gtilde_grid, force_grid, p_contracted,
                                     force_coeffs, dcoords):
@@ -166,7 +217,10 @@ class Gradients(lib.StreamObject):
         # Normalize PCM and MOIST derivatives to [natm, 3, ngrids].
         # DROP coordinate derivatives stay on the host and are transferred once
         # per chunk when all coordinate-dependent terms are available.
-        dareas, dcoords = _get_surface_derivatives(gostshyp)
+        if gostshyp.cavity == 'drop':
+            _, dcoords = _get_surface_derivatives(gostshyp)
+        else:
+            dcoords = None
 
         # Width gradient prefactors
         wgrad_prefs = -cp.float64(np.pi * np.log(2)) / (areas ** 2)
@@ -174,8 +228,9 @@ class Gradients(lib.StreamObject):
         # ==================================================================
         # Term dE1: Area derivative
         # ==================================================================
-        dE1 = P * cp.einsum(
-            'acg,g->ac', dareas, gtilde_expval / forces)
+        # Collected into w_area below; all area-derivative terms are
+        # contracted with dA/dR in a single pass.
+        w_area = P * gtilde_expval / forces
 
         # ==================================================================
         # Term dE2: Gtilde operator gradient
@@ -205,7 +260,7 @@ class Gradients(lib.StreamObject):
         # --- Part C: d-type width gradient ---
         trace_d = d_contracted[:, 0] + d_contracted[:, 3] + d_contracted[:, 5]
         imd = wgrad_prefs * amplitudes * trace_d
-        dE_d = -1.0 * cp.einsum('acg,g->ac', dareas, imd)
+        w_area -= imd
 
         # ==================================================================
         # Term dE3: Force operator gradient
@@ -233,7 +288,7 @@ class Gradients(lib.StreamObject):
             dgtilde_gaussian, dG, p_contracted, coeffs, dcoords)
         gtilde_operator_grad *= -1.0  # dr -> -dR
         force_operator_grad *= -1.0  # dr -> -dR
-        dE2 = gtilde_operator_grad + dE_d
+        dE2 = gtilde_operator_grad
 
         # --- Part C: f-type width gradient ---
         xf = f_contracted[:, 0] + f_contracted[:, 3] + f_contracted[:, 5]
@@ -246,15 +301,13 @@ class Gradients(lib.StreamObject):
         rf2 = 1.0 / (forces * forces)
         dr *= normals
 
-        dFdR = dareas * (wgrad_prefs * forces / widths)[None, None, :]
-        dFdR += cp.einsum('gc,axg->axg', dr, dareas)
+        # f-type width term: -P sum_g A g~ / F^2 (wgrad F / w + sum_c dr_c) dA/dR
+        w_area -= P * areas * gtilde_expval * rf2 * (
+            wgrad_prefs * forces / widths + dr.sum(axis=1))
 
-        width_grad_ftype = -P * cp.einsum(
-            'g,g,axg,g->ax', areas, gtilde_expval, dFdR, rf2)
+        dE3 = force_operator_grad + dE_normal
 
-        dE3 = force_operator_grad + dE_normal + width_grad_ftype
-
-        gradient = dE1 + dE2 + dE3
+        gradient = dE2 + dE3 + _contract_dareas(gostshyp, w_area)
 
         # Full device sync to catch errors from non-default streams used by
         # int3c kernels before returning control to the solute gradient.
