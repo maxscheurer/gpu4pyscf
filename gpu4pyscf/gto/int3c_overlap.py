@@ -620,8 +620,8 @@ def int3c_overlap(mol, aux_coords, aux_exponents, aux_l=0, aux_cart=True,
 # Spatially screened kernels
 # ---------------------------------------------------------------------------
 
-OVLP_TILE = 32
-OVLP_TILES_PER_SUPER = 16
+OVLP_TILE = int(libgint.GINTovlp_tile_size())  # points per tile (CUDA side)
+OVLP_TILES_PER_SUPER = max(1, 512 // OVLP_TILE)  # ~512 points per superblock
 
 
 def _part1by2(v):

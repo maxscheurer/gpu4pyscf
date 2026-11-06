@@ -719,6 +719,8 @@ static int ovlp_check(const char* name) {
     return 0;
 }
 
+int GINTovlp_tile_size() { return OVLP_TILE; }
+
 int GINTovlp_screen(
     const cudaStream_t stream, const BasisProdCache* bpcache, const int cp_ij_id,
     int* counts, int* tiles_out, const int* pair_ptr,

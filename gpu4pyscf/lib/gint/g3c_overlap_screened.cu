@@ -29,7 +29,10 @@
  * the current tile. Included from nr_fill_ao_int3c_overlap.cu (shares constants).
  */
 
-#define OVLP_TILE 32
+#ifndef OVLP_TILE
+#define OVLP_TILE 8
+#endif
+#define OVLP_TPW (32 / OVLP_TILE)  // tiles processed concurrently per warp
 #define OVLP_WARPS_PER_BLOCK 4
 
 /*
@@ -193,8 +196,8 @@ __global__ void GINTovlp_density_screened_kernel(
     double Sx[BUF_SIZE], Sy[BUF_SIZE], Sz[BUF_SIZE];
     #define S_IDX(a, b, c) ((a) * STRIDE * STRIDE + (b) * STRIDE + (c))
 
-    for (int t = t0; t < t1; ++t) {
-        const int grid = pair_tiles[t] * OVLP_TILE + lane;
+    for (int t = t0 + lane / OVLP_TILE; t < t1; t += OVLP_TPW) {
+        const int grid = pair_tiles[t] * OVLP_TILE + lane % OVLP_TILE;
         if (grid >= ngrids) continue;
         const double Cx = coords[grid * 3 + 0];
         const double Cy = coords[grid * 3 + 1];
@@ -275,8 +278,8 @@ __global__ void GINTovlp_fock_sp_screened_kernel(
     const int nij = ncart_i * ncart_j;
     for (int n = 0; n < nij; ++n) fock_ij[n] = 0.0;
 
-    for (int t = t0; t < t1; ++t) {
-        const int grid = pair_tiles[t] * OVLP_TILE + lane;
+    for (int t = t0 + lane / OVLP_TILE; t < t1; t += OVLP_TPW) {
+        const int grid = pair_tiles[t] * OVLP_TILE + lane % OVLP_TILE;
         if (grid >= ngrids) continue;
         const double Cx = coords[grid * 3 + 0];
         const double Cy = coords[grid * 3 + 1];
@@ -352,8 +355,8 @@ __global__ void GINTovlp_ip1_sp_atoms_screened_kernel(
     double gA[3] = {0.0, 0.0, 0.0};
     double gB[3] = {0.0, 0.0, 0.0};
 
-    for (int t = t0; t < t1; ++t) {
-        const int grid = pair_tiles[t] * OVLP_TILE + lane;
+    for (int t = t0 + lane / OVLP_TILE; t < t1; t += OVLP_TPW) {
+        const int grid = pair_tiles[t] * OVLP_TILE + lane % OVLP_TILE;
         if (grid >= ngrids) continue;
         const double Cx = coords[grid * 3 + 0];
         const double Cy = coords[grid * 3 + 1];
