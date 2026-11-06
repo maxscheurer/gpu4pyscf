@@ -99,6 +99,55 @@ def _gen_surface(mol, ng=110, rad=modified_Bondi):
     }
 
 
+class _OverlapPairOpt(VHFOpt):
+    """VHFOpt whose shell pairs are selected by a rigorous overlap bound.
+
+    Every primitive prefactor evaluated by the 3-center overlap kernels is
+    bounded by |e12| = fac(li) fac(lj) |ci cj| exp(-ai aj / (ai + aj) R^2).
+    Pairs with max |e12| < 0.5 * cutoff contribute nothing and are dropped.
+    This replaces the CPU ERI Schwarz diagonal (int2e) of the base class.
+    """
+
+    def __init__(self, mol, cutoff):
+        VHFOpt.__init__(self, mol, qcondname=None)
+        self._overlap_cutoff = cutoff
+
+    def get_q_cond(self):
+        """Shell-pair bound  max|ci| max|cj| exp(-mu_min R^2) >= max |e12|.
+
+        mu = ai aj / (ai + aj) is increasing in both exponents, so the two
+        smallest exponents give the smallest mu, i.e. the largest exponential.
+        """
+        mol = self._sorted_mol
+        bas = mol._bas
+        nbas = mol.nbas
+        amin = np.empty(nbas)
+        cmax = np.empty(nbas)
+        for ish in range(nbas):
+            n = bas[ish, gto.NPRIM_OF]
+            pe = bas[ish, gto.PTR_EXP]
+            pc = bas[ish, gto.PTR_COEFF]
+            amin[ish] = mol._env[pe:pe + n].min()
+            cmax[ish] = np.abs(mol._env[pc:pc + n]).max()
+        l = bas[:, gto.ANG_OF]
+        cmax[l == 0] *= 0.282094791773878143
+        cmax[l == 1] *= 0.488602511902919921
+        atm = cp.asarray(bas[:, gto.ATOM_OF])
+        xyz = cp.asarray(mol.atom_coords())
+        r2_atm = ((xyz[:, None, :] - xyz[None, :, :]) ** 2).sum(axis=2)
+        amin = cp.asarray(amin)
+        cmax = cp.asarray(cmax)
+        mu = amin[:, None] * amin[None, :] / (amin[:, None] + amin[None, :])
+        q = cp.exp(-mu * r2_atm[atm[:, None], atm[None, :]])
+        q *= cmax[:, None]
+        q *= cmax[None, :]
+        # get_pairing keeps q > 1e-14; rescale so that this means
+        # bound >= 0.5 * cutoff (keep everything for cutoff == 0).
+        thresh = 0.5 * self._overlap_cutoff
+        q *= 1e-14 / thresh * (1 - 1e-12) if thresh > 0 else 1e300
+        return cp.asnumpy(q)
+
+
 @lib.with_doc(_attach_solvent._for_scf.__doc__)
 def gostshyp_for_scf(mf, solvent_obj=None, dm=None):
     """Attach GOSTSHYP solvent model to SCF method."""
@@ -303,7 +352,7 @@ class GOSTSHYP(lib.StreamObject):
         self.surface_distances = distance
         self.surface_normals = displacement / distance[:, None]
 
-        self.intopt = VHFOpt(mol)
+        self.intopt = _OverlapPairOpt(mol, self.overlap_cutoff)
         self.intopt.build(1e-20, aosym=True, group_size=None)
         self._gtilde = None
         self._force_operators = None
