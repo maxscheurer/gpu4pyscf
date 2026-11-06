@@ -304,7 +304,7 @@ class GOSTSHYP(lib.StreamObject):
         self.surface_normals = displacement / distance[:, None]
 
         self.intopt = VHFOpt(mol)
-        self.intopt.build(1e-20, aosym=True)
+        self.intopt.build(1e-20, aosym=True, group_size=None)
         self._gtilde = None
         self._force_operators = None
         self._surface_derivatives = None
