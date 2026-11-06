@@ -747,7 +747,7 @@ int GINTovlp_density_screened(
     const double* coords, const double* exps, const int ngrids)
 {
     OVLP_TYPE_INFO
-    if (i_l <= 2 && j_l <= 2 && (kmax == 1 || kmax == 3)) {
+    if (i_l <= 2 && j_l <= 2 && kmax == 1) {
         if (kmax == 1) {
             ovlp_launch_density_t<1>(i_l, j_l, blocks, threads, stream,
                 out, dm, nao, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
