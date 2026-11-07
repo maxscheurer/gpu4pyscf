@@ -39,11 +39,15 @@ from pyscf.data.radii import BOHR
 
 
 def _gen_surface(mol, ng=110, rad=modified_Bondi):
-    """Vectorized equivalent of gpu4pyscf.solvent.pcm.gen_surface.
+    """Vectorized equivalent of gpu4pyscf.solvent.pcm.gen_surface with
+    surface_discretization_method='SWIG' (the only scheme supported here).
 
-    Same quantities and ordering, but all atoms are processed in a few batched
-    GPU operations with a single host synchronization instead of a Python loop
-    with two synchronizations per atom.
+    Same dict entries and ordering, but all atoms are processed in a few
+    batched GPU operations with a single host synchronization instead of a
+    Python loop with two synchronizations per atom. Unlike pcm.gen_surface,
+    ghost atoms are not removed and the switching radii (R_J) are looked up
+    by mol.atom_charges(), so the two agree for molecules without ghost atoms
+    and ECPs (checked in solvent/tests/test_gostshyp.py).
     """
     from pyscf.dft.LebedevGrid import MakeAngularGrid
     from gpu4pyscf.solvent.pcm import switch_h, XI, PI
@@ -179,7 +183,14 @@ class _OverlapPairOpt(VHFOpt):
         return log_qs, pair2bra, pair2ket
 
     def build(self, cutoff=1e-13, group_size=None, diag_block_with_triu=False, aosym=True):
-        """Copy of gpu4pyscf.gto.int3c1e.VHFOpt.build with overlap-bound pairing."""
+        """Copy of gpu4pyscf.gto.int3c1e.VHFOpt.build with overlap-bound pairing.
+
+        Upstream build() has no hook for the pairing step, so it is copied.
+        Only the block between the "GOSTSHYP pairing" markers (and the
+        group_size default) differs from upstream; the remaining lines are
+        kept identical to VHFOpt.build, which is checked by
+        solvent/tests/test_gostshyp.py (TestOverlapPairOpt).
+        """
         original_mol = self.mol
         mol = basis_seg_contraction(original_mol, allow_replica=True)[0]
 
@@ -197,13 +208,15 @@ class _OverlapPairOpt(VHFOpt):
                              self._qcondname, self._dmcondname)
         self.direct_scf_tol = cutoff
 
-        # Shell pairs from the rigorous overlap bound, evaluated per block pair
-        # on the GPU (same pairs and ordering as get_pairing on the dense
-        # bound matrix, without materializing it).
+        # >>> GOSTSHYP pairing: replaces q_cond = self.get_q_cond() and
+        # get_pairing(...) of VHFOpt.build. Shell pairs from the rigorous
+        # overlap bound, evaluated per block pair on the GPU (same ordering as
+        # get_pairing, without materializing a dense bound matrix).
         cput1 = log.timer_debug1('Initialize', *cput0)
         l_ctr_offsets = np.append(0, np.cumsum(l_ctr_counts))
         assert aosym and not diag_block_with_triu
         log_qs, pair2bra, pair2ket = self._overlap_pairing(l_ctr_offsets)
+        # <<< GOSTSHYP pairing
         self.log_qs = log_qs.copy()
         cput1 = log.timer_debug1('Get AO pairing', *cput1)
 

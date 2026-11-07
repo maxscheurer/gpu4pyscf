@@ -618,6 +618,124 @@ class TestGOSTSHYPGradient(unittest.TestCase):
         self.assertGreater(ratio2, 10, "FD convergence not O(h^2)")
 
 
+METHANOL = '''
+C   -0.0469   0.6627   0.0000
+O   -0.0469  -0.7571   0.0000
+H   -1.0864   0.9759   0.0000
+H    0.4382   1.0681   0.8907
+H    0.4382   1.0681  -0.8907
+H    0.8711  -1.0499   0.0000
+'''
+
+WATER = '''
+O  0.0000  0.0000  0.1174
+H -0.7570  0.0000 -0.4696
+H  0.7570  0.0000 -0.4696
+'''
+
+
+class TestSurface(unittest.TestCase):
+    """Surface construction and PCM-type area derivatives."""
+
+    def test_gen_surface_matches_pcm(self):
+        from gpu4pyscf.solvent.gostshyp import _gen_surface
+        from gpu4pyscf.solvent.pcm import gen_surface, modified_Bondi
+        mols = [gto.M(atom=WATER, basis='sto-3g', verbose=0),
+                gto.M(atom=METHANOL, basis='sto-3g', verbose=0),
+                gto.M(atom='H 1 0 0; F 2 0 0', basis='sto-3g', verbose=0)]
+        rad_vdw = 1.2 * modified_Bondi
+        for mol in mols:
+            for ng in (26, 110, 302):
+                for rad in (rad_vdw, rad_vdw + 0.4724):   # vdw, vdw/occ outer
+                    ref = gen_surface(mol, ng=ng, rad=rad)
+                    out = _gen_surface(mol, ng=ng, rad=rad)
+                    self.assertEqual(set(out), set(ref))
+                    for key, val in ref.items():
+                        msg = f'{mol.atom_symbol(0)} ng={ng} {key}'
+                        if isinstance(val, cp.ndarray):
+                            np.testing.assert_allclose(
+                                cp.asnumpy(out[key]), cp.asnumpy(val),
+                                rtol=1e-14, atol=0, err_msg=msg)
+                        else:
+                            self.assertEqual(out[key], val, msg)
+
+
+class TestOverlapPairOpt(unittest.TestCase):
+    """_OverlapPairOpt.build is a copy of VHFOpt.build with another pairing."""
+
+    # Lines of gpu4pyscf.gto.int3c1e.VHFOpt.build replaced by the block between
+    # the "GOSTSHYP pairing" markers of _OverlapPairOpt.build.
+    UPSTREAM_PAIRING = [
+        '# TODO: is it more accurate to filter with overlap_cond (or exp_cond)?',
+        'q_cond = self.get_q_cond()',
+        "cput1 = log.timer_debug1('Initialize q_cond', *cput0)",
+        'l_ctr_offsets = np.append(0, np.cumsum(l_ctr_counts))',
+        'log_qs, pair2bra, pair2ket = get_pairing(',
+        'l_ctr_offsets, l_ctr_offsets, q_cond,',
+        'diag_block_with_triu=diag_block_with_triu, aosym=aosym)',
+    ]
+
+    def test_build_source_follows_upstream(self):
+        """Fails if upstream VHFOpt.build changes outside the replaced block.
+
+        Then _OverlapPairOpt.build must be updated to match (e.g. the stream
+        argument of GINTinit_basis_prod added upstream).
+        """
+        import inspect
+        from gpu4pyscf.gto.int3c1e import VHFOpt
+        from gpu4pyscf.solvent.gostshyp import _OverlapPairOpt
+        ours = [l.strip() for l in inspect.getsource(_OverlapPairOpt.build).splitlines()]
+        upstream = [l.strip() for l in inspect.getsource(VHFOpt.build).splitlines()]
+
+        # drop the signatures (group_size default differs) and our docstring
+        ours, upstream = ours[1:], upstream[1:]
+        self.assertTrue(ours[0].startswith('"""'))
+        ours = ours[ours.index('"""') + 1:]
+        a = next(i for i, l in enumerate(ours) if l.startswith('# >>> GOSTSHYP pairing'))
+        b = ours.index('# <<< GOSTSHYP pairing')
+        ours = ours[:a] + ours[b + 1:]
+
+        n = len(self.UPSTREAM_PAIRING)
+        starts = [i for i in range(len(upstream))
+                  if upstream[i:i + n] == self.UPSTREAM_PAIRING]
+        self.assertEqual(len(starts), 1, 'upstream pairing block changed')
+        upstream = upstream[:starts[0]] + upstream[starts[0] + n:]
+        self.assertEqual(ours, upstream)
+
+    def test_zero_cutoff_matches_upstream_build(self):
+        """cutoff 0 keeps all pairs, as upstream's Schwarz pairing does here."""
+        from gpu4pyscf.gto.int3c1e import VHFOpt
+        from gpu4pyscf.gto.int3c_overlap import OverlapScreen
+        from gpu4pyscf.solvent.gostshyp import _OverlapPairOpt
+        mol = gto.M(atom=WATER, basis='cc-pvdz', verbose=0)
+        ours = _OverlapPairOpt(mol, 0.0)
+        ours.build(1e-20, aosym=True, group_size=None)
+        ref = VHFOpt(mol)
+        ref.build(1e-20, aosym=True, group_size=None)
+        nbas = ours._sorted_mol.nbas
+        self.assertEqual(ours.bas_pair2shls.shape[1], nbas * (nbas + 1) // 2)
+        for name in ('l_ctr_counts', 'l_ctr_offsets', 'cart_ao_loc', 'sph_ao_loc',
+                     'ao_loc', 'angular', '_ao_idx', 'bas_pair2shls',
+                     'bas_pairs_locs', 'l_ij', 'density_offset', 'cp_idx',
+                     'cp_jdx', 'aosym'):
+            np.testing.assert_array_equal(getattr(ours, name), getattr(ref, name),
+                                          err_msg=name)
+        for name in ('pair2bra', 'pair2ket'):
+            for x, y in zip(getattr(ours, name), getattr(ref, name), strict=True):
+                np.testing.assert_array_equal(x, y, err_msg=name)
+        for name in ('_atm', '_bas', '_env'):
+            np.testing.assert_array_equal(getattr(ours._sorted_mol, name),
+                                          getattr(ref._sorted_mol, name))
+        # Both GPU basis-pair caches drive the overlap kernels identically
+        gost = GOSTSHYP(mol).build()
+        dm = cp.asarray(converged_dm(mol))
+        out = [OverlapScreen(opt, gost.grid_coords, gost.widths, 1e-14,
+                             force_dense=True).density(mol, dm, kmax=1)
+               for opt in (ours, ref)]
+        np.testing.assert_allclose(cp.asnumpy(out[0]), cp.asnumpy(out[1]),
+                                   rtol=1e-13, atol=1e-15)
+
+
 class TestMOISTAdapter(unittest.TestCase):
     def test_missing_moist_error_from_public_build(self):
         from gpu4pyscf.solvent import moist as moist_adapter
