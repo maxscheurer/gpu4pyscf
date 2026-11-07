@@ -82,8 +82,9 @@ def test_amylose(xyz_file, overlap_cutoff):
     row['e_gostshyp'] = float(gost.e)
     row['ngrids'] = int(gost.n_gaussian)
     row['t_scf'] = round(t_scf, 1)
-    row['t_gost_scf'] = round(gost._t_wall, 1)
-    row['%_gost_scf'] = round(100.0 * gost._t_wall / t_scf, 1) if t_scf > 0 else 0.0
+    t_gost_scf = gost.timings['kernel_wall_s']
+    row['t_gost_scf'] = round(t_gost_scf, 1)
+    row['%_gost_scf'] = round(100.0 * t_gost_scf / t_scf, 1) if t_scf > 0 else 0.0
 
     # Force statistics
     forces_np = cp.asnumpy(gost.forces)
@@ -105,8 +106,9 @@ def test_amylose(xyz_file, overlap_cutoff):
     t_grad = time.perf_counter() - t0
 
     row['t_grad'] = round(t_grad, 1)
-    row['t_gost_grad'] = round(gost._grad_t_wall, 1)
-    row['%_gost_grad'] = round(100.0 * gost._grad_t_wall / t_grad, 1) if t_grad > 0 else 0.0
+    t_gost_grad = gost.timings['grad_wall_s']
+    row['t_gost_grad'] = round(t_gost_grad, 1)
+    row['%_gost_grad'] = round(100.0 * t_gost_grad / t_grad, 1) if t_grad > 0 else 0.0
     row['max_grad'] = float(np.max(np.abs(de)))
     row['rms_grad'] = float(np.sqrt(np.mean(de**2)))
     row['max_grad_gost'] = float(np.max(np.abs(grad_obj.de_solvent)))

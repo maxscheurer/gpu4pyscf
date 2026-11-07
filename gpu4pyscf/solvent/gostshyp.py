@@ -310,6 +310,21 @@ class GOSTSHYP(lib.StreamObject):
         Number of grid points per atom for surface (default: 110)
     scaling_factor : float
         VDW radii scaling factor (default: 1.2)
+    timings : dict
+        Timing counters; created by __init__ and only zeroed again by
+        reset_timings() (build() and reset() keep them):
+
+        'kernel_wall_s'  wall time of kernel() in s, summed over calls, from
+                         its entry to the synchronization on a CUDA event
+                         recorded at its end (includes an implicit build()).
+        'kernel_gpu_ms'  time between CUDA events recorded on the current
+                         stream at entry and end of kernel() in ms, summed.
+        'kernel_calls'   number of kernel() calls.
+        'grad_wall_s'    wall time in s of the last grad() call (the solvent
+                         part of nuclear gradients), ending with a full device
+                         synchronization.
+        'moist_build_s'  MOIST DROP cavity construction time in s, summed.
+        'moist_grad_s'   MOIST DROP cavity derivative time in s, summed.
     """
 
     from gpu4pyscf.lib.utils import to_gpu, device, to_cpu
@@ -320,7 +335,7 @@ class GOSTSHYP(lib.StreamObject):
         'e', 'v', 'amplitudes', 'forces', 'gtilde_expval',
         'overlap_cutoff', 'cavity', 'r_ext', 'drop_kwargs',
         'grid_coords', 'areas', 'widths', 'atom_idx', 'surface_normals',
-        'surface_distances',
+        'surface_distances', 'timings',
     }
 
     def __init__(self, mol, options=None):
@@ -359,13 +374,19 @@ class GOSTSHYP(lib.StreamObject):
         # Cached screening lists (see get_screen)
         self._screen = None
 
-        # Timing (GPU ms accumulated via CUDA events)
-        self._t_gpu_ms = 0.0
-        self._t_wall = 0.0
-        self._grad_t_wall = 0.0
-        self._t_moist_build = 0.0
-        self._t_moist_grad = 0.0
-        self._n_kernel = 0
+        self.reset_timings()
+
+    def reset_timings(self):
+        """Zero all counters in self.timings (see the class docstring)."""
+        self.timings = {
+            'kernel_wall_s': 0.0,
+            'kernel_gpu_ms': 0.0,
+            'kernel_calls': 0,
+            'grad_wall_s': 0.0,
+            'moist_build_s': 0.0,
+            'moist_grad_s': 0.0,
+        }
+        return self
 
     @property
     def pressure_au(self):
@@ -444,7 +465,7 @@ class GOSTSHYP(lib.StreamObject):
         self._drop_cavity = build_drop_cavity(
             mol, nleb=self.npoints, **self.drop_kwargs)
         grid_coords, areas, atom_idx = get_surface_data(self._drop_cavity)
-        self._t_moist_build += logger.perf_counter() - t0
+        self.timings['moist_build_s'] += logger.perf_counter() - t0
         self.surface = None
         self._outer_surface = None
         self._occ_ratio_sq = None
@@ -566,7 +587,7 @@ class GOSTSHYP(lib.StreamObject):
         fock : ndarray of shape (nao, nao)
             GOSTSHYP contribution to Fock matrix
         """
-        # Always record wall + GPU time for accumulation, regardless of verbose
+        # Always record wall + GPU time for self.timings, regardless of verbose
         _e0 = cp.cuda.Event(); _e0.record()
         _w0 = logger.perf_counter()
         t0 = logger.init_timer(self)
@@ -630,10 +651,10 @@ class GOSTSHYP(lib.StreamObject):
         self.e = energy
         self.v = fock
 
-        self._n_kernel += 1
+        self.timings['kernel_calls'] += 1
         _e1 = cp.cuda.Event(); _e1.record(); _e1.synchronize()
-        self._t_wall += logger.perf_counter() - _w0
-        self._t_gpu_ms += cp.cuda.get_elapsed_time(_e0, _e1)
+        self.timings['kernel_wall_s'] += logger.perf_counter() - _w0
+        self.timings['kernel_gpu_ms'] += cp.cuda.get_elapsed_time(_e0, _e1)
         logger.info(self, 'GOSTSHYP energy: %.10f', energy)
         logger.timer(self, 'GOSTSHYP kernel', *t0)
         return energy, self.v
@@ -689,7 +710,7 @@ class GOSTSHYP(lib.StreamObject):
         from gpu4pyscf.solvent.grad.gostshyp import Gradients as GOSTSHYPGradients
         grad_obj = GOSTSHYPGradients(self)
         result = grad_obj.kernel(dm)
-        self._grad_t_wall = grad_obj.t_wall
+        self.timings['grad_wall_s'] = grad_obj.t_wall
         return result
 
 

@@ -339,6 +339,29 @@ class TestGOSTSHYPBuild(unittest.TestCase):
 
         self.assertTrue(np.all(gostshyp.widths > 0))
 
+    def test_timings(self):
+        mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='6-31g', verbose=0)
+        dm = converged_dm(mol)
+        gost = GOSTSHYP(mol)
+        keys = {'kernel_wall_s', 'kernel_gpu_ms', 'kernel_calls',
+                'grad_wall_s', 'moist_build_s', 'moist_grad_s'}
+        self.assertEqual(set(gost.timings), keys)
+        self.assertTrue(all(v == 0 for v in gost.timings.values()))
+        gost.build()
+        gost.kernel(dm)
+        gost.kernel(dm)
+        gost.grad(dm)
+        t = gost.timings
+        self.assertEqual(t['kernel_calls'], 2)
+        for key in ('kernel_wall_s', 'kernel_gpu_ms', 'grad_wall_s'):
+            self.assertGreater(t[key], 0, key)
+        self.assertEqual(t['moist_build_s'], 0)
+        gost.reset()   # keeps the counters
+        self.assertEqual(gost.timings['kernel_calls'], 2)
+        gost.reset_timings()
+        self.assertEqual(set(gost.timings), keys)
+        self.assertTrue(all(v == 0 for v in gost.timings.values()))
+
     def test_invalid_cavity(self):
         mol = gto.M(atom='H 0 0 0; H 0 0 1', basis='sto-3g', verbose=0)
         with self.assertRaisesRegex(ValueError, 'cavity must be'):
@@ -715,6 +738,8 @@ class TestDROPCavity(unittest.TestCase):
             second = _get_surface_derivatives(gost)
             self.assertIs(first, second)
             self.assertEqual(anchor_gradient.call_count, 1)
+            self.assertGreater(gost.timings['moist_build_s'], 0)
+            self.assertGreater(gost.timings['moist_grad_s'], 0)
 
             gost.reset()
             _get_surface_derivatives(gost)

@@ -42,7 +42,7 @@ def _get_surface_derivatives(gostshyp):
         from gpu4pyscf.solvent.moist import get_anchor_gradient
         t0 = logger.perf_counter()
         dareas, dcoords = get_anchor_gradient(gostshyp._drop_cavity)
-        gostshyp._t_moist_grad += logger.perf_counter() - t0
+        gostshyp.timings['moist_grad_s'] += logger.perf_counter() - t0
         expected_da = (gostshyp.mol.natm, 3, gostshyp.n_gaussian)
         expected_dx = (3, 3, gostshyp.mol.natm, gostshyp.n_gaussian)
         if dareas.shape != expected_da or dcoords.shape != expected_dx:
@@ -215,11 +215,16 @@ def _apply_grid_coordinate_response(gostshyp, gtilde_grad, force_grad,
 
 
 class Gradients(lib.StreamObject):
-    """Nuclear gradients for GOSTSHYP solvation model."""
+    """Nuclear gradients for GOSTSHYP solvation model.
+
+    After kernel(), t_wall holds its wall time in s (up to a full device
+    synchronization); GOSTSHYP.grad copies it to timings['grad_wall_s'].
+    """
 
     def __init__(self, gostshyp_obj):
         self.gostshyp = gostshyp_obj
         self.mol = gostshyp_obj.mol
+        self.t_wall = None
 
     def kernel(self, dm):
         """
