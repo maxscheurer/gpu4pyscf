@@ -178,15 +178,9 @@ int GINTovlp_density_screened(
 {
     OVLP_TYPE_INFO
     if (i_l <= 2 && j_l <= 2 && kmax == 1) {
-        if (kmax == 1) {
-            ovlp_launch_density_t<1>(i_l, j_l, blocks, threads, stream,
-                out, dm, nao, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
-                pair_ptr, pair_tiles, coords, exps, ngrids);
-        } else {
-            ovlp_launch_density_t<3>(i_l, j_l, blocks, threads, stream,
-                out, dm, nao, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
-                pair_ptr, pair_tiles, coords, exps, ngrids);
-        }
+        ovlp_launch_density_t<1>(i_l, j_l, blocks, threads, stream,
+            out, dm, nao, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
+            pair_ptr, pair_tiles, coords, exps, ngrids);
         return ovlp_check(__func__);
     }
     const int lt = i_l + j_l + kmax;

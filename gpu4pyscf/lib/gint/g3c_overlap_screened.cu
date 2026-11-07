@@ -237,7 +237,6 @@ __global__ void GINTovlp_screen_kernel(
     }
     rp = rp * (1.0 + 1e-12) + 1e-12;
 
-    const unsigned lt_mask = (1u << lane) - 1u;
     int n = 0;   // mode 0: passing blocks; mode 1: kept tiles
     int k = 0;   // mode 1: passing blocks written
     const int out0 = fill ? blk_ptr[bas_ij] : 0;
