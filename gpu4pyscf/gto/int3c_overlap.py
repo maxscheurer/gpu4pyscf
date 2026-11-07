@@ -645,6 +645,45 @@ def _morton_order(coords):
     return cp.argsort(code)
 
 
+_sym_transform_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void ovlp_sym_transform(const double* __restrict__ src, double* __restrict__ dst,
+                        const int n_out, const int n_src,
+                        const int* __restrict__ rp, const int* __restrict__ ci,
+                        const double* __restrict__ v, const double scale)
+{
+    // dst = scale * T sym(src) T^T,  sym(X) = (X + X^T) / 2,  T in CSR (n_out rows)
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)n_out * n_out) return;
+    const int p = (int)(idx / n_out);
+    const int q = (int)(idx % n_out);
+    double s = 0.0;
+    for (int i = rp[p]; i < rp[p + 1]; ++i) {
+        const long long a = ci[i];
+        const double va = v[i];
+        for (int j = rp[q]; j < rp[q + 1]; ++j) {
+            const long long b = ci[j];
+            s += va * v[j] * (src[a * n_src + b] + src[b * n_src + a]);
+        }
+    }
+    dst[idx] = 0.5 * scale * s;
+}
+''', 'ovlp_sym_transform')
+
+
+def _sym_transform(T, src, out, scale=1.0):
+    """out = scale * T sym(src) T^T for a CSR matrix T (no temporaries)."""
+    n_out, n_src = T.shape
+    assert src.shape == (n_src, n_src) and src.flags.c_contiguous
+    assert out.shape == (n_out, n_out) and out.flags.c_contiguous
+    n = n_out * n_out
+    _sym_transform_kernel(
+        ((n + 255) // 256,), (256,),
+        (src, out, np.int32(n_out), np.int32(n_src),
+         T.indptr, T.indices, T.data, np.float64(scale)))
+    return out
+
+
 class OverlapScreen:
     """Rigorous (shell pair, grid tile) screening lists for one cavity.
 
@@ -772,20 +811,34 @@ class OverlapScreen:
             rows, data = c2s.row, c2s.data
             cols = idx[c2s.col]
         T = sp.csr_matrix((data, (rows, cols)), shape=(nao_cart, nao))
-        self._T, self._Tt, self._T_cart = T, T.T.tocsr(), mol.cart
+        T.sort_indices()
+        Tt = T.T.tocsr()
+        Tt.sort_indices()
+        for M in (T, Tt):
+            M.indptr = M.indptr.astype(np.int32)
+            M.indices = M.indices.astype(np.int32)
+        self._T, self._Tt, self._T_cart = T, Tt, mol.cart
+        # persistent work buffers: avoid ~GB cudaMalloc/cudaFree per call
+        self._dm_buf = cp.empty((nao_cart, nao_cart))
+        self._fock_buf = cp.empty((nao_cart, nao_cart))
         return T
 
-    def _sorted_cart_dm(self, mol, dm):
+    def _sorted_cart_dm(self, mol, dm, scale=1.0):
+        """scale * T sym(dm) T^T in the persistent buffer.
+
+        Only the symmetric part of dm enters the overlap contractions (the
+        kernels use D_ij + D_ji), so symmetrizing is exact.
+        """
         T = self._transform(mol)
-        dm = cp.asarray(dm, dtype=np.float64)
-        x = T @ cp.ascontiguousarray(dm.T)          # T dm^T
-        return cp.ascontiguousarray(T @ cp.ascontiguousarray(x.T))  # T dm T^T
+        dm = cp.ascontiguousarray(cp.asarray(dm, dtype=np.float64))
+        return _sym_transform(T, dm, self._dm_buf, scale)
 
     def _unsort_fock(self, mol, fock_c):
+        """T^T F T for the (symmetric) sorted-Cartesian Fock matrix F."""
         self._transform(mol)
         Tt = self._Tt
-        x = Tt @ cp.ascontiguousarray(fock_c.T)      # T^T F^T
-        return Tt @ cp.ascontiguousarray(x.T)        # T^T F T
+        out = cp.empty((Tt.shape[0], Tt.shape[0]))
+        return _sym_transform(Tt, fock_c, out)
 
     def density(self, mol, dm, kmax):
         """sum_ij D_ij S_ij,(g,c) for aux l = 0..kmax -> [ngrids, ncomp]."""
@@ -807,7 +860,9 @@ class OverlapScreen:
         amp_p = cp.ascontiguousarray(
             cp.asarray(amp_p, dtype=np.float64).reshape(-1, 3)[self.perm])
         nao_cart = intopt._sorted_mol.nao
-        fock = cp.zeros((nao_cart, nao_cart))
+        self._transform(mol)
+        fock = self._fock_buf
+        fock.fill(0)
         self._launch(libgint.GINTovlp_fock_sp_screened,
                      ctypes.c_void_p(fock.data.ptr), ctypes.c_int(nao_cart),
                      ctypes.c_void_p(amp_s.data.ptr), ctypes.c_void_p(amp_p.data.ptr))
@@ -821,8 +876,7 @@ class OverlapScreen:
         of get_int3c_overlap_ip1_amplitude_contracted (s amplitudes amp_s plus
         p amplitudes amp_p).
         """
-        dm_c = self._sorted_cart_dm(mol, dm)
-        dsym = cp.ascontiguousarray(dm_c + dm_c.T)
+        dsym = self._sorted_cart_dm(mol, dm, scale=2.0)  # D + D^T
         amp_s = cp.ascontiguousarray(cp.asarray(amp_s, dtype=np.float64).ravel()[self.perm])
         amp_p = cp.ascontiguousarray(
             cp.asarray(amp_p, dtype=np.float64).reshape(-1, 3)[self.perm])
