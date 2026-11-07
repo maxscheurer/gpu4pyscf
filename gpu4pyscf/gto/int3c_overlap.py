@@ -645,14 +645,14 @@ def _morton_order(coords):
     return cp.argsort(code)
 
 
-_sym_transform_kernel = cp.RawKernel(r'''
+_congruence_kernel = cp.RawKernel(r'''
 extern "C" __global__
-void ovlp_sym_transform(const double* __restrict__ src, double* __restrict__ dst,
+void ovlp_congruence(const double* __restrict__ src, double* __restrict__ dst,
                         const int n_out, const int n_src,
                         const int* __restrict__ rp, const int* __restrict__ ci,
                         const double* __restrict__ v, const double scale)
 {
-    // dst = scale * T sym(src) T^T,  sym(X) = (X + X^T) / 2,  T in CSR (n_out rows)
+    // dst = scale * T src T^T,  T in CSR (n_out rows)
     const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long long)n_out * n_out) return;
     const int p = (int)(idx / n_out);
@@ -663,21 +663,21 @@ void ovlp_sym_transform(const double* __restrict__ src, double* __restrict__ dst
         const double va = v[i];
         for (int j = rp[q]; j < rp[q + 1]; ++j) {
             const long long b = ci[j];
-            s += va * v[j] * (src[a * n_src + b] + src[b * n_src + a]);
+            s += va * v[j] * src[a * n_src + b];
         }
     }
-    dst[idx] = 0.5 * scale * s;
+    dst[idx] = scale * s;
 }
-''', 'ovlp_sym_transform')
+''', 'ovlp_congruence')
 
 
-def _sym_transform(T, src, out, scale=1.0):
-    """out = scale * T sym(src) T^T for a CSR matrix T (no temporaries)."""
+def _congruence(T, src, out, scale=1.0):
+    """out = scale * T src T^T for a CSR matrix T (no temporaries)."""
     n_out, n_src = T.shape
     assert src.shape == (n_src, n_src) and src.flags.c_contiguous
     assert out.shape == (n_out, n_out) and out.flags.c_contiguous
     n = n_out * n_out
-    _sym_transform_kernel(
+    _congruence_kernel(
         ((n + 255) // 256,), (256,),
         (src, out, np.int32(n_out), np.int32(n_src),
          T.indptr, T.indices, T.data, np.float64(scale)))
@@ -824,21 +824,21 @@ class OverlapScreen:
         return T
 
     def _sorted_cart_dm(self, mol, dm, scale=1.0):
-        """scale * T sym(dm) T^T in the persistent buffer.
+        """scale * T dm T^T (sorted Cartesian) in the persistent buffer.
 
-        Only the symmetric part of dm enters the overlap contractions (the
-        kernels use D_ij + D_ji), so symmetrizing is exact.
+        Only the symmetric part of dm enters the overlap contractions: the
+        kernels form D_ij + D_ji themselves, so no symmetrization is needed.
         """
         T = self._transform(mol)
         dm = cp.ascontiguousarray(cp.asarray(dm, dtype=np.float64))
-        return _sym_transform(T, dm, self._dm_buf, scale)
+        return _congruence(T, dm, self._dm_buf, scale)
 
     def _unsort_fock(self, mol, fock_c):
         """T^T F T for the (symmetric) sorted-Cartesian Fock matrix F."""
         self._transform(mol)
         Tt = self._Tt
         out = cp.empty((Tt.shape[0], Tt.shape[0]))
-        return _sym_transform(Tt, fock_c, out)
+        return _congruence(Tt, fock_c, out)
 
     def density(self, mol, dm, kmax):
         """sum_ij D_ij S_ij,(g,c) for aux l = 0..kmax -> [ngrids, ncomp]."""
@@ -876,7 +876,7 @@ class OverlapScreen:
         of get_int3c_overlap_ip1_amplitude_contracted (s amplitudes amp_s plus
         p amplitudes amp_p).
         """
-        dsym = self._sorted_cart_dm(mol, dm, scale=2.0)  # D + D^T
+        dsym = self._sorted_cart_dm(mol, dm)  # kernel forms D + D^T
         amp_s = cp.ascontiguousarray(cp.asarray(amp_s, dtype=np.float64).ravel()[self.perm])
         amp_p = cp.ascontiguousarray(
             cp.asarray(amp_p, dtype=np.float64).reshape(-1, 3)[self.perm])

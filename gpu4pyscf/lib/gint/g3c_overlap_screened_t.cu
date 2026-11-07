@@ -275,7 +275,8 @@ __global__ void GINTovlp_ip1_sp_atoms_screened_t_kernel(
     for (int iJ = 0; iJ < NJ; ++iJ) {
         #pragma unroll
         for (int iI = 0; iI < NI; ++iI)
-            dd[iJ * NI + iI] = dsym[(ao_i + iI) * nao + ao_j + iJ];
+            dd[iJ * NI + iI] = dsym[(ao_i + iI) * nao + ao_j + iJ]
+                             + dsym[(ao_j + iJ) * nao + ao_i + iI];  // D + D^T
     }
     double gA[3] = {0.0, 0.0, 0.0};
     double gB[3] = {0.0, 0.0, 0.0};

@@ -420,7 +420,8 @@ __global__ void GINTovlp_ip1_sp_atoms_screened_kernel(
                     const int ix = c_idx[i_loc + iI];
                     const int iy = c_idx[i_loc + iI + TOT_NF];
                     const int iz = c_idx[i_loc + iI + 2 * TOT_NF];
-                    const double d = dsym[(ao_i + iI) * nao + (ao_j + iJ)];
+                    const double d = dsym[(ao_i + iI) * nao + (ao_j + iJ)]
+                                   + dsym[(ao_j + iJ) * nao + (ao_i + iI)];  // D + D^T
                     for (int k = 0; k < 4; ++k) {
                         const int kx = (k == 1), ky = (k == 2), kz = (k == 3);
                         const double sx = Sx[S_IDX(ix, jx, kx)];
