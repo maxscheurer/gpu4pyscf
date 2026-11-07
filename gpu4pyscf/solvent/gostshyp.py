@@ -45,11 +45,10 @@ def _gen_surface(mol, ng=110, rad=modified_Bondi):
     GPU operations with a single host synchronization instead of a Python loop
     with two synchronizations per atom.
     """
-    from gpu4pyscf.solvent.pcm import switch_h, XI, PI, libdft
+    from pyscf.dft.LebedevGrid import MakeAngularGrid
+    from gpu4pyscf.solvent.pcm import switch_h, XI, PI
     from gpu4pyscf.lib.cupy_helper import dist_matrix
-    unit_sphere = np.empty((ng, 4))
-    libdft.MakeAngularGrid(unit_sphere.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(ng))
-    unit_sphere = cp.asarray(unit_sphere)
+    unit_sphere = cp.asarray(MakeAngularGrid(ng))
 
     natm = mol.natm
     atom_coords = cp.asarray(mol.atom_coords(unit='B'))
@@ -260,7 +259,8 @@ class _OverlapPairOpt(VHFOpt):
                     bas_pairs_locs.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(ncptype),
                     _sorted_mol._atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(_sorted_mol.natm),
                     _sorted_mol._bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(_sorted_mol.nbas),
-                    _sorted_mol._env.ctypes.data_as(ctypes.c_void_p))
+                    _sorted_mol._env.ctypes.data_as(ctypes.c_void_p),
+                    ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
                 self._bpcache[n] = bpcache
 
         cput1 = log.timer_debug1('Initialize GPU cache', *cput1)
