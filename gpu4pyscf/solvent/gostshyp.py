@@ -26,7 +26,7 @@ import cupy as cp
 from pyscf import lib
 from pyscf import gto
 from gpu4pyscf.solvent import _attach_solvent
-from gpu4pyscf.solvent.pcm import gen_surface, modified_Bondi
+from gpu4pyscf.solvent.pcm import modified_Bondi
 from gpu4pyscf.gto.int3c1e import VHFOpt, GPU_AO_LMAX, libgint
 from gpu4pyscf.gto.mole import basis_seg_contraction
 from gpu4pyscf.df.int3c2e import sort_mol, _split_l_ctr_groups

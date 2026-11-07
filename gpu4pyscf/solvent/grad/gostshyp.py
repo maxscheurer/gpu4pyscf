@@ -25,19 +25,7 @@ import numpy as np
 import cupy as cp
 from pyscf import lib
 from gpu4pyscf.solvent.grad.pcm import get_dF_dA
-from gpu4pyscf.gto import int3c_overlap
-from gpu4pyscf.gto import int3c_overlap_ip
 from gpu4pyscf.lib import logger
-
-
-def _per_atom_sum(per_ao, aoslice):
-    """Sum per-AO contributions [nao, 3] to per-atom [natm, 3] on GPU."""
-    natm = aoslice.shape[0]
-    per_atom = cp.empty((natm, 3), dtype=per_ao.dtype)
-    for ia in range(natm):
-        p0, p1 = int(aoslice[ia, 2]), int(aoslice[ia, 3])
-        per_atom[ia] = cp.sum(per_ao[p0:p1], axis=0)
-    return per_atom
 
 
 def _scatter_add(target, indices, values):
