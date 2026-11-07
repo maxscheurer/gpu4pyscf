@@ -27,7 +27,12 @@ from pyscf import lib
 from pyscf import gto
 from gpu4pyscf.solvent import _attach_solvent
 from gpu4pyscf.solvent.pcm import gen_surface, modified_Bondi
-from gpu4pyscf.gto.int3c1e import VHFOpt
+from gpu4pyscf.gto.int3c1e import VHFOpt, GPU_AO_LMAX, libgint
+from gpu4pyscf.gto.mole import basis_seg_contraction
+from gpu4pyscf.df.int3c2e import sort_mol, _split_l_ctr_groups
+from gpu4pyscf.scf.int4c2e import BasisProdCache
+from gpu4pyscf.__config__ import num_devices
+from pyscf.scf import _vhf
 from gpu4pyscf.gto import int3c_overlap
 from gpu4pyscf.lib import logger
 from pyscf.data.radii import BOHR
@@ -112,12 +117,8 @@ class _OverlapPairOpt(VHFOpt):
         VHFOpt.__init__(self, mol, qcondname=None)
         self._overlap_cutoff = cutoff
 
-    def get_q_cond(self):
-        """Shell-pair bound  max|ci| max|cj| exp(-mu_min R^2) >= max |e12|.
-
-        mu = ai aj / (ai + aj) is increasing in both exponents, so the two
-        smallest exponents give the smallest mu, i.e. the largest exponential.
-        """
+    def _shell_bound_data(self):
+        """Per-shell (min exponent, scaled max |coeff|, atom) of the sorted mol."""
         mol = self._sorted_mol
         bas = mol._bas
         nbas = mol.nbas
@@ -132,20 +133,139 @@ class _OverlapPairOpt(VHFOpt):
         l = bas[:, gto.ANG_OF]
         cmax[l == 0] *= 0.282094791773878143
         cmax[l == 1] *= 0.488602511902919921
-        atm = cp.asarray(bas[:, gto.ATOM_OF])
-        xyz = cp.asarray(mol.atom_coords())
-        r2_atm = ((xyz[:, None, :] - xyz[None, :, :]) ** 2).sum(axis=2)
-        amin = cp.asarray(amin)
-        cmax = cp.asarray(cmax)
-        mu = amin[:, None] * amin[None, :] / (amin[:, None] + amin[None, :])
-        q = cp.exp(-mu * r2_atm[atm[:, None], atm[None, :]])
-        q *= cmax[:, None]
-        q *= cmax[None, :]
-        # get_pairing keeps q > 1e-14; rescale so that this means
-        # bound >= 0.5 * cutoff (keep everything for cutoff == 0).
+        return (cp.asarray(amin), cp.asarray(cmax),
+                cp.asarray(mol.atom_coords()[bas[:, gto.ATOM_OF]]))
+
+    def _overlap_pairing(self, offsets):
+        """Shell pairs (i >= j) whose bound
+            max|ci| max|cj| exp(-mu_min R^2) >= max |e12|
+        reaches 0.5 * cutoff; mu = ai aj / (ai + aj) is increasing in both
+        exponents, so the smallest exponents give the largest exponential.
+        Ordering matches get_pairing(aosym=True, diag_block_with_triu=False).
+        """
+        amin, cmax, xyz = self._shell_bound_data()
         thresh = 0.5 * self._overlap_cutoff
-        q *= 1e-14 / thresh * (1 - 1e-12) if thresh > 0 else 1e300
-        return cp.asnumpy(q)
+        log_qs, pair2bra, pair2ket = [], [], []
+        for p0, p1 in zip(offsets[:-1], offsets[1:]):
+            for q0, q1 in zip(offsets[:-1], offsets[1:]):
+                if q0 > p0:
+                    continue
+                r2 = ((xyz[p0:p1, None, :] - xyz[None, q0:q1, :]) ** 2).sum(axis=2)
+                ai = amin[p0:p1, None]
+                aj = amin[None, q0:q1]
+                q = cp.exp(-(ai * aj / (ai + aj)) * r2)
+                q *= cmax[p0:p1, None]
+                q *= cmax[None, q0:q1]
+                mask = q >= thresh
+                if q0 == p0:
+                    mask &= cp.tri(p1 - p0, dtype=bool)
+                ish, jsh = cp.nonzero(mask)
+                if q0 == p0 and len(ish) == 0:
+                    continue
+                pair2bra.append(cp.asnumpy(ish) + p0)
+                pair2ket.append(cp.asnumpy(jsh) + q0)
+                log_q = cp.log(cp.minimum(q[ish, jsh] * (1e-14 / thresh)
+                                          if thresh > 0 else q[ish, jsh], 1.0))
+                log_qs.append(cp.asnumpy(log_q))
+        return log_qs, pair2bra, pair2ket
+
+    def build(self, cutoff=1e-13, group_size=None, diag_block_with_triu=False, aosym=True):
+        """Copy of gpu4pyscf.gto.int3c1e.VHFOpt.build with overlap-bound pairing."""
+        original_mol = self.mol
+        mol = basis_seg_contraction(original_mol, allow_replica=True)[0]
+
+        log = logger.new_logger(original_mol, original_mol.verbose)
+        cput0 = log.init_timer()
+        _sorted_mol, sorted_idx, uniq_l_ctr, l_ctr_counts = sort_mol(mol, log=log)
+        self._sorted_mol = _sorted_mol
+
+        if group_size is not None :
+            uniq_l_ctr, l_ctr_counts = _split_l_ctr_groups(uniq_l_ctr, l_ctr_counts, group_size)
+        self.l_ctr_counts = l_ctr_counts
+
+        # Initialize vhfopt after reordering mol._bas
+        _vhf.VHFOpt.__init__(self, _sorted_mol, self._intor, self._prescreen,
+                             self._qcondname, self._dmcondname)
+        self.direct_scf_tol = cutoff
+
+        # Shell pairs from the rigorous overlap bound, evaluated per block pair
+        # on the GPU (same pairs and ordering as get_pairing on the dense
+        # bound matrix, without materializing it).
+        cput1 = log.timer_debug1('Initialize', *cput0)
+        l_ctr_offsets = np.append(0, np.cumsum(l_ctr_counts))
+        assert aosym and not diag_block_with_triu
+        log_qs, pair2bra, pair2ket = self._overlap_pairing(l_ctr_offsets)
+        self.log_qs = log_qs.copy()
+        cput1 = log.timer_debug1('Get AO pairing', *cput1)
+
+        # contraction coefficient for ao basis
+        cart_ao_loc = _sorted_mol.ao_loc_nr(cart=True)
+        sph_ao_loc = _sorted_mol.ao_loc_nr(cart=False)
+        self.cart_ao_loc = [cart_ao_loc[cp] for cp in l_ctr_offsets]
+        self.sph_ao_loc = [sph_ao_loc[cp] for cp in l_ctr_offsets]
+        self.angular = [l[0] for l in uniq_l_ctr]
+        if any(np.array(self.angular) > GPU_AO_LMAX):
+            raise NotImplementedError("H orbital or higher (5Z basis or higher) is not supported")
+
+        # Sorted AO indices
+        ao_loc = mol.ao_loc_nr(cart=original_mol.cart)
+        ao_idx = np.array_split(np.arange(original_mol.nao), ao_loc[1:-1])
+        self._ao_idx = np.hstack([ao_idx[i] for i in sorted_idx])
+        cput1 = log.timer_debug1('AO indices', *cput1)
+
+        ao_loc = cart_ao_loc
+
+        self.pair2bra = pair2bra
+        self.pair2ket = pair2ket
+        self.l_ctr_offsets = l_ctr_offsets
+        bas_pair2shls = np.hstack(pair2bra + pair2ket).astype(np.int32).reshape(2,-1)
+        bas_pairs_locs = np.append(0, np.cumsum([x.size for x in pair2bra])).astype(np.int32)
+        self.bas_pair2shls = bas_pair2shls
+        self.bas_pairs_locs = bas_pairs_locs
+        ncptype = len(self.log_qs)
+
+        n_uniq_l_ctr = len(uniq_l_ctr)
+        if aosym:
+            # This symmetric case is different from self.cp_idx, whose length is ncptype = n_uniq_l_ctr ** 2
+            cp_idx, cp_jdx = np.tril_indices(n_uniq_l_ctr)
+        else:
+            cp_idx, cp_jdx = np.unravel_index(np.arange(n_uniq_l_ctr**2), (n_uniq_l_ctr, n_uniq_l_ctr))
+        l_ij = list(zip(uniq_l_ctr[cp_idx, 0], uniq_l_ctr[cp_jdx, 0]))
+        self.l_ij = np.asarray(l_ij)
+        def get_n_hermite_density_of_angular_pair(l):
+            return (l + 1) * (l + 2) * (l + 3) // 6
+        n_density_per_pair = np.array([ get_n_hermite_density_of_angular_pair(li + lj) for (li, lj) in l_ij ])
+        n_density_per_angular_pair = (bas_pairs_locs[1:] - bas_pairs_locs[:-1]) * n_density_per_pair
+        self.density_offset = np.append(0, np.cumsum(n_density_per_angular_pair)).astype(np.int32)
+
+        self._bpcache = {}
+        for n in range(num_devices):
+            with cp.cuda.Device(n):
+                bpcache = ctypes.POINTER(BasisProdCache)()
+                scale_shellpair_diag = 1.0
+                libgint.GINTinit_basis_prod(
+                    ctypes.byref(bpcache), ctypes.c_double(scale_shellpair_diag),
+                    ao_loc.ctypes.data_as(ctypes.c_void_p),
+                    bas_pair2shls.ctypes.data_as(ctypes.c_void_p),
+                    bas_pairs_locs.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(ncptype),
+                    _sorted_mol._atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(_sorted_mol.natm),
+                    _sorted_mol._bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(_sorted_mol.nbas),
+                    _sorted_mol._env.ctypes.data_as(ctypes.c_void_p))
+                self._bpcache[n] = bpcache
+
+        cput1 = log.timer_debug1('Initialize GPU cache', *cput1)
+        self.aosym = aosym
+        if aosym:
+            self.cp_idx, self.cp_jdx = np.tril_indices(ncptype)
+        else:
+            nl = int(round(np.sqrt(ncptype)))
+            self.cp_idx, self.cp_jdx = np.unravel_index(np.arange(ncptype), (nl, nl))
+
+        if original_mol.cart:
+            self.ao_loc = self.cart_ao_loc
+        else:
+            self.ao_loc = self.sph_ao_loc
+
 
 
 @lib.with_doc(_attach_solvent._for_scf.__doc__)
