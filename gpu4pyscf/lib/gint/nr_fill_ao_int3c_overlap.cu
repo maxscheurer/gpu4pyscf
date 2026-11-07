@@ -721,9 +721,19 @@ static int ovlp_check(const char* name) {
 
 int GINTovlp_tile_size() { return OVLP_TILE; }
 
+int GINTovlp_expand(const cudaStream_t stream, int* tiles_out, const int* pair_ptr,
+                    const int* blk, const unsigned* mask, const int* blk_ptr,
+                    const int tiles_per_block, const int npairs)
+{
+    if (npairs <= 0) return 0;
+    GINTovlp_expand_kernel<<<(npairs + 3) / 4, 128, 0, stream>>>(
+        tiles_out, pair_ptr, blk, mask, blk_ptr, tiles_per_block, npairs);
+    return ovlp_check(__func__);
+}
+
 int GINTovlp_screen(
     const cudaStream_t stream, const BasisProdCache* bpcache, const int cp_ij_id,
-    int* counts, int* tiles_out, const int* pair_ptr,
+    int* counts, int* blk_out, unsigned* mask_out, const int* blk_ptr,
     const double* tile_sphere, const double* tile_gamma, const int ntiles,
     const double* super_sphere, const double* super_gamma, const int tiles_per_super,
     const double* block_sphere, const double* block_gamma, const int tiles_per_block,
@@ -738,7 +748,7 @@ int GINTovlp_screen(
     const int nthreads = 128;  // 4 warps, one shell pair per warp
     const int nblocks = (ntasks_ij + 3) / 4;
     GINTovlp_screen_kernel<<<nblocks, nthreads, 0, stream>>>(
-        counts, tiles_out, pair_ptr, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
+        counts, blk_out, mask_out, blk_ptr, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
         tile_sphere, tile_gamma, ntiles, super_sphere, super_gamma, tiles_per_super,
         block_sphere, block_gamma, tiles_per_block, thresh, fill);
     return ovlp_check(__func__);

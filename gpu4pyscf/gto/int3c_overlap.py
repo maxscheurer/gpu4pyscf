@@ -735,24 +735,21 @@ class OverlapScreen:
         self.super_sphere, self.super_gamma = group(OVLP_TILES_PER_SUPER)
         self.block_sphere, self.block_gamma = group(OVLP_TILES_PER_BLOCK)
 
+        assert OVLP_TILES_PER_BLOCK <= 32
         npairs = int(intopt.bas_pairs_locs[-1])
-        counts = cp.zeros(npairs, dtype=np.int32)
         thresh = 0.5 * cutoff
         libgint.GINTset_int3c_overlap_constants(intopt.bpcache, ctypes.c_double(cutoff))
         stream = cp.cuda.get_current_stream()
         null = ctypes.c_void_p(0)
-        for fill in (0, 1):
-            if fill:
-                ptr = cp.zeros(npairs + 1, dtype=np.int32)
-                cp.cumsum(counts, out=ptr[1:])
-                nnz = int(ptr[-1])
-                tiles = cp.empty(max(nnz, 1), dtype=np.int32)
+
+        def screen(fill, counts, blk, mask, blk_ptr):
             for cp_ij_id in range(len(intopt.log_qs)):
                 err = libgint.GINTovlp_screen(
                     ctypes.c_void_p(stream.ptr), intopt.bpcache, ctypes.c_int(cp_ij_id),
                     ctypes.c_void_p(counts.data.ptr),
-                    ctypes.c_void_p(tiles.data.ptr) if fill else null,
-                    ctypes.c_void_p(ptr.data.ptr) if fill else null,
+                    ctypes.c_void_p(blk.data.ptr) if fill else null,
+                    ctypes.c_void_p(mask.data.ptr) if fill else null,
+                    ctypes.c_void_p(blk_ptr.data.ptr) if fill else null,
                     ctypes.c_void_p(self.tile_sphere.data.ptr),
                     ctypes.c_void_p(self.tile_gamma.data.ptr),
                     ctypes.c_int(ntiles),
@@ -765,6 +762,31 @@ class OverlapScreen:
                     ctypes.c_double(thresh), ctypes.c_int(fill))
                 if err != 0:
                     raise RuntimeError('GINTovlp_screen failed')
+
+        # 1) count passing (pair, block) records with the cheap block-level
+        # bounds, 2) evaluate the exact tile test once, storing a hit mask per
+        # passing block, 3) expand the masks into the per-pair tile CSR.
+        nblk = cp.zeros(npairs, dtype=np.int32)
+        screen(0, nblk, None, None, None)
+        blk_ptr = cp.zeros(npairs + 1, dtype=np.int32)
+        cp.cumsum(nblk, out=blk_ptr[1:])
+        nrec = max(int(blk_ptr[-1]), 1)
+        blk = cp.empty(nrec, dtype=np.int32)
+        mask = cp.empty(nrec, dtype=np.uint32)
+        counts = cp.zeros(npairs, dtype=np.int32)
+        screen(1, counts, blk, mask, blk_ptr)
+        ptr = cp.zeros(npairs + 1, dtype=np.int32)
+        cp.cumsum(counts, out=ptr[1:])
+        nnz = int(ptr[-1])
+        tiles = cp.empty(max(nnz, 1), dtype=np.int32)
+        err = libgint.GINTovlp_expand(
+            ctypes.c_void_p(stream.ptr), ctypes.c_void_p(tiles.data.ptr),
+            ctypes.c_void_p(ptr.data.ptr), ctypes.c_void_p(blk.data.ptr),
+            ctypes.c_void_p(mask.data.ptr), ctypes.c_void_p(blk_ptr.data.ptr),
+            ctypes.c_int(OVLP_TILES_PER_BLOCK), ctypes.c_int(npairs))
+        if err != 0:
+            raise RuntimeError('GINTovlp_expand failed')
+        del blk, mask
         self.pair_ptr = ptr
         self.pair_tiles = tiles
         self.nnz = nnz

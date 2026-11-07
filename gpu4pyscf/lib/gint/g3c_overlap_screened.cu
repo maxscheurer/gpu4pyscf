@@ -52,9 +52,10 @@ __device__ __forceinline__ double ovlp_bound(double aij, double e, double d2,
 }
 
 __global__ void GINTovlp_screen_kernel(
-    int* __restrict__ counts,          // [n_bas_pairs] (count pass)
-    int* __restrict__ tiles_out,       // [nnz]         (fill pass)
-    const int* __restrict__ pair_ptr,  // [n_bas_pairs+1] (fill pass)
+    int* __restrict__ counts,          // [n_bas_pairs] mode 0: #blocks, mode 1: #tiles
+    int* __restrict__ blk_out,         // mode 1: passing block ids  [nblk_pass]
+    unsigned* __restrict__ mask_out,   // mode 1: tile hit mask per passing block
+    const int* __restrict__ blk_ptr,   // mode 1: [n_bas_pairs+1] offsets of passing blocks
     const int bas_ij0, const int prim_ij0, const int ntasks_ij, const int nprim_ij,
     const double* __restrict__ tile_sphere,  // [ntiles, 4]: cx, cy, cz, R
     const double* __restrict__ tile_gamma,   // [ntiles, 2]: gmin, gmax
@@ -92,8 +93,9 @@ __global__ void GINTovlp_screen_kernel(
     rp = rp * (1.0 + 1e-12) + 1e-12;
 
     const unsigned lt_mask = (1u << lane) - 1u;
-    int n = 0;
-    const int out0 = fill ? pair_ptr[bas_ij] : 0;
+    int n = 0;   // mode 0: passing blocks; mode 1: kept tiles
+    int k = 0;   // mode 1: passing blocks written
+    const int out0 = fill ? blk_ptr[bas_ij] : 0;
     const int nsuper = (ntiles + tiles_per_super - 1) / tiles_per_super;
     for (int sb0 = 0; sb0 < nsuper; sb0 += 32) {
         const int sb = sb0 + lane;
@@ -132,10 +134,12 @@ __global__ void GINTovlp_screen_kernel(
             while (bmask) {
             const int blk = b0 + __ffs(bmask) - 1;
             bmask &= bmask - 1;
+            if (!fill) { ++n; continue; }
+            // tiles_per_block <= 32: one ballot covers the whole block
             const int tb = blk * tiles_per_block;
             const int te = min(ntiles, tb + tiles_per_block);
-            for (int t0 = tb; t0 < te; t0 += 32) {
-                const int t = t0 + lane;
+            {
+                const int t = tb + lane;
                 bool keep = false;
                 if (t < te) {
                     const double cx = tile_sphere[t * 4 + 0];
@@ -157,14 +161,40 @@ __global__ void GINTovlp_screen_kernel(
                     }
                 }
                 const unsigned kmask = __ballot_sync(0xffffffffu, keep);
-                if (fill && keep) tiles_out[out0 + n + __popc(kmask & lt_mask)] = t;
+                if (lane == 0) {
+                    blk_out[out0 + k] = blk;
+                    mask_out[out0 + k] = kmask;
+                }
+                ++k;
                 n += __popc(kmask);
             }
             }  // blocks
             }
         }
     }
-    if (!fill && lane == 0) counts[bas_ij] = n;
+    if (lane == 0) counts[bas_ij] = n;
+}
+
+/*
+ * Expand (block, hit mask) records into the dense per-pair tile CSR.
+ * One warp per pair.
+ */
+__global__ void GINTovlp_expand_kernel(
+    int* __restrict__ tiles_out, const int* __restrict__ pair_ptr,
+    const int* __restrict__ blk, const unsigned* __restrict__ mask,
+    const int* __restrict__ blk_ptr, const int tiles_per_block, const int npairs)
+{
+    const int lane = threadIdx.x & 31;
+    const int p = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (p >= npairs) return;
+    const unsigned lt_mask = (1u << lane) - 1u;
+    int n = pair_ptr[p];
+    for (int k = blk_ptr[p]; k < blk_ptr[p + 1]; ++k) {
+        const unsigned m = mask[k];
+        if ((m >> lane) & 1u)
+            tiles_out[n + __popc(m & lt_mask)] = blk[k] * tiles_per_block + lane;
+        n += __popc(m);
+    }
 }
 
 // Shared prologue of the per-primitive work (identical arithmetic to the
