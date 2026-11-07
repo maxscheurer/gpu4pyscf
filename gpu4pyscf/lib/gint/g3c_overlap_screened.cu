@@ -282,7 +282,7 @@ __global__ void GINTovlp_density_screened_kernel(
             }
         }
         if (touched) {
-            for (int c = 0; c < ncomp; ++c) atomicAdd(&out[grid * ncomp + c], acc[c]);
+            for (int c = 0; c < ncomp; ++c) atomicAdd(&out[c * ngrids + grid], acc[c]);
         }
     }
     #undef S_IDX

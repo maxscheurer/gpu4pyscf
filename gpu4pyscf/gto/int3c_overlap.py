@@ -845,13 +845,13 @@ class OverlapScreen:
         ncomp = (kmax + 1) * (kmax + 2) * (kmax + 3) // 6
         dm_c = self._sorted_cart_dm(mol, dm)
         nao_cart = dm_c.shape[0]
-        out = cp.zeros((self.ngrids, ncomp))
+        out = cp.zeros((ncomp, self.ngrids))  # component-major for coalescing
         self._launch(libgint.GINTovlp_density_screened,
                      ctypes.c_void_p(out.data.ptr), ctypes.c_int(ncomp),
                      ctypes.c_void_p(dm_c.data.ptr), ctypes.c_int(nao_cart),
                      ctypes.c_int(kmax))
-        res = cp.empty_like(out)
-        res[self.perm] = out
+        res = cp.empty((self.ngrids, ncomp))
+        res[self.perm] = out.T
         return res
 
     def fock_sp(self, mol, amp_s, amp_p):

@@ -179,7 +179,7 @@ __global__ void GINTovlp_density_screened_t_kernel(
         }
         if (touched) {
             #pragma unroll
-            for (int c = 0; c < NCOMP; ++c) atomicAdd(&out[grid * NCOMP + c], acc[c]);
+            for (int c = 0; c < NCOMP; ++c) atomicAdd(&out[c * ngrids + grid], acc[c]);
         }
     }
 }
