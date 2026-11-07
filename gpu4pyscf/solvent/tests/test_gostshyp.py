@@ -659,6 +659,31 @@ class TestSurface(unittest.TestCase):
                         else:
                             self.assertEqual(out[key], val, msg)
 
+    def test_contract_dareas_matches_dense_reference(self):
+        """_contract_dareas vs the dense pcm.grad.get_dF_dA area derivative."""
+        from gpu4pyscf.solvent.grad.pcm import get_dF_dA
+        from gpu4pyscf.solvent.grad.gostshyp import (
+            _contract_dareas, _get_surface_derivatives)
+        rng = np.random.default_rng(3)
+        for atom in (WATER, METHANOL):
+            mol = gto.M(atom=atom, basis='sto-3g', verbose=0)
+            for cavity in ('vdw', 'vdw/occ'):
+                gost = GOSTSHYP(mol, options={'cavity': cavity}).build()
+                surface = (gost._outer_surface
+                           if gost._outer_surface is not None else gost.surface)
+                _, dareas = get_dF_dA(surface)
+                dareas = dareas.transpose(2, 0, 1)   # [natm, 3, ngrids]
+                if gost._occ_ratio_sq is not None:
+                    dareas *= gost._occ_ratio_sq[None, None, :]
+                weights = cp.asarray(rng.standard_normal(gost.n_gaussian))
+                ref = cp.asnumpy(cp.einsum('acg,g->ac', dareas, weights))
+                out = cp.asnumpy(_contract_dareas(gost, weights))
+                np.testing.assert_allclose(out, ref, rtol=0,
+                                           atol=1e-12 * abs(ref).max(),
+                                           err_msg=cavity)
+                with self.assertRaises(ValueError):
+                    _get_surface_derivatives(gost)
+
 
 class TestOverlapPairOpt(unittest.TestCase):
     """_OverlapPairOpt.build is a copy of VHFOpt.build with another pairing."""

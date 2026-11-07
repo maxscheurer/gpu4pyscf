@@ -24,7 +24,6 @@ The GOSTSHYP gradient dE/dR has three contributions:
 import numpy as np
 import cupy as cp
 from pyscf import lib
-from gpu4pyscf.solvent.grad.pcm import get_dF_dA
 from gpu4pyscf.lib import logger
 
 
@@ -34,33 +33,30 @@ def _scatter_add(target, indices, values):
 
 
 def _get_surface_derivatives(gostshyp):
-    """Return cached area and optional non-rigid coordinate derivatives."""
+    """Cached MOIST derivatives of a DROP cavity.
+
+    Returns (dareas, dcoords): dareas [natm, 3, ngrids] on the GPU and the
+    grid-coordinate derivatives dcoords [3, 3, natm, ngrids] on the host (see
+    moist.get_anchor_gradient). PCM-type cavities (vdw, vdw/occ) do not use
+    this; their area derivatives are contracted by _contract_dareas.
+    """
+    if gostshyp.cavity != 'drop':
+        raise ValueError('surface derivatives are only cached for cavity="drop"')
     if gostshyp._surface_derivatives is not None:
         return gostshyp._surface_derivatives
 
-    if gostshyp.cavity == 'drop':
-        from gpu4pyscf.solvent.moist import get_anchor_gradient
-        t0 = logger.perf_counter()
-        dareas, dcoords = get_anchor_gradient(gostshyp._drop_cavity)
-        gostshyp.timings['moist_grad_s'] += logger.perf_counter() - t0
-        expected_da = (gostshyp.mol.natm, 3, gostshyp.n_gaussian)
-        expected_dx = (3, 3, gostshyp.mol.natm, gostshyp.n_gaussian)
-        if dareas.shape != expected_da or dcoords.shape != expected_dx:
-            raise ValueError(
-                'Unexpected MOIST derivative shapes: '
-                f'{dareas.shape}, {dcoords.shape}; expected '
-                f'{expected_da}, {expected_dx}')
-        result = (cp.asarray(dareas), dcoords)
-    else:
-        surface = (gostshyp._outer_surface
-                   if gostshyp._outer_surface is not None
-                   else gostshyp.surface)
-        _, dareas = get_dF_dA(surface)
-        dareas = dareas.transpose(2, 0, 1)
-        if gostshyp._occ_ratio_sq is not None:
-            dareas *= gostshyp._occ_ratio_sq[None, None, :]
-        result = (dareas, None)
-
+    from gpu4pyscf.solvent.moist import get_anchor_gradient
+    t0 = logger.perf_counter()
+    dareas, dcoords = get_anchor_gradient(gostshyp._drop_cavity)
+    gostshyp.timings['moist_grad_s'] += logger.perf_counter() - t0
+    expected_da = (gostshyp.mol.natm, 3, gostshyp.n_gaussian)
+    expected_dx = (3, 3, gostshyp.mol.natm, gostshyp.n_gaussian)
+    if dareas.shape != expected_da or dcoords.shape != expected_dx:
+        raise ValueError(
+            'Unexpected MOIST derivative shapes: '
+            f'{dareas.shape}, {dcoords.shape}; expected '
+            f'{expected_da}, {expected_dx}')
+    result = (cp.asarray(dareas), dcoords)
     gostshyp._surface_derivatives = result
     return result
 
@@ -154,7 +150,7 @@ void gost_contract_dareas(const double* __restrict__ grid, const double* __restr
 
 def _owner_neighbours(gostshyp, surface):
     """CSR neighbour lists (atoms != a that can switch points of atom a)."""
-    cache = getattr(gostshyp, '_dareas_nbr', None)
+    cache = gostshyp._dareas_nbr
     if cache is not None and cache[0] is surface['grid_coords']:
         return cache[1], cache[2]
     atom_coords = surface['atom_coords']

@@ -323,6 +323,15 @@ class GOSTSHYP(lib.StreamObject):
         Number of grid points per atom for surface (default: 110)
     scaling_factor : float
         VDW radii scaling factor (default: 1.2)
+    overlap_cutoff : float
+        Screening threshold of the primitive 3-center overlap prefactors
+        (default: 1e-14); <= 0 disables screening (dense kernels).
+    cavity : str
+        'vdw', 'vdw/occ' (default) or 'drop' (MOIST DROPSvdW).
+    r_ext : float
+        Outer-cavity extension for 'vdw/occ' in Bohr (default: 0.4724).
+    drop_kwargs : dict
+        Extra keyword arguments for the MOIST DROPSvdW cavity.
     timings : dict
         Timing counters; created by __init__ and only zeroed again by
         reset_timings() (build() and reset() keep them):
@@ -386,6 +395,12 @@ class GOSTSHYP(lib.StreamObject):
 
         # Cached screening lists (see get_screen)
         self._screen = None
+        # Testing switch: True runs the screened kernels without lists
+        # (dense mode) even when screening is possible.
+        self._force_dense = False
+        # Owner-atom neighbour lists of the area-derivative kernel, cached by
+        # grad.gostshyp._owner_neighbours.
+        self._dareas_nbr = None
 
         self.reset_timings()
 
@@ -540,7 +555,7 @@ class GOSTSHYP(lib.StreamObject):
     def get_screen(self):
         """Spatial (shell pair, grid tile) screening lists (cached)."""
         scr = self._screen
-        force_dense = getattr(self, '_force_dense', False)
+        force_dense = self._force_dense
         if scr is None or not scr.matches(self.intopt, self.grid_coords,
                                           self.overlap_cutoff, force_dense):
             scr = self._screen = int3c_overlap.OverlapScreen(
@@ -691,7 +706,11 @@ class GOSTSHYP(lib.StreamObject):
         return self.build()
 
     def to_cpu(self):
-        """Create the corresponding pyscf-forge GOSTSHYP object."""
+        """Create the corresponding pyscf-forge GOSTSHYP object.
+
+        overlap_cutoff is not transferred: the CPU implementation has no
+        integral screening option and evaluates all overlaps.
+        """
         from pyscf.solvent.gostshyp import GOSTSHYP as CPU_GOSTSHYP
 
         options = {
