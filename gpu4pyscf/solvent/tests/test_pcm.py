@@ -15,10 +15,9 @@
 import unittest
 import numpy
 import pyscf
-import pytest
 import cupy
 from pyscf import gto
-from gpu4pyscf import scf, dft
+from gpu4pyscf import scf, dft, solvent
 from gpu4pyscf.solvent import pcm
 
 def setUpModule():
@@ -153,6 +152,375 @@ H    0.000000   -0.935307   -1.082500
         mf.with_solvent.lebedev_order = 29
         mf.run()
         assert abs(mf.e_tot - -112.95304419865343) < 1e-8
+
+    def test_with_ecp(self):
+        mol = gto.M(
+            atom = """
+                Al      0.000000    0.000000    0.000000
+                F       1.650000    0.000000    0.000000
+                F      -0.825000    1.428941    0.000000
+                F      -0.825000   -1.428941    0.000000
+            """,
+            basis = "CRENBL",
+            ecp = "CRENBL",
+            verbose = 0,
+        )
+
+        mf = mol.RHF().PCM().to_gpu()
+        mf.with_solvent.method = 'C-PCM'
+        mf.with_solvent.lebedev_order = 3
+        mf.with_solvent.eps = 78
+        mf.conv_tol = 1e-10
+
+        test_energy = mf.kernel()
+        test_gradient = mf.Gradients().kernel()
+
+        ### Q-Chem reference input
+        # $rem
+        # JOBTYPE force
+        # METHOD HF
+        # BASIS CRENBL
+        # ECP CRENBL
+        # ECP_FIT false
+        # ECP_QUAD true
+        # solvent_method          pcm
+        # SYMMETRY      FALSE
+        # SYM_IGNORE    TRUE
+        # MAX_SCF_CYCLES 100
+        # PURECART 1111
+        # SCF_CONVERGENCE 10
+        # THRESH        14
+        # $end
+
+        # $pcm
+        # Theory CPCM
+        # Method SWIG
+        # Solver INVERSION
+        # HeavyPoints 6
+        # $end
+
+        # $solvent
+        # Dielectric 78
+        # $end
+        ref_energy = -73.8339216743
+        ref_gradient = numpy.array([
+            [ -0.006814,     -0.000000,     -0.000000],
+            [ -0.006077,      0.000000,      0.000000],
+            [  0.006446,     -0.013978,      0.000000],
+            [  0.006446,      0.013978,      0.000000],
+        ])
+
+        assert abs(test_energy - ref_energy) < 2e-6
+        assert numpy.max(numpy.abs(test_gradient - ref_gradient)) < 1e-5
+
+    def test_iswig(self):
+        mol = gto.M(
+            atom = """
+                O      0.000000    0.000000    0.000000
+                H      0.957200    0.000000    0.000000
+                H     -0.239987    0.926627    0.000000
+                Ne 0 0 3.44686045
+            """, # The Ne position overlaps with a grid on O
+            basis = "6-31g",
+            verbose = 0,
+        )
+
+        mf = mol.RHF().PCM().to_gpu()
+        mf.with_solvent.method = 'C-PCM'
+        mf.with_solvent.lebedev_order = 7
+        mf.with_solvent.eps = 78
+        mf.with_solvent.surface_discretization_method = "iswig"
+        mf.conv_tol = 1e-10
+
+        test_energy = mf.kernel()
+        assert mf.converged
+
+        ### Q-Chem reference input
+        # $rem
+        # JOBTYPE sp
+        # METHOD HF
+        # BASIS 6-31g
+        # solvent_method          pcm
+        # SYMMETRY      FALSE
+        # SYM_IGNORE    TRUE
+        # MAX_SCF_CYCLES 100
+        # PURECART 1111
+        # SCF_CONVERGENCE 10
+        # THRESH        14
+        # $end
+
+        # $pcm
+        # Theory CPCM
+        # Method iSWIG
+        # Solver INVERSION
+        # HeavyPoints 26
+        # HPoints 26
+        # $end
+
+        # $solvent
+        # Dielectric 78
+        # $end
+
+        ### SWIG instead of iSWIG: -204.4719960138
+        ref_energy = -204.4722728963
+
+        assert abs(test_energy - ref_energy) < 1e-8
+
+    def test_ghost_atom(self):
+        mol = pyscf.M(
+            atom = """
+                ghost:O      -0.0456482954     0.3276635601     0.1150712045
+                ghost:H       0.8839023862     0.1379773801     0.1537324880
+                ghost:H      -0.4544197433    -0.3524420751     0.6270142868
+                O       2.8650684263    -0.1847028876     0.0859519520
+                H       3.1198758203    -0.2809098055    -0.8201356074
+                H       3.3367304058     0.5708588279     0.4048656762
+                ghost:Ne     100 0 0
+            """,
+            basis = "def2-SVP",
+            verbose = 0,
+        )
+        mf = scf.RHF(mol)
+        mf = mf.PCM()
+        mf.with_solvent.method = "IEF-PCM"
+        mf.with_solvent.eps = 80.0
+        mf.conv_tol = 1e-12
+
+        test_energy = mf.kernel()
+        assert mf.converged
+
+        gobj = mf.Gradients()
+        gobj.grid_response = True
+        test_gradient = gobj.kernel()
+
+        ### Q-Chem reference input
+        # $molecule
+        # 0 1
+        #         @O      -0.0456482954     0.3276635601     0.1150712045
+        #         @H       0.8839023862     0.1379773801     0.1537324880
+        #         @H      -0.4544197433    -0.3524420751     0.6270142868
+        #         O       2.8650684263    -0.1847028876     0.0859519520
+        #         H       3.1198758203    -0.2809098055    -0.8201356074
+        #         H       3.3367304058     0.5708588279     0.4048656762
+        # $end
+
+        # $rem
+        # JOBTYPE freq
+        # METHOD HF
+        # BASIS def2-svp
+        # SCF_CONVERGENCE 12
+        # BASIS_LIN_DEP_THRESH 6
+        # SOLVENT_METHOD PCM
+        # SYMMETRY      FALSE
+        # SYM_IGNORE    TRUE
+        # MAX_SCF_CYCLES 100
+        # PURECART 1111
+        # THRESH        14
+        # $end
+        ref_energy = -75.9747732340
+
+        ref_gradient = numpy.array([
+            [-0.000112,      -0.000008,      -0.000007],
+            [-0.000936,      -0.000017,       0.000188],
+            [-0.000051,      -0.000021,       0.000016],
+            [ 0.003634,       0.003660,      -0.003067],
+            [-0.001186,      -0.001495,       0.001833],
+            [-0.001350,      -0.002120,       0.001037],
+            [0, 0, 0],
+        ])
+
+        assert abs(test_energy - ref_energy) < 1e-9
+        assert numpy.max(numpy.abs(test_gradient - ref_gradient)) < 2e-6
+
+    def test_damping_with_solvent(self):  # issue #939
+        for mf in (scf.RHF(mol).PCM(), scf.UHF(mol).PCM()):
+            dm = mf.get_init_guess()
+            h1e, s1e = mf.get_hcore(), mf.get_ovlp()
+            vhf = mf.get_veff(mol, dm)
+            f = mf.get_fock(h1e, s1e, vhf, dm)
+            f_last = f + 0.05 * cupy.eye(f.shape[-1])
+            f_damped = mf.get_fock(h1e, s1e, vhf, dm, cycle=0, diis_start_cycle=10,
+                                   damp_factor=0.6, fock_last=f_last)
+            assert abs(f_damped - (0.4 * f + 0.6 * f_last)).max() < 1e-10
+
+class NamedSolvent(unittest.TestCase):
+    def test_solvent_name(self):
+        # issue #3413
+        cm = pcm.PCM(mol, 'toluene')
+        self.assertEqual(cm.solvent, 'toluene')
+        self.assertAlmostEqual(cm.get_eps(), 2.3741, 12)
+        self.assertAlmostEqual(cm.get_eps_optical(), 1.4961**2, 12)
+
+    def test_default_solvent(self):
+        cm = pcm.PCM(mol)
+        self.assertEqual(cm.solvent, '')
+        self.assertAlmostEqual(cm.get_eps(), 78.3553, 12)
+        self.assertIsNone(cm.eps_optical)
+
+    def test_water_matches_default_eps(self):
+        # Naming water must not change eps away from the default
+        cm = pcm.PCM(mol, 'water')
+        self.assertAlmostEqual(cm.get_eps(), pcm.EPS_WATER, 12)
+
+    def test_assign_solvent(self):
+        cm = pcm.PCM(mol)
+        cm.solvent = 'acetonitrile'
+        self.assertAlmostEqual(cm.get_eps(), 35.688, 12)
+        self.assertAlmostEqual(cm.get_eps_optical(), 1.3442**2, 12)
+        cm.eps = 35.9
+        self.assertAlmostEqual(cm.get_eps(), 35.9, 12)
+        self.assertEqual(cm.solvent, 'acetonitrile')
+
+    def test_solvent_name_matching(self):
+        for name, ref in (('Water', 'water'),
+                          ('DMSO', 'dimethylsulfoxide'),
+                          ('thf', 'tetrahydrofuran'),
+                          ('hexane', 'n-hexane'),
+                          ('N,N-DiMethylFormamide', 'N,N-dimethylformamide'),
+                          ('carbontetrachloride', 'carbon tetrachloride')):
+            self.assertEqual(pcm.PCM(mol, name).solvent, ref)
+
+    def test_unknown_solvent(self):
+        self.assertRaises(RuntimeError, pcm.PCM, mol, 'unobtainium')
+
+    def test_solvent_energy(self):
+        cm = pcm.PCM(mol, 'acetonitrile')
+        cm.lebedev_order = 29
+        e_tot = scf.RHF(mol).PCM(cm).kernel()
+
+        cm_ref = pcm.PCM(mol)
+        cm_ref.eps = 35.688
+        cm_ref.lebedev_order = 29
+        e_ref = scf.RHF(mol).PCM(cm_ref).kernel()
+        self.assertAlmostEqual(e_tot, e_ref, 12)
+
+    def test_solvent_name_in_constructor(self):
+        e_tot = scf.RHF(mol).PCM('acetonitrile').kernel()
+        e_ref = scf.RHF(mol).PCM(pcm.PCM(mol, 'acetonitrile')).kernel()
+        self.assertAlmostEqual(e_tot, e_ref, 12)
+        e_ref = solvent.PCM(scf.RHF(mol), 'acetonitrile').kernel()
+        self.assertAlmostEqual(e_tot, e_ref, 12)
+
+    def test_solvent_updated_after_build(self):
+        cm = pcm.PCM(mol, 'water')
+        cm.build()
+        f_epsilon = cm._intermediates['f_epsilon']
+        cm.solvent = 'toluene'
+        # The intermediates were computed for water. They have to be discarded.
+        self.assertFalse(cm._intermediates)
+        cm.build()
+        self.assertNotAlmostEqual(cm._intermediates['f_epsilon'], f_epsilon, 6)
+        eps = cm.get_eps()
+        self.assertAlmostEqual(cm._intermediates['f_epsilon'], (eps-1)/eps, 12)
+
+def _make_response_attachment(unrestricted):
+    molecule = gto.M(atom='H 0 0 0; H .1 -.2 .8', basis='sto-3g', verbose=0)
+    base = (scf.UHF(molecule) if unrestricted else scf.RHF(molecule)).run(conv_tol=1e-11)
+    assert base.converged
+    model = pcm.PCM(molecule)
+    model.method = 'C-PCM'
+    model.eps = 12.
+    model.lebedev_order = 11
+    density = base.make_rdm1()
+    coeff = base.mo_coeff[0] if unrestricted else base.mo_coeff
+    transition = cupy.outer(coeff[:, 0], coeff[:, 1])
+    transition += transition.T
+    if unrestricted:
+        transition = cupy.stack([transition, -.3*transition])
+    return base, model, density, transition
+
+
+class SolventResponse(unittest.TestCase):
+    def test_equilibrium_solvent_response(self):
+        self._check_attachment_response(True)
+
+    def test_nonequilibrium_solvent_response(self):
+        self._check_attachment_response(False)
+
+    def _check_attachment_response(self, equilibrium):
+        for frozen in [False, True]:
+            with self.subTest(frozen=frozen):
+                response_attachment = _make_response_attachment(False)
+                base, model, density, transition = response_attachment
+                mf = base.PCM(model, dm=density if frozen else None)
+                model.equilibrium_solvation = equilibrium
+                vacuum = mf.undo_solvent().gen_response(hermi=1)(transition)
+                actual = mf.gen_response(hermi=1)(transition)
+                cpu_model = model.to_cpu()
+                response = cpu_model._B_dot_x(transition.get())
+                expected = vacuum.get() + (response if equilibrium and not frozen else 0)
+                numpy.testing.assert_allclose(model._B_dot_x(transition).get(), response,
+                                              atol=1e-10, rtol=1e-10)
+                assert numpy.max(abs(response)) > 1e-5
+                step = 1e-3
+                plus = mf.get_veff(mf.mol, density + step*transition).v_solvent.copy()
+                minus = mf.get_veff(mf.mol, density - step*transition).v_solvent.copy()
+                expected_derivative = numpy.zeros_like(response) if frozen else response
+                numpy.testing.assert_allclose(((plus-minus)/(2*step)).get(), expected_derivative,
+                                              atol=1e-10, rtol=1e-9)
+                numpy.testing.assert_allclose(actual.get(), expected, atol=1e-10, rtol=1e-10)
+                numpy.testing.assert_allclose(mf.make_rdm1().get(), density.get(), atol=1e-14)
+                assert model.equilibrium_solvation is equilibrium
+                assert model.frozen is frozen
+
+    def test_pcm_frozen_dm_and_reattachment(self):
+        base, model, density, transition = _make_response_attachment(True)
+        reference_energy, reference_potential = model.to_cpu().kernel(density.get())
+        initial = pcm.PCM(base.mol)
+        mf = base.PCM(initial, dm=density)
+        assert mf.with_solvent is initial
+        assert initial.frozen
+        initial_energy, initial_potential = initial.to_cpu().kernel(density.get())
+        numpy.testing.assert_allclose(cupy.asnumpy(initial.e), initial_energy, atol=1e-10)
+        numpy.testing.assert_allclose(initial.v.get(), initial_potential, atol=1e-10)
+
+        cls = type(mf)
+        result = mf.PCM(model, dm=density)
+        assert result is mf
+        assert type(result) is cls
+        assert mf.with_solvent is model
+        assert model.frozen
+        numpy.testing.assert_allclose(cupy.asnumpy(model.e), reference_energy, atol=1e-10)
+        numpy.testing.assert_allclose(model.v.get(), reference_potential, atol=1e-10)
+        value = mf.get_veff(mf.mol, density + .03*transition)
+        numpy.testing.assert_allclose(value.v_solvent.get(), reference_potential, atol=1e-10)
+        numpy.testing.assert_allclose(cupy.asnumpy(value.e_solvent), reference_energy, atol=1e-10)
+        assert mf.PCM(model) is mf
+
+    def test_casida_equilibrium_solvent_response(self):
+        self._check_attachment_casida_factory_and_response(True)
+
+    def test_casida_nonequilibrium_solvent_response(self):
+        self._check_attachment_casida_factory_and_response(False)
+
+    def _check_attachment_casida_factory_and_response(self, equilibrium):
+        from gpu4pyscf.tdscf.rks import CasidaTDDFT
+        molecule = gto.M(atom='H 0 0 0; H .1 -.2 .8', basis='sto-3g', verbose=0)
+        model = pcm.PCM(molecule)
+        model.method = 'C-PCM'
+        model.eps = 12.
+        model.lebedev_order = 11
+        base = dft.RKS(molecule, xc='lda,vwn')
+        base.grids.atom_grid = (20, 50)
+        mf = base.PCM(model).run(conv_tol=1e-11)
+        assert mf.converged
+        td = mf.CasidaTDDFT(equilibrium_solvation=equilibrium)
+        assert isinstance(td, CasidaTDDFT)
+        assert td._scf is mf
+        assert td.with_solvent is not model
+        assert td.with_solvent.equilibrium_solvation is equilibrium
+        assert not model.equilibrium_solvation
+        expected_eps = model.get_eps() if equilibrium else model.get_eps_optical()
+        numpy.testing.assert_allclose(td.with_solvent.get_eps(), expected_eps, atol=1e-14)
+        transition = cupy.outer(mf.mo_coeff[:, 0], mf.mo_coeff[:, 1])
+        transition += transition.T
+        cpu_vacuum = mf.undo_solvent().to_cpu()
+        vacuum = cpu_vacuum.gen_response(singlet=True, hermi=1)(transition.get())
+        cpu_model = td.with_solvent.to_cpu()
+        expected = vacuum + cpu_model._B_dot_x(transition.get())
+        actual = td.gen_response(singlet=True, hermi=1)(transition)
+        numpy.testing.assert_allclose(actual.get(), expected, atol=1e-9, rtol=1e-9)
+
 
 if __name__ == "__main__":
     print("Full Tests for PCMs")

@@ -23,15 +23,14 @@ import cupy as cp
 from pyscf import gto
 from pyscf import lib
 from pyscf.pbc.df import fft as fft_cpu
-from pyscf.pbc.df import aft as aft_cpu
 from pyscf.pbc.gto import pseudo
 from pyscf.pbc.lib.kpts_helper import is_zero
 from pyscf.pbc.lib.kpts import KPoints
 from gpu4pyscf.lib import logger, utils
-from gpu4pyscf.lib.cupy_helper import contract
+from gpu4pyscf.lib.cupy_helper import contract, asarray
 from gpu4pyscf.pbc import tools
-from gpu4pyscf.pbc.df import fft_jk
-from gpu4pyscf.pbc.df.aft import _check_kpts
+from gpu4pyscf.pbc.df import fft_jk, aft
+from gpu4pyscf.pbc.df.aft import _check_kpts, get_SI, _get_ZSI
 from gpu4pyscf.pbc.df.ft_ao import ft_ao
 from gpu4pyscf.pbc.lib.kpts_helper import reset_kpts
 
@@ -46,12 +45,8 @@ def get_nuc(mydf, kpts=None):
     assert cell.low_dim_ft_type != 'inf_vacuum'
     assert cell.dimension > 1
     mesh = mydf.mesh
-    charge = cp.asarray(-cell.atom_charges(), dtype=np.float64)
-    Gv = cell.get_Gv(mesh)
-    SI = get_SI(cell, mesh=mesh)
-    rhoG = charge.dot(SI)
-
-    coulG = tools.get_coulG(cell, mesh=mesh, Gv=Gv)
+    rhoG = _get_ZSI(cell, mesh)
+    coulG = tools.get_coulG(cell, mesh=mesh)
     vneG = rhoG * coulG
     vneR = tools.ifft(vneG, mesh).real
 
@@ -62,9 +57,14 @@ def get_nuc(mydf, kpts=None):
     else:
         vne = cp.zeros((nkpts,nao,nao), dtype=np.complex128)
     kpts = np.asarray(kpts)
-    ao_ks = numint.eval_ao_kpts(cell, mydf.grids.coords, kpts)
-    for k, ao in enumerate(ao_ks):
-        vne[k] += (ao.conj().T*vneR).dot(ao)
+
+    ni = mydf._numint
+    deriv = 0
+    p0 = p1 = 0
+    for ao_ks, weight, coords in ni.block_loop(cell, mydf.grids, deriv, kpts):
+        p0, p1 = p1, p1 + coords.shape[0]
+        for k, ao in enumerate(ao_ks):
+            vne[k] += (ao.conj().T*vneR[p0:p1]).dot(ao)
 
     if is_single_kpt:
         vne = vne[0]
@@ -98,9 +98,14 @@ def get_pp(mydf, kpts=None):
     else:
         vpp = cp.zeros((nkpts,nao,nao), dtype=np.complex128)
     kpts = np.asarray(kpts)
-    ao_ks = numint.eval_ao_kpts(cell, mydf.grids.coords, kpts)
-    for k, ao in enumerate(ao_ks):
-        vpp[k] += (ao.conj().T*vpplocR).dot(ao)
+
+    ni = mydf._numint
+    deriv = 0
+    p0 = p1 = 0
+    for ao_ks, weight, coords in ni.block_loop(cell, mydf.grids, deriv, kpts):
+        p0, p1 = p1, p1 + coords.shape[0]
+        for k, ao in enumerate(ao_ks):
+            vpp[k] += (ao.conj().T*vpplocR[p0:p1]).dot(ao)
 
     # vppnonloc evaluated in reciprocal space
     fakemol = gto.Mole()
@@ -127,7 +132,7 @@ def get_pp(mydf, kpts=None):
             pp = cell._pseudo[symb]
             p1 = 0
             for l, proj in enumerate(pp[5:]):
-                rl, nl, hl = proj
+                rl, nl, hl = proj[:3]
                 if nl > 0:
                     fakemol._bas[0,gto.ANG_OF] = l
                     fakemol._env[ptr+3] = .5*rl**2
@@ -150,7 +155,7 @@ def get_pp(mydf, kpts=None):
                 SPG_lm_aoGs = SPG_lmi.dot(aokG)
                 p1 = 0
                 for l, proj in enumerate(pp[5:]):
-                    rl, nl, hl = proj
+                    rl, nl, hl = proj[:3]
                     if nl > 0:
                         p0, p1 = p1, p1+nl*(l*2+1)
                         hl = cp.asarray(hl)
@@ -170,50 +175,10 @@ def get_pp(mydf, kpts=None):
         vpp = vpp[0]
     return vpp
 
-def get_SI(cell, Gv=None, mesh=None, atmlst=None):
-    '''Calculate the structure factor (0D, 1D, 2D, 3D) for all atoms; see MH (3.34).
-
-    Args:
-        cell : instance of :class:`Cell`
-
-        Gv : (N,3) array
-            G vectors
-
-        atmlst : list of ints, optional
-            Indices of atoms for which the structure factors are computed.
-
-    Returns:
-        SI : (natm, ngrids) ndarray, dtype=np.complex128
-            The structure factor for each atom at each G-vector.
-    '''
-    coords = cp.asarray(cell.atom_coords())
-    if atmlst is not None:
-        coords = coords[np.asarray(atmlst)]
-    if Gv is None:
-        if mesh is None:
-            mesh = cell.mesh
-        basex, basey, basez = cell.get_Gv_weights(mesh)[1]
-        basex = cp.asarray(basex)
-        basey = cp.asarray(basey)
-        basez = cp.asarray(basez)
-        b = cp.asarray(cell.reciprocal_vectors())
-        rb = coords.dot(b.T)
-        SIx = cp.exp(-1j*rb[:,0,None] * basex)
-        SIy = cp.exp(-1j*rb[:,1,None] * basey)
-        SIz = cp.exp(-1j*rb[:,2,None] * basez)
-        SI = SIx[:,:,None,None] * SIy[:,None,:,None] * SIz[:,None,None,:]
-        natm = coords.shape[0]
-        SI = SI.reshape(natm, -1)
-    else:
-        SI = cp.exp(-1j*coords.dot(cp.asarray(Gv).T))
-    return SI
-
 
 class FFTDF(lib.StreamObject):
     '''Density expansion on plane waves (GPW method)
     '''
-
-    blockdim = 240
 
     _keys = fft_cpu.FFTDF._keys
 
@@ -223,7 +188,7 @@ class FFTDF(lib.StreamObject):
         self.stdout = cell.stdout
         self.verbose = cell.verbose
         self.max_memory = cell.max_memory
-        self.mesh = cell.mesh
+        self._mesh = None
         self.kpts = kpts
 
         # The following attributes are not input options.
@@ -237,10 +202,21 @@ class FFTDF(lib.StreamObject):
         excludes=('_rsh_df',))
 
     @property
+    def mesh(self):
+        # Follow the current cell unless a DF mesh was explicitly assigned.
+        if self._mesh is None:
+            return self.cell.mesh
+        return self._mesh
+    @mesh.setter
+    def mesh(self, value):
+        self._mesh = value
+
+    @property
     def grids(self):
         from gpu4pyscf.pbc.dft.gen_grid import UniformGrids
         grids = UniformGrids(self.cell)
-        grids.mesh = self.mesh
+        if self._mesh is not None:
+            grids.mesh = self._mesh
         return grids
     @grids.setter
     def grids(self, val):
@@ -270,6 +246,7 @@ class FFTDF(lib.StreamObject):
         self._rsh_df = {}
         return self
 
+    weighted_coulG = aft.AFTDF.weighted_coulG
     dump_flags = fft_cpu.FFTDF.dump_flags
     check_sanity = fft_cpu.FFTDF.check_sanity
     build = fft_cpu.FFTDF.build
@@ -284,7 +261,7 @@ class FFTDF(lib.StreamObject):
                 return rsh_df.get_jk(dm, hermi, kpts, kpts_band, with_j, with_k,
                                      omega=None, exxdiv=exxdiv)
 
-        kpts, is_single_kpt = _check_kpts(kpts, dm)
+        kpts, is_single_kpt = _check_kpts(kpts)
         if is_single_kpt:
             vj, vk = fft_jk.get_jk(self, dm, hermi, kpts[0], kpts_band,
                                    with_j, with_k, exxdiv)
@@ -299,6 +276,8 @@ class FFTDF(lib.StreamObject):
     get_j_e1 = fft_jk.get_j_e1_kpts
     get_k_e1 = NotImplemented
     get_jk_e1 = NotImplemented
+    get_ej_derivatives = NotImplemented
+    get_ek_derivatives = NotImplemented
 
     get_eri = get_ao_eri = NotImplemented
     ao2mo = get_mo_eri = NotImplemented
@@ -306,7 +285,7 @@ class FFTDF(lib.StreamObject):
     get_ao_pairs_G = get_ao_pairs = NotImplemented
     get_mo_pairs_G = get_mo_pairs = NotImplemented
 
-    range_coulomb = aft_cpu.AFTDF.range_coulomb
+    range_coulomb = aft.AFTDF.range_coulomb
 
     to_gpu = utils.to_gpu
     device = utils.device
@@ -315,5 +294,7 @@ class FFTDF(lib.StreamObject):
     def to_cpu(self):
         from pyscf.pbc.df.fft import FFTDF
         out = FFTDF(self.cell, kpts=self.kpts)
-        out.mesh = self.mesh
+        out.exxdiv = self.exxdiv
+        if self._mesh is not None:
+            out.mesh = self._mesh
         return out

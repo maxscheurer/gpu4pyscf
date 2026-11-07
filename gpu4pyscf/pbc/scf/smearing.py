@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import reduce
 import numpy as np
 import cupy as cp
 from pyscf import lib
@@ -23,9 +22,10 @@ from gpu4pyscf.lib.cupy_helper import contract
 
 SMEARING_METHOD = mol_smearing.SMEARING_METHOD
 
-def smearing(mf, sigma=None, method=None, mu0=None, fix_spin=False):
+def smearing(mf, sigma=None, method=SMEARING_METHOD, mu0=None, fix_spin=False):
     '''Fermi-Dirac or Gaussian smearing'''
     from gpu4pyscf.pbc.scf import khf
+    assert not mf.istype('KROHF'), 'Smearing for KROHF/KROKS is not supported'
     if not isinstance(mf, khf.KSCF):
         return mol_smearing.smearing(mf, sigma, method, mu0, fix_spin)
 
@@ -35,6 +35,11 @@ def smearing(mf, sigma=None, method=None, mu0=None, fix_spin=False):
         mf.mu0 = mu0
         mf.fix_spin = fix_spin
         return mf
+
+    if mf.istype('ROHF'):
+        # ROHF leads to two Fock matrices. It's not clear how to define the
+        # Roothaan effective Fock matrix from the two.
+        raise NotImplementedError('Smearing-ROHF')
 
     return lib.set_class(_SmearingKSCF(mf, sigma, method, mu0, fix_spin),
                          (_SmearingKSCF, mf.__class__))
@@ -171,5 +176,5 @@ class _SmearingKSCF(mol_smearing._SmearingSCF):
 def from_cpu(method):
     from pyscf.scf.addons import _SmearingSCF
     assert isinstance(method, _SmearingSCF)
-    return smearing(method.undo_smearing().to_cpu(), method.sigma,
+    return smearing(method.undo_smearing().to_gpu(), method.sigma,
                     method.smearing_method, method.mu0, method.fix_spin)

@@ -22,10 +22,10 @@ import cupy
 import pyscf
 from pyscf.data import radii
 from pyscf.data.elements import charge as elements_proton
+from pyscf.data.elements import _std_symbol_without_ghost
 
 BRAGG_RADII = radii.BRAGG
 COVALENT_RADII = radii.COVALENT
-SG1RADII = pyscf.dft.radi.SG1RADII
 
 gauss_chebyshev = pyscf.dft.radi.gauss_chebyshev
 treutler = pyscf.dft.radi.treutler
@@ -36,8 +36,8 @@ def treutler_atomic_radii_adjust(mol, atomic_radii):
 # i > j
 # fac(i,j) = \frac{1}{4} ( \frac{ra(j)}{ra(i)} - \frac{ra(i)}{ra(j)}
 # fac(j,i) = -fac(i,j)
-    charges = [elements_proton(x) for x in mol.elements]
-    rad = cupy.sqrt(atomic_radii[charges]) + 1e-200
+    charges = [elements_proton(_std_symbol_without_ghost(x)) for x in mol.elements]
+    rad = cupy.sqrt(cupy.asarray(atomic_radii[charges])) + 1e-200
     rr = rad.reshape(-1,1) * (1./rad)
     a = .25 * (rr.T - rr)
     a[a<-.5] = -.5
@@ -56,7 +56,7 @@ def get_treutler_fac(mol, atomic_radii):
     # fac(i,j) = \frac{1}{4} ( \frac{ra(j)}{ra(i)} - \frac{ra(i)}{ra(j)}
     # fac(j,i) = -fac(i,j)
     '''
-    charges = [elements_proton(x) for x in mol.elements]
+    charges = [elements_proton(_std_symbol_without_ghost(x)) for x in mol.elements]
     #atomic_radii = cupy.asarray(atomic_radii[charges])
     rad = numpy.sqrt(atomic_radii[charges]) + 1e-200
     rr = rad.reshape(-1,1) * (1./rad)
@@ -66,11 +66,32 @@ def get_treutler_fac(mol, atomic_radii):
     return cupy.asarray(a)
 
 def get_becke_fac(mol, atomic_radii):
-    charges = [elements_proton(x) for x in mol.elements]
-    atomic_radii = numpy.asarray(atomic_radii[charges])
-    rad = atomic_radii[charges] + 1e-200
+    charges = [elements_proton(_std_symbol_without_ghost(x)) for x in mol.elements]
+    rad = numpy.asarray(atomic_radii[charges]) + 1e-200
     rr = rad.reshape(-1,1) * (1./rad)
     a = .25 * (rr.T - rr)
     a[a<-.5] = -.5
     a[a>0.5] = 0.5
     return cupy.asarray(a)
+
+### The first element of SG1RADII in pyscf<=2.13.0 is zero, which is very bad for ghost atoms.
+### So we made a copy here for the revised SG1RADII.
+# SG1RADII = pyscf.dft.radi.SG1RADII
+SG1RADII = numpy.array((
+    1.0000, # Ghost
+    1.0000,                                                 0.5882,
+    3.0769, 2.0513, 1.5385, 1.2308, 1.0256, 0.8791, 0.7692, 0.6838,
+    4.0909, 3.1579, 2.5714, 2.1687, 1.8750, 1.6514, 1.4754, 1.3333))
+
+def euler_macLaurin(n, chg, *args, **kwargs):
+    # P.M.W. Gill, B.G. Johnson, J.A. Pople, Chem. Phys. Letters 209 (1993) 506-512
+    # SG-1 grid in Q-Chem
+    # To reproduce Q-Chem result with XC_GRID = XY
+    # Make sure to turn off small_rho_cutoff (set it to a number < 1e-20), for the following reason:
+    # This grid generates very large weight at large r, and makes the calculation unstable. We recommend not using it in practice.
+    R = SG1RADII[chg]
+    i = numpy.arange(1, n+1).astype(numpy.float64)
+    r = R * i**2 * (n + 1 - i)**-2
+    dr = 2 * R * (n+1) * i * (n + 1 - i)**-3 # w_i^r / r^2, where w_i^r is defined in eq 6 of the paper
+    # Change the order so large r goes first. Not sure why, but it makes the calculation stable.
+    return r[::-1], dr[::-1]

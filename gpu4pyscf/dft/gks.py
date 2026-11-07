@@ -17,13 +17,14 @@ from pyscf import lib
 from pyscf.dft import gks
 from gpu4pyscf.dft import numint2c
 from gpu4pyscf.dft import rks
+from gpu4pyscf.scf import hf
 from gpu4pyscf.scf.ghf import GHF
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib import utils
-from gpu4pyscf.lib.cupy_helper import tag_array
+from gpu4pyscf.lib.cupy_helper import tag_array, asarray
 
 
-def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
+def get_veff(ks, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
     '''Coulomb + XC functional
 
     .. note::
@@ -37,10 +38,10 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
             A density matrix or a list of density matrices
 
     Kwargs:
-        dm_last : ndarray or a list of ndarrays or 0
+        dm_last : ndarray or a list of ndarrays
             The density matrix baseline.  If not 0, this function computes the
             increment of HF potential w.r.t. the reference HF potential matrix.
-        vhf_last : ndarray or a list of ndarrays or 0
+        vhf_last : ndarray or a list of ndarrays
             The reference Vxc potential matrix.
         hermi : int
             Whether J, K matrix is hermitian
@@ -55,11 +56,9 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
     '''
     if mol is None: mol = ks.mol
     if dm is None: dm = ks.make_rdm1()
+    log = logger.new_logger(ks)
+    t0 = log.init_timer()
     ks.initialize_grids(mol, dm)
-
-    t0 = (logger.process_clock(), logger.perf_counter())
-
-    ground_state = isinstance(dm, cp.ndarray) and dm.ndim == 2
 
     if hermi == 2:  # because rho = 0
         n, exc, vxc = 0, 0, 0
@@ -70,7 +69,7 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
             raise NotImplementedError('Only multi-colinear GKS is implemented')
         n, exc, vxc = ni.get_vxc(mol, ks.grids, ks.xc, dm,
                                  hermi=hermi, max_memory=max_memory)
-        logger.debug(ks, 'nelec by numeric integration = %s', n)
+        log.debug('nelec by numeric integration = %s', n)
         if ks.do_nlc():
             if ni.libxc.is_nlc(ks.xc):
                 xc = ks.xc
@@ -81,58 +80,45 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
                                           hermi=hermi, max_memory=max_memory)
             exc += enlc
             vxc += vnlc
-            logger.debug(ks, 'nelec with nlc grids = %s', n)
-        t0 = logger.timer(ks, 'vxc', *t0)
+            log.debug('nelec with nlc grids = %s', n)
+    t1 = log.timer('vxc', *t0)
 
-    
-    dm_orig = cp.asarray(dm)
+    dm_orig = dm = cp.asarray(dm)
     vj_last = getattr(vhf_last, 'vj', None)
+    ecoul = None
     if vj_last is not None:
-        dm = cp.asarray(dm) - cp.asarray(dm_last)
-    if not ni.libxc.is_hybrid_xc(ks.xc):
-        vk = None
-        vj = ks.get_j(mol, dm, hermi)
-        if vj_last is not None:
-            vj += vj_last
-        vxc += vj
+        dm_last = cp.asarray(dm_last)
+        dm = dm - dm_last
     else:
+        dm_last = None
+    vhf = vj = ks.get_j(mol, dm, hermi)
+    ecoul = hf._trace_ecoul(vj, dm, dm_last, vhf_last)
+    cput2 = log.timer_debug1('vj', *t1)
+
+    if ni.libxc.is_hybrid_xc(ks.xc):
         omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks.xc, spin=mol.spin)
-        if omega == 0:
-            vj, vk = ks.get_jk(mol, dm, hermi)
-            vk *= hyb
-        elif alpha == 0: # LR=0, only SR exchange
-            vj = ks.get_j(mol, dm, hermi)
-            vk = ks.get_k(mol, dm, hermi, omega=-omega)
-            vk *= hyb
-        elif hyb == 0: # SR=0, only LR exchange
-            vj = ks.get_j(mol, dm, hermi)
-            vk = ks.get_k(mol, dm, hermi, omega=omega)
-            vk *= alpha
-        else: # SR and LR exchange with different ratios
-            vj, vk = ks.get_jk(mol, dm, hermi)
-            vk *= hyb
-            vklr = ks.get_k(mol, dm, hermi, omega=omega)
-            vklr *= (alpha - hyb)
-            vk += vklr
+        vk = ks.get_k(mol, dm, hermi, omega, alpha, hyb)
+        vhf -= vk
         if vj_last is not None:
-            vj += vhf_last.vj
-            vk += vhf_last.vk
-        vxc += vj - vk
-
-        if ground_state:
-            exc -= cp.einsum('ij,ji', dm_orig, vk).real * .5
-
-    if ground_state:
-        ecoul = cp.einsum('ij,ji', dm_orig, vj).real * .5
+            vhf += asarray(vhf_last.vj)
+        vxc += vhf
+        exc += float(cp.einsum('ij,ji', dm_orig, vhf).real.get()) * .5
+        if ecoul is not None:
+            exc -= ecoul
+        log.timer_debug1('vk', *cput2)
     else:
-        ecoul = None
-
-    vxc = tag_array(vxc, ecoul=ecoul, exc=exc, vj=vj, vk=vk)
+        if vj_last is not None:
+            vhf += asarray(vhf_last.vj)
+        vxc += vhf
+    t0 = log.timer('veff', *t0)
+    vxc = tag_array(vxc, ecoul=ecoul, exc=exc, vj=vhf)
     return vxc
 
 
 class GKS(rks.KohnShamDFT, GHF):
-    to_gpu = utils.to_gpu
+
+    # to_gpu = utils.to_gpu
+    to_gpu = NotImplemented
     device = utils.device
 
     def __init__(self, mol, xc='LDA,VWN'):
@@ -163,14 +149,20 @@ class GKS(rks.KohnShamDFT, GHF):
     @spin_samples.setter
     def spin_samples(self, val):
         self._numint.spin_samples = val
-    
+
     get_veff = get_veff
     reset = rks.RKS.reset
     energy_elec = rks.RKS.energy_elec
     nuc_grad_method = NotImplemented
-    to_hf = NotImplemented
+
+    def to_hf(self):
+        '''Convert to GHF object.'''
+        from gpu4pyscf import scf
+        return self._transfer_attrs_(scf.GHF(self.mol))
     
     def to_cpu(self):
-        mf = gks.GKS(self.mol)
+        mf = gks.GKS(self.mol, xc=self.xc)
         utils.to_cpu(self, out=mf)
+        mf.collinear = self.collinear
+        mf.spin_samples = self.spin_samples
         return mf

@@ -13,11 +13,16 @@
 # limitations under the License.
 
 import pyscf
+import numpy
 import cupy
 import unittest
-import pytest
 from pyscf.dft import rks as cpu_rks
 from gpu4pyscf.dft import rks as gpu_rks
+from gpu4pyscf.dft import gen_grid
+try:
+    from gpu4pyscf.dispersion import dftd3, dftd4
+except (ImportError, OSError):
+    dftd3 = dftd4 = None
 
 atom = '''
 O       0.0000000000    -0.0000000000     0.1174000000
@@ -66,7 +71,7 @@ class KnownValues(unittest.TestCase):
     def test_grad_with_grids_response(self):
         print("-----testing DFT gradient with grids response----")
         _check_grad(mol_sph, grid_response=True, tol=1e-6)
-    
+
     def test_grad_without_grids_response(self):
         print('-----testing DFT gradient without grids response----')
         _check_grad(mol_sph, grid_response=False)
@@ -95,6 +100,7 @@ class KnownValues(unittest.TestCase):
         print('--------nlc testing-------------')
         _check_grad(mol_sph, xc='HYB_MGGA_XC_WB97M_V', disp=None, tol=1e-7)
 
+    @unittest.skipIf(dftd3 is None, "requires the dftd3 library")
     def test_grad_d3bj(self):
         print('--------- testing RKS with D3BJ ------')
         _check_grad(mol_sph, xc='b3lyp', disp='d3bj')
@@ -106,10 +112,289 @@ class KnownValues(unittest.TestCase):
     def test_grad_cart(self):
         print('------hybrid GGA Cart testing--------')
         _check_grad(mol_cart, xc='B3LYP', disp=None)
-    
+
     def test_grad_hf(self):
         print('------HF testing--------')
         _check_grad(mol_sph, xc='hf', disp=None)
+
+    def test_grid_response_stratmann(self):
+        mol = pyscf.M(
+            atom = '''
+            Na 10 0 0
+            F 11 0 0.1''',
+            basis = "def2-svp",
+            verbose = 0,
+        )
+        mf = mol.RKS(xc = "r2scan").to_gpu()
+        mf.grids.atom_grid = (10,14)
+        mf.grids.prune = None
+        mf.grids.becke_scheme = gen_grid.stratmann
+        mf.small_rho_cutoff = 1e-30
+        mf.conv_tol = 1e-12
+        mf.kernel()
+        assert mf.converged
+
+        gobj = mf.Gradients()
+        gobj.grid_response = True
+        test_gradient = gobj.kernel()
+
+        # ref_gradient = numpy.empty([mol.natm, 3])
+        # def get_e(mol):
+        #     mf = mol.RKS(xc = "r2scan")
+        #     mf.grids.atom_grid = (10,14)
+        #     mf.grids.prune = None
+        #     from pyscf.dft import gen_grid as gen_grid_cpu
+        #     mf.grids.becke_scheme = gen_grid_cpu.stratmann
+        #     mf.small_rho_cutoff = 1e-30
+        #     mf.conv_tol = 1e-12
+        #     e = mf.kernel()
+        #     assert mf.converged
+        #     return e
+
+        # dx = 4e-5
+        # mol_copy = mol.copy()
+        # for i_atom in range(mol.natm):
+        #     for i_xyz in range(3):
+        #         xyz_p = mol.atom_coords()
+        #         xyz_p[i_atom, i_xyz] += dx
+        #         mol_copy.set_geom_(xyz_p, unit='Bohr')
+        #         mol_copy.build()
+        #         e_p = get_e(mol_copy)
+
+        #         xyz_m = mol.atom_coords()
+        #         xyz_m[i_atom, i_xyz] -= dx
+        #         mol_copy.set_geom_(xyz_m, unit='Bohr')
+        #         mol_copy.build()
+        #         e_m = get_e(mol_copy)
+
+        #         ref_gradient[i_atom, i_xyz] = (e_p - e_m) / (2 * dx)
+        # print(repr(ref_gradient))
+
+        ref_gradient = numpy.array([
+            [ 2.03163616e+00, -3.55271368e-09,  3.42115604e-01],
+            [-2.03163615e+00,  5.68434189e-09, -3.42115600e-01],
+        ])
+
+        assert numpy.max(numpy.abs(test_gradient - ref_gradient)) < 1e-7
+
+    def test_grid_response_no_radii_adjustment(self):
+        mol = pyscf.M(
+            atom = '''
+            Na 0 0 0
+            F 1 0 0.1''',
+            basis = "def2-svp",
+            verbose = 0,
+        )
+        mf = mol.RKS(xc = "r2scan").to_gpu()
+        mf.grids.atom_grid = (10,14)
+        mf.grids.prune = None
+        mf.grids.becke_scheme = gen_grid.stratmann
+        mf.grids.radii_adjust = None
+        mf.small_rho_cutoff = 1e-30
+        mf.conv_tol = 1e-12
+        mf.kernel()
+        assert mf.converged
+
+        gobj = mf.Gradients()
+        gobj.grid_response = True
+        test_gradient = gobj.kernel()
+
+        # ref_gradient = numpy.empty([mol.natm, 3])
+        # def get_e(mol):
+        #     mf = mol.RKS(xc = "r2scan")
+        #     mf.grids.atom_grid = (10,14)
+        #     mf.grids.prune = None
+        #     from pyscf.dft import gen_grid as gen_grid_cpu
+        #     mf.grids.becke_scheme = gen_grid_cpu.stratmann
+        #     mf.grids.radii_adjust = None
+        #     mf.small_rho_cutoff = 1e-30
+        #     mf.conv_tol = 1e-12
+        #     e = mf.kernel()
+        #     assert mf.converged
+        #     return e
+
+        # dx = 4e-5
+        # mol_copy = mol.copy()
+        # for i_atom in range(mol.natm):
+        #     for i_xyz in range(3):
+        #         xyz_p = mol.atom_coords()
+        #         xyz_p[i_atom, i_xyz] += dx
+        #         mol_copy.set_geom_(xyz_p, unit='Bohr')
+        #         mol_copy.build()
+        #         e_p = get_e(mol_copy)
+
+        #         xyz_m = mol.atom_coords()
+        #         xyz_m[i_atom, i_xyz] -= dx
+        #         mol_copy.set_geom_(xyz_m, unit='Bohr')
+        #         mol_copy.build()
+        #         e_m = get_e(mol_copy)
+
+        #         ref_gradient[i_atom, i_xyz] = (e_p - e_m) / (2 * dx)
+        # print(repr(ref_gradient))
+
+        ref_gradient = numpy.array([
+            [ 2.60052754e+00, -2.13162821e-09,  2.66351520e-01],
+            [-2.60052754e+00,  0.00000000e+00, -2.66351523e-01],
+        ])
+
+        assert numpy.max(numpy.abs(test_gradient - ref_gradient)) < 1e-7
+
+    def test_ghost_atom_grad_rks(self):
+        mol = pyscf.M(
+            atom = """
+                C      0.000000    0.877350    0.000000
+                C     -0.759806   -0.438675    0.000000
+                C      0.759806   -0.438675    0.000000
+                H      0.000000    1.513350    0.900000
+                H      0.000000    1.513350   -0.900000
+                H     -1.430605   -0.826175    0.900000
+                H     -1.430605   -0.826175   -0.900000
+                H      1.430605   -0.826175    0.900000
+                H      1.430605   -0.826175   -0.900000
+                ghost:Ar 0 0 1.5
+                ghost:Ar 0 0 -1.5
+            """, # Cyclopropane
+            basis = "sto-3g",
+            verbose = 0,
+        )
+
+        mf = mol.RKS(xc = "PBE0").density_fit(auxbasis = "def2-universal-jkfit").to_gpu()
+        mf.grids.atom_grid = (99,590)
+        mf.grids.prune = None
+        mf.grids.radii_adjust = None
+        mf.small_rho_cutoff = 0
+        mf.conv_tol = 1e-12
+        test_energy = mf.kernel()
+        assert mf.converged
+
+        gobj = mf.Gradients()
+        gobj.grid_response = True
+        test_gradient = gobj.kernel()
+
+        ### Q-Chem reference input
+        # $molecule
+        # 0 1
+        # C      0.000000    0.877350    0.000000
+        # C     -0.759806   -0.438675    0.000000
+        # C      0.759806   -0.438675    0.000000
+        # H      0.000000    1.513350    0.900000
+        # H      0.000000    1.513350   -0.900000
+        # H     -1.430605   -0.826175    0.900000
+        # H     -1.430605   -0.826175   -0.900000
+        # H      1.430605   -0.826175    0.900000
+        # H      1.430605   -0.826175   -0.900000
+        # @Ar 0 0 1.5
+        # @Ar 0 0 -1.5
+        # $end
+
+        # $rem
+        # JOBTYPE force
+        # METHOD PBE0
+        # XC_GRID       000099000590
+        # BECKE_SHIFT UNSHIFTED
+        # BASIS sto-3g
+        # SYMMETRY      FALSE
+        # SYM_IGNORE    TRUE
+        # MAX_SCF_CYCLES 100
+        # PURECART 1111
+        # SCF_CONVERGENCE 10
+        # THRESH        14
+        # ri_j        True
+        # ri_k        True
+        # aux_basis RIJK-def2-TZVP
+        # $end
+        ref_energy = -116.3194912032
+        ref_gradient = numpy.array([
+            [ 0.0000000,  0.0660107, -0.0660107,  0.0000000, -0.0000000, -0.0452116, -0.0452116,  0.0452116,  0.0452116, -0.0000000, -0.0000000],
+            [-0.0004307,  0.0448647,  0.0448647,  0.0074608,  0.0074608, -0.0263691, -0.0263691, -0.0263691, -0.0263691,  0.0006281,  0.0006281],
+            [ 0.0000000, -0.0000000,  0.0000000, -0.0008212,  0.0008212,  0.0267111, -0.0267111,  0.0267111, -0.0267111,  0.0023017, -0.0023017],
+        ]).T
+
+        assert numpy.abs(test_energy - ref_energy) < 2e-7
+        assert numpy.max(numpy.abs(test_gradient - ref_gradient)) < 2e-6
+
+        # Precise Q-Chem grid below
+
+        mf = mol.RKS(xc = "PBE0").density_fit(auxbasis = "def2-universal-jkfit").to_gpu()
+        mf.grids.atom_grid = (99,590)
+        import gpu4pyscf
+        mf.grids.radi_method = gpu4pyscf.dft.radi.euler_macLaurin
+        mf.grids.prune = None
+        mf.grids.radii_adjust = None
+        mf.small_rho_cutoff = 0
+        mf.conv_tol = 1e-12
+        test_energy = mf.kernel()
+        assert mf.converged
+
+        gobj = mf.Gradients()
+        gobj.grid_response = True
+        test_gradient = gobj.kernel()
+
+        assert numpy.abs(test_energy - ref_energy) < 1e-8
+        assert numpy.max(numpy.abs(test_gradient - ref_gradient)) < 2e-7
+
+    def test_explicit_nlc_grids_response(self):
+        mol = pyscf.M(atom='O .1 .2 0; H .8 .1 .5; H -.5 .7 .6',
+                      basis='sto-3g', verbose=0)
+        mf_cpu = mol.RKS(xc='wb97m-v')
+        mf_cpu.grids.atom_grid = (20, 50)
+        mf_cpu.grids.prune = None
+        mf_cpu.nlcgrids.atom_grid = (10, 50)
+        mf_cpu.nlcgrids.prune = None
+        mf_cpu.small_rho_cutoff = 0
+        mf_cpu.conv_tol = 1e-12
+        mf_gpu = mf_cpu.to_gpu()
+        mf_cpu.kernel()
+        mf_gpu.kernel()
+        numpy.testing.assert_allclose(mf_gpu.e_tot, mf_cpu.e_tot, atol=1e-8, rtol=0)
+        default = mf_gpu.nuc_grad_method().set(grid_response=True).kernel()
+        gradient = mf_gpu.nuc_grad_method().set(grid_response=True)
+        gradient.grids = mf_gpu.grids.copy().reset()
+        gradient.nlcgrids = mf_gpu.nlcgrids.copy().reset()
+        actual = gradient.kernel()
+        numpy.testing.assert_allclose(actual, default, atol=1e-10, rtol=0)
+        reference = mf_cpu.nuc_grad_method().set(grid_response=True).kernel()
+        numpy.testing.assert_allclose(actual, reference, atol=1e-6, rtol=0)
+        numpy.testing.assert_allclose(actual.sum(axis=0), 0, atol=1e-7, rtol=0)
+
+    def test_explicit_nlc_grids_without_response(self):
+        mol = pyscf.M(atom='O .1 .2 0; H .8 .1 .5; H -.5 .7 .6',
+                      basis='sto-3g', verbose=0)
+        mf_cpu = mol.RKS(xc='wb97m-v')
+        mf_cpu.grids.atom_grid = (20, 50)
+        mf_cpu.grids.prune = None
+        mf_cpu.nlcgrids.atom_grid = (10, 50)
+        mf_cpu.nlcgrids.prune = None
+        mf_cpu.small_rho_cutoff = 0
+        mf_cpu.conv_tol = 1e-12
+        mf_gpu = mf_cpu.to_gpu()
+        mf_cpu.kernel()
+        mf_gpu.kernel()
+        numpy.testing.assert_allclose(mf_gpu.e_tot, mf_cpu.e_tot, atol=1e-8, rtol=0)
+        default = mf_gpu.nuc_grad_method().set(grid_response=False).kernel()
+        gradient = mf_gpu.nuc_grad_method().set(grid_response=False)
+        gradient.grids = mf_gpu.grids.copy().reset()
+        gradient.nlcgrids = mf_gpu.nlcgrids.copy().reset()
+        actual = gradient.kernel()
+        numpy.testing.assert_allclose(actual, default, atol=1e-10, rtol=0)
+        reference = mf_cpu.nuc_grad_method().set(grid_response=False).kernel()
+        numpy.testing.assert_allclose(actual, reference, atol=1e-6, rtol=0)
+
+    @unittest.skipIf(dftd3 is None or dftd4 is None, "requires the dftd3 and dftd4 libraries")
+    def test_dispersion_ghost_atoms(self):
+        mol = pyscf.M(atom='ghost-H 2 0 0; O 0 0 0; X-H 0 2 0; H 0 0 1; H 0 1 0', verbose=0)
+        real_mol = pyscf.M(atom='O 0 0 0; H 0 0 1; H 0 1 0', verbose=0)
+        mf = mol.RKS(xc='pbe').to_gpu()
+        real_mf = real_mol.RKS(xc='pbe').to_gpu()
+        atom_idx = [1,3,4]
+        for version in ['d3bj', 'd4']:
+            with self.subTest(version=version):
+                mf.disp = real_mf.disp = version
+                expected = numpy.zeros([5,3])
+                expected[atom_idx] = real_mf.nuc_grad_method().get_dispersion()
+                numpy.testing.assert_allclose(mf.nuc_grad_method().get_dispersion(), expected, atol=1e-12, rtol=0)
+
+
 if __name__ == "__main__":
     print("Full Tests for RKS Gradient")
     unittest.main()

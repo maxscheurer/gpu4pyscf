@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 import itertools
 import ctypes
 from dataclasses import dataclass
@@ -26,25 +27,28 @@ from gpu4pyscf.lib import logger
 from gpu4pyscf.lib import utils
 from gpu4pyscf.lib.cupy_helper import (
     load_library, tag_array, contract, sandwich_dot, block_diag, transpose_sum,
-    dist_matrix, batched_vec3_norm2)
+    dist_matrix, ndarray)
 from gpu4pyscf.gto.mole import cart2sph_by_l
 from gpu4pyscf.dft import numint
 from gpu4pyscf.pbc import tools
-from gpu4pyscf.pbc.df.fft import get_SI, _check_kpts
 from gpu4pyscf.pbc.df.fft_jk import _format_dms, _format_jks
 from gpu4pyscf.pbc.df.ft_ao import ft_ao
+from gpu4pyscf.pbc.gto.cell import get_Gv_weights
 from gpu4pyscf.__config__ import shm_size
 from gpu4pyscf.__config__ import props as gpu_specs
 
 __all__ = ['MultiGridNumInt']
 
-libmgrid = load_library('libmgrid')
-libmgrid.MG_eval_rho_orth.restype = ctypes.c_int
-libmgrid.MG_eval_mat_lda_orth.restype = ctypes.c_int
-libmgrid.MG_eval_mat_gga_orth.restype = ctypes.c_int
-libmgrid.MG_init_constant.restype = ctypes.c_int
-libmgrid.ovlp_mask_estimation.restype = ctypes.c_int
-libmgrid.filter_supmol_bas.restype = ctypes.c_int
+try:
+    libmgrid = load_library('libmgrid')
+    libmgrid.MG_eval_rho_orth.restype = ctypes.c_int
+    libmgrid.MG_eval_mat_lda_orth.restype = ctypes.c_int
+    libmgrid.MG_eval_mat_gga_orth.restype = ctypes.c_int
+    libmgrid.MG_init_constant.restype = ctypes.c_int
+    libmgrid.ovlp_mask_estimation.restype = ctypes.c_int
+    libmgrid.filter_supmol_bas.restype = ctypes.c_int
+except OSError:
+    libmgrid = None
 
 PRIMBAS_ANG = 0
 PRIMBAS_EXP = 1
@@ -75,7 +79,7 @@ def get_j_kpts(ni, dm_kpts, hermi=1, kpts=None, kpts_band=None):
         vj : (nkpts, nao, nao) ndarray
         or list of vj if the input dm_kpts is a list of DMs
     '''
-    assert kpts is None
+    assert kpts is None or is_zero(kpts)
     kpts = np.zeros((1, 3))
 
     cell = ni.cell
@@ -153,7 +157,8 @@ def _eval_rhoG(ni, dm_kpts, hermi=1, kpts=None, xctype='LDA'):
                     ctypes.c_uint32(len(task.shl_pair_idx)),
                     ctypes.cast(task.shl_pair_idx.data.ptr, ctypes.c_void_p),
                     ctypes.cast(pool.data.ptr, ctypes.c_void_p),
-                    ctypes.c_int(workers))
+                    ctypes.c_int(workers),
+                    ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
                 if err != 0:
                     raise RuntimeError(f'MG_eval_rho_orth kernel for l={task.l} failed')
 
@@ -227,7 +232,8 @@ def _eval_tauG(ni, dm_kpts, hermi=1, kpts=None):
                     ctypes.c_uint32(len(task.shl_pair_idx)),
                     ctypes.cast(task.shl_pair_idx.data.ptr, ctypes.c_void_p),
                     ctypes.cast(pool.data.ptr, ctypes.c_void_p),
-                    ctypes.c_int(workers))
+                    ctypes.c_int(workers),
+                    ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
                 if err != 0:
                     raise RuntimeError(f'MG_eval_tau_orth kernel for l={task.l} failed')
 
@@ -301,7 +307,8 @@ def _get_j_pass2(ni, vG, hermi=1, kpts=None, verbose=None):
                     ctypes.c_uint32(len(task.shl_pair_idx)),
                     ctypes.cast(task.shl_pair_idx.data.ptr, ctypes.c_void_p),
                     ctypes.cast(pool.data.ptr, ctypes.c_void_p),
-                    ctypes.c_int(workers))
+                    ctypes.c_int(workers),
+                    ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
                 if err != 0:
                     raise RuntimeError(f'MG_eval_mat_lda_orth kernel for l={task.l} failed')
 
@@ -378,7 +385,8 @@ def _get_gga_pass2(ni, vG, hermi=1, kpts=None, verbose=None):
                     ctypes.c_uint32(len(task.shl_pair_idx)),
                     ctypes.cast(task.shl_pair_idx.data.ptr, ctypes.c_void_p),
                     ctypes.cast(pool.data.ptr, ctypes.c_void_p),
-                    ctypes.c_int(workers))
+                    ctypes.c_int(workers),
+                    ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
                 if err != 0:
                     raise RuntimeError(f'MG_eval_mat_gga_orth kernel for l={task.l} failed')
 
@@ -453,7 +461,8 @@ def _get_tau_pass2(ni, vG, hermi=1, kpts=None, verbose=None):
                     ctypes.c_uint32(len(task.shl_pair_idx)),
                     ctypes.cast(task.shl_pair_idx.data.ptr, ctypes.c_void_p),
                     ctypes.cast(pool.data.ptr, ctypes.c_void_p),
-                    ctypes.c_int(workers))
+                    ctypes.c_int(workers),
+                    ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
                 if err != 0:
                     raise RuntimeError(f'MG_eval_mat_tau_orth kernel for l={task.l} failed')
 
@@ -535,11 +544,8 @@ def nr_rks(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
     rhoR = cp.asarray(rhoR.reshape(nvar,ngrids), order='C')
     nelec = float(rhoR[0].sum().real.get()) * weight
 
-    if xctype == 'LDA':
-        exc, vxc = ni.eval_xc_eff(xc_code, rhoR[0], deriv=1, xctype=xctype)[:2]
-    else:
-        exc, vxc = ni.eval_xc_eff(xc_code, rhoR, deriv=1, xctype=xctype)[:2]
-    excsum = float(rhoR[0].dot(exc[:,0]).real.get()) * weight
+    exc, vxc = ni.eval_xc_eff(xc_code, rhoR, deriv=1, xctype=xctype, spin=0)[:2]
+    excsum = float(rhoR[0].dot(exc).real.get()) * weight
     wv = weight * vxc
     wv_freq = tools.fft(wv, mesh).reshape(nvar,ngrids)
     rhoR = rhoG = exc = vxc = wv = None
@@ -562,7 +568,7 @@ def nr_rks(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
     if len(shape) == 3 and shape[0] != kpts_band.shape[0]:
         shape[0] = kpts_band.shape[0]
     veff = veff.reshape(shape)
-    veff = tag_array(veff, ecoul=ecoul, exc=excsum, vj=None, vk=None)
+    veff = tag_array(veff, ecoul=ecoul, exc=excsum)
     return nelec, excsum, veff
 
 # Note nr_uks handles only one set of KUKS density matrices (alpha, beta) in
@@ -637,11 +643,8 @@ def nr_uks(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
     rhoR = cp.asarray(rhoR.reshape(2,nvar,ngrids), order='C')
     nelec = rhoR[:,0].sum(axis=-1).get() * weight
 
-    if xctype == 'LDA':
-        exc, vxc = ni.eval_xc_eff(xc_code, rhoR[:,0], deriv=1, xctype=xctype)[:2]
-    else:
-        exc, vxc = ni.eval_xc_eff(xc_code, rhoR, deriv=1, xctype=xctype)[:2]
-    excsum = float(rhoR[:,0].dot(exc[:,0]).sum().real.get()) * weight
+    exc, vxc = ni.eval_xc_eff(xc_code, rhoR, deriv=1, xctype=xctype, spin=1)[:2]
+    excsum = float(rhoR[:,0].dot(exc).sum().real.get()) * weight
     wv = (weight * vxc).reshape(2*nvar,ngrids)
     wv_freq = tools.fft(wv, mesh).reshape(2,nvar,ngrids)
     rhoR = rhoG = exc = vxc = wv = None
@@ -664,7 +667,7 @@ def nr_uks(ni, cell, grids, xc_code, dm_kpts, relativity=0, hermi=1,
     if len(shape) == 4 and shape[1] != kpts_band.shape[1]:
         shape[1] = kpts_band.shape[1]
     veff = veff.reshape(shape)
-    veff = tag_array(veff, ecoul=ecoul, exc=excsum, vj=None, vk=None)
+    veff = tag_array(veff, ecoul=ecoul, exc=excsum)
     return nelec, excsum, veff
 
 def get_rho(ni, dm, kpts=None):
@@ -688,7 +691,7 @@ def get_rho(ni, dm, kpts=None):
 def eval_nucG(cell, mesh):
     '''Nuclear attraction potential on Gv'''
     assert cell.dimension == 3
-    Gv, (basex, basey, basez) = tools.pbc._get_Gv_with_base(cell, mesh)
+    Gv, (basex, basey, basez) = get_Gv_weights(cell, mesh)[:2]
     b = cell.reciprocal_vectors()
     coords = cell.atom_coords()
     rb = cp.asarray(coords.dot(b.T))
@@ -700,36 +703,6 @@ def eval_nucG(cell, mesh):
     nucG = contract('qxy,qz->xyz', rho_xy, SIz).ravel()
     nucG *= tools.get_coulG(cell, Gv=Gv)
     return nucG
-
-def eval_nucG_SI_gradient(cell, mesh, rho_g):
-    ngrids = np.prod(mesh)
-    assert rho_g.shape == (ngrids,)
-
-    assert cell.dimension == 3
-    Gv, (basex, basey, basez) = tools.pbc._get_Gv_with_base(cell, mesh)
-    b = cell.reciprocal_vectors()
-    coords = cell.atom_coords()
-    rb = cp.asarray(coords.dot(b.T))
-    SIx = cp.exp(-1j*rb[:,0,None] * basex)
-    SIy = cp.exp(-1j*rb[:,1,None] * basey)
-    SIz = cp.exp(-1j*rb[:,2,None] * basez)
-    dSI_prefactor = -1j * Gv.T * rho_g.conj()
-    charges = -cell.atom_charges()
-    coulG = tools.get_coulG(cell, Gv=Gv)
-
-    de = cp.empty([cell.natm, 3], dtype = cp.complex128)
-
-    for i_atom in range(cell.natm):
-        SI = (SIx[i_atom,:,None,None] * SIy[i_atom,:,None] * SIz[i_atom]).ravel()
-        de[i_atom, :] = charges[i_atom] * (dSI_prefactor @ (coulG * SI))
-
-    grad_max_imag = cp.max(cp.abs(de.imag))
-    if grad_max_imag >= 1e-8:
-        logger.warn(cell, f"Large imaginary part ({grad_max_imag:e}) from nuclear repulsion term structure factor gradient")
-
-    de = de.real
-    de /= cell.vol
-    return de
 
 def get_nuc(ni, kpts=None):
     assert kpts is None or is_zero(kpts)
@@ -747,191 +720,133 @@ def get_nuc(ni, kpts=None):
         vne = vne[0]
     return vne
 
+def _get_Gv_bases(mesh, b):
+    Gx = cp.array(np.fft.fftfreq(mesh[0], 1./mesh[0]) * b[0,:,None])
+    Gy = cp.array(np.fft.fftfreq(mesh[1], 1./mesh[1]) * b[1,:,None])
+    Gz = cp.array(np.fft.fftfreq(mesh[2], 1./mesh[2]) * b[2,:,None])
+    return (Gx, Gy, Gz)
+
 _kernel_registery = {}
 
-def _append_vpplocG_one_atom_without_gamma(i_atom, natm, rloc, nexp, cexp, charge,
-                                           mesh, G2, coulG, SIx, SIy, SIz, vlocG):
-    # Result will be appended to vlocG
-
-    fn_name = f"gth_loc_reciporcal_nexp_{nexp}_kernel"
-    if fn_name not in _kernel_registery:
-        C_declaration = ''
-        C_contribution = ''
-        if nexp >= 1:
-            C_declaration += ', const double cexp0'
-            C_contribution += 'cfacs += cexp0;'
-        if nexp >= 2:
-            C_declaration += ', const double cexp1'
-            C_contribution += 'cfacs += cexp1 * (3 - G2_red);'
-        if nexp >= 3:
-            C_declaration += ', const double cexp2'
-            C_contribution += 'cfacs += cexp2 * (15 - 10 * G2_red + G2_red * G2_red);'
-        if nexp >= 4:
-            C_declaration += ', const double cexp3'
-            C_contribution += 'cfacs += cexp3 * (105 - 105 * G2_red + 21 * G2_red * G2_red - G2_red * G2_red * G2_red);'
-        kernel_code = r'''
-            #include <cupy/complex.cuh>
-            extern "C" __global__
-            void ''' + fn_name + '''(
-                const double* __restrict__ grids_G2, const double* __restrict__ grids_coulG,
-                const complex<double>* __restrict__ grids_SIx, const complex<double>* __restrict__ grids_SIy, const complex<double>* __restrict__ grids_SIz,
-                complex<double>* __restrict__ grids_vlocG,
-                const int n_mesh_x, const int n_mesh_y, const int n_mesh_z, const int i_atom,
-                const double charge, const double rloc''' + C_declaration + r''')
-            {
-                const int i_grid = blockDim.x * blockIdx.x + threadIdx.x;
-                const int ngrids = n_mesh_x * n_mesh_y * n_mesh_z;
-                if (i_grid >= ngrids) return;
-
-                const double G2 = grids_G2[i_grid];
-                const double coulG = grids_coulG[i_grid];
-                const double G2_red = G2 * rloc * rloc;
-                const int i_grid_x = i_grid / (n_mesh_y * n_mesh_z);
-                const int i_grid_y = (i_grid - i_grid_x * (n_mesh_y * n_mesh_z)) / n_mesh_z;
-                const int i_grid_z = i_grid - i_grid_x * (n_mesh_y * n_mesh_z) - i_grid_y * n_mesh_z;
-                const complex<double> SIx = grids_SIx[i_atom * n_mesh_x + i_grid_x];
-                const complex<double> SIy = grids_SIy[i_atom * n_mesh_y + i_grid_y];
-                const complex<double> SIz = grids_SIz[i_atom * n_mesh_z + i_grid_z];
-                const complex<double> SI = SIx * SIy * SIz * exp(-0.5 * G2_red);
-                complex<double> vlocG = -charge * coulG * SI;
-
-                double cfacs = 0;
-                ''' + C_contribution + r'''
-                vlocG += 15.749609945722419 * rloc * rloc * rloc * cfacs * SI;
-
-                grids_vlocG[i_grid] += vlocG;
-            }
-        '''
-        _kernel_registery[fn_name] = cp.RawKernel(kernel_code, fn_name)
-    kernel = _kernel_registery[fn_name]
-
-    ngrids = G2.shape[0]
-    assert G2.shape == (ngrids,) and G2.dtype == cp.float64
-    assert coulG.shape == (ngrids,) and coulG.dtype == cp.float64
-    assert SIx.shape == (natm, mesh[0]) and SIx.dtype == cp.complex128 and SIx.flags.c_contiguous
-    assert SIy.shape == (natm, mesh[1]) and SIy.dtype == cp.complex128 and SIy.flags.c_contiguous
-    assert SIz.shape == (natm, mesh[2]) and SIz.dtype == cp.complex128 and SIz.flags.c_contiguous
-    assert vlocG.shape == (ngrids,) and vlocG.dtype == cp.complex128
-    assert ngrids < np.iinfo(np.int32).max
-
-    kernel_parameters = [G2, coulG, SIx, SIy, SIz, vlocG, cp.int32(mesh[0]), cp.int32(mesh[1]), cp.int32(mesh[2]),
-                         cp.int32(i_atom), cp.float64(charge), cp.float64(rloc)]
-    if nexp >= 1:
-        kernel_parameters.append(cp.float64(cexp[0]))
-    if nexp >= 2:
-        kernel_parameters.append(cp.float64(cexp[1]))
-    if nexp >= 3:
-        kernel_parameters.append(cp.float64(cexp[2]))
-    if nexp >= 4:
-        kernel_parameters.append(cp.float64(cexp[3]))
-    kernel(((ngrids + 1024 - 1) // 1024, ), (1024, ), kernel_parameters)
-
-    # SI = (SIx[i_atom,:,None,None] * SIy[i_atom,:,None] * SIz[i_atom]).ravel()
-    # G2_red = G2 * rloc**2
-    # SI *= cp.exp(-0.5*G2_red)
-    # vlocG -= charge * coulG * SI
-
-    # # Add the C1, C2, C3, C4 contributions
-    # cfacs = 0
-    # if nexp >= 1:
-    #     cfacs += cexp[0]
-    # if nexp >= 2:
-    #     cfacs += cexp[1] * (3 - G2_red)
-    # if nexp >= 3:
-    #     cfacs += cexp[2] * (15 - 10*G2_red + G2_red**2)
-    # if nexp >= 4:
-    #     cfacs += cexp[3] * (105 - 105*G2_red + 21*G2_red**2 - G2_red**3)
-    # vlocG += (2*np.pi)**(3/2.)*rloc**3 * cfacs * SI
-
-    return vlocG
-
-def eval_vpplocG(cell, mesh):
+def eval_vpplocG(cell, mesh, out=None):
     '''PRB, 58, 3641 Eq (5)
     '''
     assert cell.dimension == 3
-    Gv, (basex, basey, basez) = tools.pbc._get_Gv_with_base(cell, mesh)
-    b = cell.reciprocal_vectors()
-    coords = cell.atom_coords()
-    rb = cp.asarray(coords.dot(b.T))
-    SIx = cp.exp(-1j*rb[:,0,None] * basex)
-    SIy = cp.exp(-1j*rb[:,1,None] * basey)
-    SIz = cp.exp(-1j*rb[:,2,None] * basez)
-    # G2 = contract('px,px->p', Gv, Gv)
-    G2 = batched_vec3_norm2(Gv)
-    charges = cell.atom_charges()
+    Gv_bases = _get_Gv_bases(mesh, cell.reciprocal_vectors())
+    coords = cp.asarray(cell.atom_coords())
+    SIx = cp.exp(-1j * coords.dot(Gv_bases[0]))
+    SIy = cp.exp(-1j * coords.dot(Gv_bases[1]))
+    SIz = cp.exp(-1j * coords.dot(Gv_bases[2]))
 
-    coulG = tools.get_coulG(cell, Gv=Gv)
-    vlocG = cp.zeros(len(G2), dtype=np.complex128)
+    charges = cell.atom_charges()
+    charges_gpu = cp.array(charges, dtype=np.float64)
+
+    fn_name = "gth_pploc_kernel"
+    if fn_name not in _kernel_registery:
+        # SI = (SIx[i_atom,:,None,None] * SIy[i_atom,:,None] * SIz[i_atom]).ravel()
+        # G2_red = G2 * rloc**2
+        # SI *= cp.exp(-0.5*G2_red)
+        # vlocG -= charge * coulG * SI
+
+        # # Add the C1, C2, C3, C4 contributions
+        # cfacs = 0
+        # if nexp >= 1:
+        #     cfacs += cexp[0]
+        # if nexp >= 2:
+        #     cfacs += cexp[1] * (3 - G2_red)
+        # if nexp >= 3:
+        #     cfacs += cexp[2] * (15 - 10*G2_red + G2_red**2)
+        # if nexp >= 4:
+        #     cfacs += cexp[3] * (105 - 105*G2_red + 21*G2_red**2 - G2_red**3)
+        # vlocG += (2*np.pi)**(3/2.)*rloc**3 * cfacs * SI
+        kernel_code = r'''
+            #include <cupy/complex.cuh>
+            extern "C" __global__
+void ''' + fn_name + '''(
+    const double* __restrict__ Gx, const double* __restrict__ Gy, const double* __restrict__ Gz,
+    const complex<double>* __restrict__ grids_SIx, const complex<double>* __restrict__ grids_SIy, const complex<double>* __restrict__ grids_SIz,
+    complex<double>* __restrict__ grids_vlocG,
+    const int nx, const int ny, const int nz, int atom_batch_size,
+    int *atom_ids, double *charges, double rloc, int nexp,
+    double cexp0, double cexp1, double cexp2, double cexp3)
+{
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    size_t nyz = ny * nz;
+    size_t ng = nx * nyz;
+    for (size_t i_grid = idx; i_grid < ng; i_grid += stride) {
+        int ix = i_grid / nyz;
+        int iyz = i_grid - nyz * ix;
+        int iy = iyz / nz;
+        int iz = iyz - nz * iy;
+        double G2 = 0.;
+        for (int n = 0; n < 3; ++n) {
+            double Gv = Gx[nx*n+ix] + Gy[ny*n+iy] + Gz[nz*n+iz];
+            G2 += Gv * Gv;
+        }
+        double coulG = 0.;
+        if (G2 != 0) coulG = 12.566370614359172 / G2;
+        double G2_red = G2 * rloc * rloc;
+        double expx = exp(-0.5 * G2_red);
+        double cfacs = 0;
+        if (nexp >= 1) cfacs += cexp0;
+        if (nexp >= 2) cfacs += cexp1 * (3 - G2_red);
+        if (nexp >= 3) cfacs += cexp2 * (15 + G2_red * (G2_red - 10));
+        if (nexp >= 4) cfacs += cexp3 * (105 + G2_red * (G2_red * (21 - G2_red) - 105));
+        cfacs *= 15.749609945722419 * rloc * rloc * rloc;
+        complex<double> vlocG = 0;
+        for (int ia = 0; ia < atom_batch_size; ++ia) {
+            int i_atom = atom_ids[ia];
+            complex<double> SIx = grids_SIx[i_atom * nx + ix];
+            complex<double> SIy = grids_SIy[i_atom * ny + iy];
+            complex<double> SIz = grids_SIz[i_atom * nz + iz];
+            complex<double> SI = SIx * SIy * SIz * expx;
+            vlocG -= charges[i_atom] * coulG * SI;
+            vlocG += cfacs * SI;
+        }
+        grids_vlocG[i_grid] += vlocG;
+    }
+}'''
+        _kernel_registery[fn_name] = cp.RawKernel(kernel_code, fn_name)
+    kernel = _kernel_registery[fn_name]
+    workers = gpu_specs['multiProcessorCount']
+
+    ngrids = np.prod(mesh)
+    vlocG = ndarray(ngrids, dtype=np.complex128, buffer=out)
+    vlocG.fill(0)
     vlocG0 = 0
 
-    for ia in range(cell.natm):
-        symb = cell.atom_symbol(ia)
+    elements = np.array([cell.atom_symbol(ia) for ia in range(cell.natm)])
+    uniq_elements, inv_idx, counts = np.unique(
+        elements, return_inverse=True, return_counts=True)
+    idx = np.argsort(inv_idx)
+    idx_gpu = cp.array(idx, dtype=np.int32)
+    splits = np.append(0, counts).cumsum()
+
+    for ii, (i0, i1) in enumerate(zip(splits[:-1], splits[1:])):
+        symb = uniq_elements[ii]
         if symb not in cell._pseudo:
             continue
 
         pp = cell._pseudo[symb]
         rloc, nexp, cexp = pp[1:3+1]
-        if nexp == 0:
-            continue
+        cexp = [cp.float64(x) for x in cexp] + [cp.float64(0.)] * 4
 
-        vlocG0 += 2*np.pi*charges[ia]*rloc**2
+        kernel((workers*2, ), (1024, ), [
+            Gv_bases[0], Gv_bases[1], Gv_bases[2], SIx, SIy, SIz, vlocG,
+            cp.int32(mesh[0]), cp.int32(mesh[1]), cp.int32(mesh[2]),
+            cp.int32(i1-i0), idx_gpu[i0:i1], charges_gpu, cp.float64(rloc),
+            cp.int32(nexp)] + cexp[:4])
 
-        _append_vpplocG_one_atom_without_gamma(ia, cell.natm, rloc, nexp, cexp, charges[ia], mesh, G2, coulG, SIx, SIy, SIz, vlocG)
+        vlocG0 += 2*np.pi * charges[idx[i0:i1]].sum() * rloc**2
 
     vlocG[0] += vlocG0
     return vlocG
 
-def eval_vpplocG_SI_gradient(cell, mesh, rho_g):
-    ngrids = np.prod(mesh)
-    assert rho_g.shape == (ngrids,)
-
-    Gv, (basex, basey, basez) = tools.pbc._get_Gv_with_base(cell, mesh)
-    b = cell.reciprocal_vectors()
-    coords = cell.atom_coords()
-    rb = cp.asarray(coords.dot(b.T))
-    SIx = cp.exp(-1j*rb[:,0,None] * basex)
-    SIy = cp.exp(-1j*rb[:,1,None] * basey)
-    SIz = cp.exp(-1j*rb[:,2,None] * basez)
-    dSI_prefactor = -1j * Gv.T * rho_g.conj()
-    G2 = batched_vec3_norm2(Gv)
-    charges = cell.atom_charges()
-
-    coulG = tools.get_coulG(cell, Gv=Gv)
-    vlocG = cp.zeros(len(G2), dtype=np.complex128)
-
-    de = cp.empty([cell.natm, 3], dtype = cp.complex128)
-
-    for ia in range(cell.natm):
-        symb = cell.atom_symbol(ia)
-        if symb not in cell._pseudo:
-            continue
-
-        pp = cell._pseudo[symb]
-        rloc, nexp, cexp = pp[1:3+1]
-        if nexp == 0:
-            continue
-
-        vlocG.fill(0)
-        _append_vpplocG_one_atom_without_gamma(ia, cell.natm, rloc, nexp, cexp, charges[ia], mesh, G2, coulG, SIx, SIy, SIz, vlocG)
-
-        vlocG0 = 2*np.pi*charges[ia]*rloc**2
-        vlocG[0] += vlocG0
-
-        de[ia, :] = dSI_prefactor @ vlocG
-
-    grad_max_imag = cp.max(cp.abs(de.imag))
-    if grad_max_imag >= 1e-8:
-        logger.warn(cell, f"Large imaginary part ({grad_max_imag:e}) from pseudopotential local term structure factor gradient")
-
-    de = de.real
-    de /= cell.vol
-    return de
-
 def get_pp(ni, kpts=None):
     '''Get the periodic pseudopotential nuc-el AO matrix, with G=0 removed.
     '''
-    from pyscf import gto
-    from pyscf.pbc.gto.pseudo import pp_int
+    from gpu4pyscf.pbc.gto.pseudo.pp_int import get_pp_nl
     assert kpts is None or is_zero(kpts)
     if kpts is None or kpts.ndim == 1:
         is_single_kpt = True
@@ -947,7 +862,7 @@ def get_pp(ni, kpts=None):
     vpp = _get_j_pass2(ni, vpplocG[None,:], kpts=kpts)[0]
     t1 = log.timer_debug1('vpploc', *t0)
 
-    vppnl = pp_int.get_pp_nl(cell, kpts)
+    vppnl = get_pp_nl(cell, kpts)
     for k, kpt in enumerate(kpts):
         if is_zero(kpt):
             vpp[k] += cp.asarray(vppnl[k].real)
@@ -1093,7 +1008,8 @@ def to_primitive_bas(cell):
             ctypes.cast(prim_bas_gpu.data.ptr, ctypes.c_void_p),
             ctypes.c_int(nbas_p),
             ctypes.cast(prim_env_gpu.data.ptr, ctypes.c_void_p),
-            ctypes.c_float(log_cutoff))
+            ctypes.c_float(log_cutoff),
+            ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
         if err != 0:
             raise RuntimeError('filter_supmol_bas kernel failed')
 
@@ -1232,8 +1148,9 @@ def _ovlp_mask_estimation(cell, cell0_nprims, supmol_bas, supmol_env,
             ctypes.cast(ls.data.ptr, ctypes.c_void_p),
             ctypes.c_int(cell0_nprims),
             ctypes.c_int(supmol_nbas),
-            ctypes.c_int(l_inc), ctypes.c_int(hermi),
-            ctypes.c_float(log_cutoff))
+            ctypes.c_int(hermi), ctypes.c_int(l_inc),
+            ctypes.c_float(log_cutoff),
+            ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
         if err != 0:
             raise RuntimeError('ovlp_mask_estimation kernel failed')
         ovlp_mask = ovlp_mask.astype(dtype=bool, copy=False)
@@ -1379,7 +1296,7 @@ def create_tasks(cell, prim_bas, supmol_bas, supmol_env, ao_loc_in_cell0,
     return tasks
 
 def init_constant(cell):
-    err = libmgrid.MG_init_constant(ctypes.c_int(SHM_SIZE))
+    err = libmgrid.MG_init_constant(ctypes.c_int(SHM_SIZE), ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
     if err != 0:
         raise RuntimeError('CUDA kernel initialization')
 
@@ -1407,9 +1324,14 @@ class MGridEnvVars(ctypes.Structure):
         ('lattice_params', ctypes.c_void_p),
     ]
 
+class MultiGridNumIntBase(lib.StreamObject, numint.LibXCMixin):
+    pass
 
-class MultiGridNumInt(lib.StreamObject, numint.LibXCMixin):
+class MultiGridNumInt(MultiGridNumIntBase):
     def __init__(self, cell):
+        warnings.warn(
+            'multigrid is deprecated. Use multigrid_v3 instead',
+            DeprecationWarning, stacklevel=2)
         self.mesh = cell.mesh
         self.reset(cell)
 
@@ -1461,9 +1383,7 @@ class MultiGridNumInt(lib.StreamObject, numint.LibXCMixin):
                           for _ in range(nc)])
         return sandwich_dot(mat, c2s)
 
-    def get_j(self, dm, hermi=1, kpts=None, kpts_band=None, omega=None):
-        if kpts is not None:
-            raise NotImplementedError
+    def get_j(self, dm, hermi=1, kpts=None, kpts_band=None):
         vj = get_j_kpts(self, dm, hermi, kpts, kpts_band)
         return vj
 
@@ -1473,9 +1393,15 @@ class MultiGridNumInt(lib.StreamObject, numint.LibXCMixin):
     get_rho = get_rho
     nr_rks = nr_rks
     nr_uks = nr_uks
-    get_vxc = nr_vxc = NotImplemented #numint_cpu.KNumInt.nr_vxc
 
-    eval_xc_eff = numint.eval_xc_eff
+    def get_vxc(self, cell, grids, xc_code, dm_kpts, spin=0, hermi=1,
+                kpts=None, kpts_band=None, with_j=False, verbose=None):
+        fn = self.nr_rks if spin == 0 else self.nr_uks
+        return fn(cell, grids, xc_code, dm_kpts, spin, hermi=hermi,
+                  kpts=kpts, kpts_band=kpts_band, with_j=with_j, verbose=verbose)
+    nr_vxc = get_vxc
+
+    eval_xc_eff = numint.NumInt.eval_xc_eff
     _init_xcfuns = numint.NumInt._init_xcfuns
 
     nr_rks_fxc = NotImplemented
@@ -1483,6 +1409,18 @@ class MultiGridNumInt(lib.StreamObject, numint.LibXCMixin):
     nr_rks_fxc_st = NotImplemented
     cache_xc_kernel  = NotImplemented
     cache_xc_kernel1 = NotImplemented
+
+    def energy_nuclear_gradient(self, xc_code, dm_kpts, kpts=None, spin=None,
+                                with_j=False, with_nuc=False):
+        raise NotImplementedError('Please use multigrid_v3.MultiGridNumInt instead.')
+
+    def energy_strain_gradient(self, xc_code, dm_kpts, kpts=None, spin=None,
+                               with_j=False, with_nuc=False):
+        raise NotImplementedError
+
+    def energy_derivatives(self, xc_code, dm_kpts, kpts=None, spin=None,
+                           with_j=False, with_nuc=False):
+        raise NotImplementedError('Please use multigrid_v3.MultiGridNumInt instead.')
 
     to_gpu = utils.to_gpu
     device = utils.device

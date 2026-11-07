@@ -14,6 +14,7 @@
 
 import os
 import sys
+import warnings
 import functools
 import ctypes
 import numpy as np
@@ -27,6 +28,8 @@ from gpu4pyscf.lib.memcpy import copy_array, p2p_transfer  #NOQA
 from gpu4pyscf.lib import multi_gpu
 from gpu4pyscf.lib.utils import load_library
 from gpu4pyscf.__config__ import num_devices, _p2p_access
+from gpu4pyscf.__config__ import props as gpu_specs
+from gpu4pyscf import __config__
 
 LMAX_ON_GPU = 7
 DSOLVE_LINDEP = 1e-13
@@ -66,17 +69,16 @@ def print_mem_info():
     print(msg)
     return msg
 
-def get_avail_mem():
+def get_avail_mem(exclude_memory_pool=False):
+    if exclude_memory_pool:
+        return cupy.cuda.runtime.memGetInfo()[0]
+
     mempool = cupy.get_default_memory_pool()
     used_mem = mempool.used_bytes()
-    mem_limit = mempool.get_limit()
-    if(mem_limit != 0):
-        return mem_limit - used_mem
-    else:
-        total_mem = mempool.total_bytes()
-        # get memGetInfo() is slow
-        mem_avail = cupy.cuda.runtime.memGetInfo()[0]
-        return mem_avail + total_mem - used_mem
+    total_mem = mempool.total_bytes()
+    # get memGetInfo() is slow
+    mem_avail = cupy.cuda.runtime.memGetInfo()[0]
+    return mem_avail + total_mem - used_mem
 
 def concatenate(array_list):
     ''' Concatenate axis=0 only
@@ -111,13 +113,13 @@ def device2host_2d(a_cpu, a_gpu, stream=None):
     if stream is None:
         stream = cupy.cuda.get_current_stream()
     libcupy_helper.async_d2h_2d(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         a_cpu.ctypes.data_as(ctypes.c_void_p),
         ctypes.c_int(a_cpu.strides[0]),
         ctypes.cast(a_gpu.data.ptr, ctypes.c_void_p),
         ctypes.c_int(a_gpu.strides[0]),
         ctypes.c_int(a_gpu.shape[0]),
-        ctypes.c_int(a_gpu.shape[1]))
+        ctypes.c_int(a_gpu.shape[1]),
+        ctypes.cast(stream.ptr, ctypes.c_void_p))
 
 # define cupy array with tags
 class CPArrayWithTag(cupy.ndarray):
@@ -160,7 +162,8 @@ def asarray(a, **kwargs):
         # cupy/_core/core.pyx, where memory buffer is allocated via
         # mem = _alloc_async_transfer_buffer(nbytes)
 
-        allow_fast_transfer = kwargs.get('dtype', a.dtype) == a.dtype
+        allow_fast_transfer = (kwargs.get('dtype', a.dtype) == a.dtype and
+                               'order' not in kwargs)
         # a must be C-contiguous or F-contiguous
         if not a.flags.c_contiguous and not a.flags.f_contiguous:
             allow_fast_transfer = False
@@ -213,10 +216,10 @@ def pack_tril(a, stream=None):
             stream = cupy.cuda.get_current_stream()
         a_tril = cupy.empty((counts, n*(n+1)//2), dtype=np.float64)
         err = libcupy_helper.pack_tril(
-            ctypes.cast(stream.ptr, ctypes.c_void_p),
             ctypes.cast(a_tril.data.ptr, ctypes.c_void_p),
             ctypes.cast(a.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(n), ctypes.c_int(counts))
+            ctypes.c_int(n), ctypes.c_int(counts),
+            ctypes.cast(stream.ptr, ctypes.c_void_p))
         if err != 0:
             raise RuntimeError('pack_tril kernel failed')
 
@@ -244,17 +247,19 @@ def unpack_tril(cderi_tril, out=None, stream=None, hermi=1):
         else:
             raise NotImplementedError
         out [:,mask] = cderi_tril
+        if ndim == 1:
+            out = out[0]
         return out
 
     if stream is None:
         stream = cupy.cuda.get_current_stream()
     err = libcupy_helper.unpack_tril(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(cderi_tril.data.ptr, ctypes.c_void_p),
         ctypes.cast(out.data.ptr, ctypes.c_void_p),
         ctypes.c_int(nao),
         ctypes.c_int(count),
-        ctypes.c_int(hermi))
+        ctypes.c_int(hermi),
+        ctypes.cast(stream.ptr, ctypes.c_void_p))
     if err != 0:
         raise RuntimeError('failed in unpack_tril kernel')
     if ndim == 1:
@@ -262,27 +267,58 @@ def unpack_tril(cderi_tril, out=None, stream=None, hermi=1):
     return out
 
 def unpack_sparse(cderi_sparse, row, col, p0, p1, nao, out=None, stream=None):
+    warnings.warn(
+        'unpack_sparse is deprecated. Use fill_symmetric instead',
+        DeprecationWarning, stacklevel=2)
+    return fill_symmetric(cderi_sparse, row*nao+col, nao, p0, p1, out, stream)
+
+def fill_symmetric(a, pair_addresses, nao, p0=0, p1=None, out=None, stream=None):
+    '''
+    Performs:
+
+        i, j = divmod(pair_addresses, nao)
+        out[j,i,:] = out[i,j,:] = a[:,p0:p1]
+    '''
+    assert a.ndim == 2
+    if p1 is None:
+        p1 = a.shape[1]
+
+    if out is None:
+        out = cupy.zeros([nao,nao,p1-p0], dtype=a.dtype)
+    else:
+        assert out.ndim == 3
+
     if stream is None:
         stream = cupy.cuda.get_current_stream()
-    if out is None:
-        out = cupy.zeros([nao,nao,p1-p0])
-    nij = len(row)
-    naux = cderi_sparse.shape[1]
-    nao = out.shape[1]
-    err = libcupy_helper.unpack_sparse(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
-        ctypes.cast(cderi_sparse.data.ptr, ctypes.c_void_p),
-        ctypes.cast(row.data.ptr, ctypes.c_void_p),
-        ctypes.cast(col.data.ptr, ctypes.c_void_p),
-        ctypes.cast(out.data.ptr, ctypes.c_void_p),
-        ctypes.c_int(nao),
-        ctypes.c_int(nij),
-        ctypes.c_int(naux),
-        ctypes.c_int(p0),
-        ctypes.c_int(p1)
-    )
-    if err != 0:
-        raise RuntimeError('failed in unpack_sparse')
+
+    pair_addresses = cupy.asarray(pair_addresses, dtype=np.int32)
+    out_stride = out.strides[-2] // out.itemsize
+    if a.strides[-1] == 8: # a is in row major
+        a_stride = a.strides[-2] // a.itemsize
+        err = libcupy_helper.decompress_and_fill(
+            ctypes.cast(out.data.ptr, ctypes.c_void_p),
+            ctypes.c_int(out_stride),
+            ctypes.cast(a.data.ptr, ctypes.c_void_p),
+            ctypes.cast(pair_addresses.data.ptr, ctypes.c_void_p),
+            ctypes.c_int(len(pair_addresses)),
+            ctypes.c_int(nao),
+            ctypes.c_int(a_stride),
+            ctypes.c_int(p0), ctypes.c_int(p1),
+            ctypes.cast(stream.ptr, ctypes.c_void_p))
+        if err != 0:
+            raise RuntimeError('decompress_and_fill failed')
+    else: # a is in column major
+        err = libcupy_helper.decompress_and_transpose(
+            ctypes.cast(out.data.ptr, ctypes.c_void_p),
+            ctypes.c_int(out_stride), ctypes.cast(a.data.ptr, ctypes.c_void_p),
+            ctypes.cast(pair_addresses.data.ptr, ctypes.c_void_p),
+            ctypes.c_int(len(pair_addresses)),
+            ctypes.c_int(nao),
+            ctypes.c_int(p0), ctypes.c_int(p1),
+            ctypes.c_int(1), ctypes.c_int(0),
+            ctypes.cast(stream.ptr, ctypes.c_void_p))
+        if err != 0:
+            raise RuntimeError('decompress_and_transpose failed')
     return out
 
 def add_sparse(a, b, indices):
@@ -291,7 +327,8 @@ def add_sparse(a, b, indices):
     '''
     assert a.device == b.device
     assert a.flags.c_contiguous
-    assert b.flags.c_contiguous
+    if not b.flags.c_contiguous:
+        b = cupy.ascontiguousarray(b)
     if len(indices) == 0: return a
     indices = cupy.asarray(indices, dtype=np.int32)
     n = a.shape[-1]
@@ -305,13 +342,13 @@ def add_sparse(a, b, indices):
 
     stream = cupy.cuda.get_current_stream()
     err = libcupy_helper.add_sparse(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(a.data.ptr, ctypes.c_void_p),
         ctypes.cast(b.data.ptr, ctypes.c_void_p),
         ctypes.cast(indices.data.ptr, ctypes.c_void_p),
         ctypes.c_int(n),
         ctypes.c_int(m),
-        ctypes.c_int(count)
+        ctypes.c_int(count),
+        ctypes.cast(stream.ptr, ctypes.c_void_p)
     )
     if err != 0:
         raise RuntimeError('failed in sparse_add2d')
@@ -330,12 +367,12 @@ def dist_matrix(x, y, out=None):
 
     stream = cupy.cuda.get_current_stream()
     err = libcupy_helper.dist_matrix(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(out.data.ptr, ctypes.c_void_p),
         ctypes.cast(x.data.ptr, ctypes.c_void_p),
         ctypes.cast(y.data.ptr, ctypes.c_void_p),
         ctypes.c_int(m),
-        ctypes.c_int(n)
+        ctypes.c_int(n),
+        ctypes.cast(stream.ptr, ctypes.c_void_p)
     )
     if err != 0:
         raise RuntimeError('failed in calculating distance matrix')
@@ -376,7 +413,6 @@ def block_c2s_diag(angular, counts):
 
     stream = cupy.cuda.get_current_stream()
     err = libcupy_helper.block_diag(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(cart2sph.data.ptr, ctypes.c_void_p),
         ctypes.c_int(ncart),
         ctypes.c_int(nsph),
@@ -385,28 +421,35 @@ def block_c2s_diag(angular, counts):
         ctypes.cast(offsets.data.ptr, ctypes.c_void_p),
         ctypes.cast(rows.data.ptr, ctypes.c_void_p),
         ctypes.cast(cols.data.ptr, ctypes.c_void_p),
+        ctypes.cast(stream.ptr, ctypes.c_void_p),
     )
     if err != 0:
         raise RuntimeError('failed in block_diag kernel')
     return cart2sph
 
 def block_diag(blocks, out=None):
-    '''
-    each block size is up to 16x16
+    '''Construct a block-diagonal array, preserving the input result dtype.
+
+    A supplied output buffer is filled with the complete block-diagonal matrix.
     '''
     rows = np.cumsum(np.asarray([0] + [x.shape[0] for x in blocks]))
     cols = np.cumsum(np.asarray([0] + [x.shape[1] for x in blocks]))
     offsets = np.cumsum(np.asarray([0] + [x.shape[0]*x.shape[1] for x in blocks]))
 
     m, n = rows[-1], cols[-1]
-    if out is None: out = cupy.zeros([m, n])
+    dtype = np.result_type(*blocks)
+    out = ndarray([m, n], dtype=dtype, buffer=out)
+    out.fill(0.)
+    if dtype != np.float64:
+        for block, r0, r1, c0, c1 in zip(blocks, rows[:-1], rows[1:], cols[:-1], cols[1:]):
+            out[r0:r1,c0:c1] = block
+        return out
     rows = cupy.asarray(rows, dtype='int32')
     cols = cupy.asarray(cols, dtype='int32')
     offsets = cupy.asarray(offsets, dtype='int32')
     data = cupy.concatenate([x.ravel() for x in blocks])
     stream = cupy.cuda.get_current_stream()
     err = libcupy_helper.block_diag(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(out.data.ptr, ctypes.c_void_p),
         ctypes.c_int(m),
         ctypes.c_int(n),
@@ -415,6 +458,7 @@ def block_diag(blocks, out=None):
         ctypes.cast(offsets.data.ptr, ctypes.c_void_p),
         ctypes.cast(rows.data.ptr, ctypes.c_void_p),
         ctypes.cast(cols.data.ptr, ctypes.c_void_p),
+        ctypes.cast(stream.ptr, ctypes.c_void_p),
     )
     if err != 0:
         raise RuntimeError('failed in block_diag kernel')
@@ -433,21 +477,23 @@ def take_last2d(a, indices, out=None):
     else:
         count = np.prod(a.shape[:-2])
     out = ndarray((count, nidx, nidx), buffer=out)
+    if a.ndim == 2:
+        out = out.reshape(nidx,nidx)
+    if nidx == 0:
+        return out
     indices_int32 = cupy.asarray(indices, dtype='int32')
     stream = cupy.cuda.get_current_stream()
     err = libcupy_helper.take_last2d(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(out.data.ptr, ctypes.c_void_p),
         ctypes.cast(a.data.ptr, ctypes.c_void_p),
         ctypes.cast(indices_int32.data.ptr, ctypes.c_void_p),
         ctypes.c_int(count),
         ctypes.c_int(nidx),
-        ctypes.c_int(nao)
+        ctypes.c_int(nao),
+        ctypes.cast(stream.ptr, ctypes.c_void_p)
     )
     if err != 0:
         raise RuntimeError('failed in take_last2d kernel')
-    if a.ndim == 2:
-        out = out.reshape(nidx,nidx)
     return out
 
 def takebak(out, a, indices, axis=-1):
@@ -470,25 +516,29 @@ def takebak(out, a, indices, axis=-1):
     indices_int32 = cupy.asarray(indices, dtype=cupy.int32)
     stream = cupy.cuda.get_current_stream()
     err = libcupy_helper.takebak(
-        ctypes.c_void_p(stream.ptr),
         ctypes.c_void_p(out.data.ptr), a.ctypes,
         ctypes.c_void_p(indices_int32.data.ptr),
-        ctypes.c_int(count), ctypes.c_int(n_o), ctypes.c_int(n_a)
+        ctypes.c_int(count), ctypes.c_int(n_o), ctypes.c_int(n_a),
+        ctypes.c_void_p(stream.ptr)
     )
     if err != 0: # Not the mapped host memory
         out[...,indices] = cupy.asarray(a)
     return out
 
-def transpose_sum(a, stream=None, inplace=True):
+def transpose_sum(a, stream=None, inplace=True, hermi=1):
     '''
-    perform a + a.transpose(0,2,1) inplace
+    perform
+    a + a.transpose(0,2,1).conj() for hermi=1 or
+    a - a.transpose(0,2,1).conj() hermi=2
+    inplace
     '''
     if not inplace:
         a = cupy.copy(a, order='C')
+    ndim = a.ndim
+    assert hermi == 1 or hermi == 2
     assert isinstance(a, cupy.ndarray)
     assert a.flags.c_contiguous
-    assert a.ndim in (2, 3)
-    ndim = a.ndim
+    assert ndim == 2 or ndim == 3
     if ndim == 2:
         a = a[None]
     count, m, n = a.shape
@@ -499,9 +549,9 @@ def transpose_sum(a, stream=None, inplace=True):
         fn = libcupy_helper.transpose_dsum
     else:
         fn = libcupy_helper.transpose_zsum
-    err = fn(ctypes.cast(stream.ptr, ctypes.c_void_p),
-             ctypes.cast(a.data.ptr, ctypes.c_void_p),
-             ctypes.c_int(n), ctypes.c_int(count))
+    err = fn(ctypes.cast(a.data.ptr, ctypes.c_void_p),
+             ctypes.c_int(n), ctypes.c_int(count), ctypes.c_int(hermi),
+             ctypes.cast(stream.ptr, ctypes.c_void_p))
     if err != 0:
         raise RuntimeError('failed in transpose_sum kernel')
     if ndim == 2:
@@ -516,7 +566,6 @@ def hermi_triu(mat, hermi=1, inplace=True, stream=None):
     hermi=1 performs symmetric; hermi=2 performs anti-symmetric
     '''
     assert hermi in (1, 2)
-    assert mat.dtype == np.float64
     if inplace:
         assert mat.flags.c_contiguous
     else:
@@ -530,38 +579,66 @@ def hermi_triu(mat, hermi=1, inplace=True, stream=None):
     else:
         raise ValueError(f'dimension not supported {mat.ndim}')
 
+    if mat.dtype == np.float64:
+        dtype = 1
+    elif mat.dtype == np.complex128:
+        dtype = 2
+    else:
+        raise ValueError(f'{mat.ndim} type not supported')
+
     if stream is None:
         stream = cupy.cuda.get_current_stream()
     err = libcupy_helper.fill_triu(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(mat.data.ptr, ctypes.c_void_p),
-        ctypes.c_int(n), ctypes.c_int(counts), ctypes.c_int(hermi))
+        ctypes.c_int(n), ctypes.c_int(counts), ctypes.c_int(hermi),
+        ctypes.c_int(dtype),
+        ctypes.cast(stream.ptr, ctypes.c_void_p))
     if err != 0:
         raise RuntimeError('hermi_triu kernel failed')
     return mat
 
-def cart2sph_cutensor(t, axis=0, ang=1, out=None):
-    '''
-    transform 'axis' of a tensor from cartesian basis into spherical basis with cutensor
-    '''
-    from gpu4pyscf.gto import mole
-    if(ang <= 1):
-        if(out is not None): out[:] = t
-        return t
-    size = list(t.shape)
-    c2s = mole.cart2sph_by_l(ang)
-    if(not t.flags['C_CONTIGUOUS']): t = cupy.asarray(t, order='C')
-    li_size = c2s.shape
-    nli = size[axis] // li_size[0]
-    i0 = max(1, np.prod(size[:axis]))
-    i3 = max(1, np.prod(size[axis+1:]))
-    out_shape = size[:axis] + [nli*li_size[1]] + size[axis+1:]
+def copy_symmetric(a, i_addr, j_addr, stream=None):
+    '''a[j_addr,i_addr] = a[i_addr, j_addr]'''
+    assert a.ndim == 3
+    if stream is None:
+        stream = cupy.cuda.get_current_stream()
+    N1, N2 = a.shape[1:3]
+    npairs = len(i_addr)
+    if a.dtype == np.complex128:
+        N2 *= 2
+    i_addr = cupy.asarray(i_addr, dtype=np.int32)
+    j_addr = cupy.asarray(j_addr, dtype=np.int32)
+    err = libcupy_helper.copy_symmetric(
+        ctypes.cast(a.data.ptr, ctypes.c_void_p),
+        ctypes.cast(i_addr.data.ptr, ctypes.c_void_p),
+        ctypes.cast(j_addr.data.ptr, ctypes.c_void_p),
+        ctypes.c_int(npairs), ctypes.c_int(N1), ctypes.c_int(N2),
+        ctypes.cast(stream.ptr, ctypes.c_void_p))
+    if err != 0:
+        raise RuntimeError('copy_symmetric kernel failed')
+    return a
 
-    t_cart = t.reshape([i0*nli, li_size[0], i3])
-    if(out is not None):
-        out = out.reshape([i0*nli, li_size[1], i3])
-    t_sph = contract('min,ip->mpn', t_cart, c2s, out=out)
-    return t_sph.reshape(out_shape)
+def scatter_add(a, idx, b, alpha=1, stream=None):
+    '''a[idx,:] += alpha * b'''
+    if stream is None:
+        stream = cupy.cuda.get_current_stream()
+    assert a.ndim == 2 and b.ndim == 2
+    assert a.dtype == b.dtype
+    nrow, ncol = b.shape
+    if b.dtype == np.complex128:
+        ncol *= 2
+    idx = cupy.asarray(idx, dtype=np.int32)
+    err = libcupy_helper.scatter_add(
+        ctypes.cast(a.data.ptr, ctypes.c_void_p),
+        ctypes.cast(b.data.ptr, ctypes.c_void_p),
+        ctypes.cast(idx.data.ptr, ctypes.c_void_p),
+        ctypes.c_double(alpha),
+        ctypes.c_int(nrow), ctypes.c_int(ncol),
+        ctypes.cast(stream.ptr, ctypes.c_void_p))
+    if err != 0:
+        raise RuntimeError('scatter_add kernel failed')
+    return a
+
 
 def cart2sph(t, axis=0, ang=1, out=None, stream=None):
     '''
@@ -589,12 +666,12 @@ def cart2sph(t, axis=0, ang=1, out=None, stream=None):
     if stream is None:
         stream = cupy.cuda.get_current_stream()
     err = libcupy_helper.cart2sph(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(t_cart.data.ptr, ctypes.c_void_p),
         ctypes.cast(out.data.ptr, ctypes.c_void_p),
         ctypes.c_int(i3),
         ctypes.c_int(count),
-        ctypes.c_int(ang)
+        ctypes.c_int(ang),
+        ctypes.cast(stream.ptr, ctypes.c_void_p)
     )
     if err != 0:
         raise RuntimeError('failed in cart2sph kernel')
@@ -654,7 +731,11 @@ def krylov(aop, b, x0=None, tol=1e-10, max_cycle=30, dot=cupy.dot,
     nroots, ndim = x1.shape
     x1, rmat = _stable_qr(x1, cupy.dot, lindep=lindep)
     if len(x1) == 0:
-        return cupy.zeros_like(b)
+        # A zero residual means a supplied initial guess is already a solution.
+        if x0 is None:
+            return cupy.zeros_like(b)
+        else:
+            return x0
 
     x1 *= rmat.diagonal()[:,None]
 
@@ -787,6 +868,13 @@ def _gen_x0(v, xs):
         x0 = x0[0]
     return x0
 
+_MAX_MEMORY = os.getenv('PYSCF_MAX_MEMORY')
+if _MAX_MEMORY is None and __config__.MAX_MEMORY != 4000:
+    # 4000 MB is the built-in default initialized in pyscf.__config__.
+    # If MAX_MEMORY has been explicitly configured (e.g. in ~/.pyscf_conf.py),
+    # use that value when the environment variable is not set.
+    _MAX_MEMORY = __config__.MAX_MEMORY
+
 def empty_mapped(shape, dtype=float, order='C'):
     '''(experimental)
     Returns a new, uninitialized NumPy array with the given shape and dtype.
@@ -798,6 +886,15 @@ def empty_mapped(shape, dtype=float, order='C'):
     size = int(np.prod(shape))
     nbytes = size * int(np.dtype(dtype).itemsize)
     assert nbytes >= 0, f"nbytes = {nbytes} is negative, type(nbytes) = {type(nbytes)}, please check if overflow happens"
+
+    if _MAX_MEMORY is not None:
+        mem_used = lib.current_memory()[0] # in MB
+        mem_limit = float(_MAX_MEMORY)
+        if nbytes*1e-6 + mem_used > mem_limit:
+            raise MemoryError(
+                f'Cannot allocate {nbytes} bytes of host memory '
+                f'(current: {mem_used:.1f} MB, limit: {mem_limit:.1f} MB).')
+
     mem = cupy.cuda.PinnedMemoryPointer(
         cupy.cuda.PinnedMemory(nbytes, cupy.cuda.runtime.hostAllocMapped), 0)
     out = np.ndarray(shape, dtype=dtype, buffer=mem, order=order)
@@ -806,6 +903,17 @@ def empty_mapped(shape, dtype=float, order='C'):
 def ndarray(shape, dtype=np.float64, buffer=None):
     '''
     Construct CuPy ndarray object using the NumPy ndarray API
+
+    Args:
+        shape : tuple or int
+            Shape of the array to allocate.
+
+    Kwargs:
+        dtype : Numpy data type.
+
+        buffer : CuPy array or CuPy memory object
+            If buffer is specified, used to fill the array. Otherwise, a new
+            memory space will be allocated to store data.
     '''
     if buffer is None:
         return cupy.empty(shape, dtype)
@@ -919,7 +1027,6 @@ def grouped_dot(As, Bs, Cs=None):
 
     stream = cupy.cuda.get_current_stream()
     err = libcupy_helper.grouped_dot(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(Cs_ptr.ctypes.data, ctypes.c_void_p),
         ctypes.cast(As_ptr.ctypes.data, ctypes.c_void_p),
         ctypes.cast(Bs_ptr.ctypes.data, ctypes.c_void_p),
@@ -927,7 +1034,8 @@ def grouped_dot(As, Bs, Cs=None):
         ctypes.cast(Ns.ctypes.data, ctypes.c_void_p),
         ctypes.cast(Ks.ctypes.data, ctypes.c_void_p),
         ctypes.cast(cutlass_space.data.ptr, ctypes.c_void_p),
-        ctypes.c_int(groups)
+        ctypes.c_int(groups),
+        ctypes.cast(stream.ptr, ctypes.c_void_p)
     )
     if err != 0:
         raise RuntimeError('failed in grouped_gemm kernel')
@@ -973,18 +1081,26 @@ def grouped_gemm(As, Bs, Cs=None):
 
     stream = cupy.cuda.get_current_stream()
     err = libcupy_helper.grouped_gemm(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(Cs_ptr.ctypes.data, ctypes.c_void_p),
         ctypes.cast(As_ptr.ctypes.data, ctypes.c_void_p),
         ctypes.cast(Bs_ptr.ctypes.data, ctypes.c_void_p),
         ctypes.cast(Ms.ctypes.data, ctypes.c_void_p),
         ctypes.cast(Ns.ctypes.data, ctypes.c_void_p),
         ctypes.cast(Ks.ctypes.data, ctypes.c_void_p),
-        ctypes.c_int(groups)
+        ctypes.c_int(groups),
+        ctypes.cast(stream.ptr, ctypes.c_void_p)
     )
     if err != 0:
         raise RuntimeError('failed in grouped_gemm kernel')
     return Cs
+
+def absmax(a):
+    '''abs(a).max() while limiting temporary memory use. The optimization is
+    only valid for real-valued arrays.
+    '''
+    if a.dtype == np.complex128 or a.nbytes < 100000000:
+        return abs(a).max()
+    return max(a.max(), -a.min())
 
 def condense(opname, a, loc_x, loc_y=None):
     '''Aggregate the last two dimensions of an array using the specified operation.
@@ -1042,12 +1158,13 @@ def condense(opname, a, loc_x, loc_y=None):
             code = 'val += a[ip*nj+jp];'
             result_code = 'val'
         elif opname == 'max':
-            init_code = '0'
-            code = 'double tmp = a[ip*nj+jp]; val = (val > tmp) ? val : tmp;'
+            # Seed nonempty extrema from data; zero biases all-negative maxima.
+            init_code = '(i0 < i1 && j0 < j1) ? a[i0*nj+j0] : 0'
+            code = 'double tmp = a[ip*nj+jp]; val = max(val, tmp);'
             result_code = 'val'
         elif opname == 'min':
-            init_code = '0'
-            code = 'double tmp = a[ip*nj+jp]; val = (val < tmp) ? val : tmp;'
+            init_code = '(i0 < i1 && j0 < j1) ? a[i0*nj+j0] : 0'
+            code = 'double tmp = a[ip*nj+jp]; val = min(val, tmp);'
             result_code = 'val'
         elif opname == 'abssum':
             init_code = '0'
@@ -1060,16 +1177,16 @@ def condense(opname, a, loc_x, loc_y=None):
         elif opname == 'norm':
             init_code = '0'
             code = 'double tmp = a[ip*nj+jp]; val += tmp * tmp;'
-            result_code = 'fsqrt(val)'
+            result_code = 'sqrt(val)'
 
-        kernel_code = (f'''\
+        kernel_code = ('''\
 extern "C" __global__
-void {fn_name}(double *out, double *a, int *loc_x, int *loc_y,
-               long long nloc_x, long long nloc_y, long long counts)'''
-'''
+void ''' + fn_name + '''(double *out, double *a, int *loc_x, int *loc_y,
+        long long nloc_x, long long nloc_y, long long counts)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int blocks_y = (nloc_y + 15) / 16;
+    int i = (blockIdx.x / blocks_y) * 16 + threadIdx.y;
+    int j = (blockIdx.x % blocks_y) * 16 + threadIdx.x;
     if (i >= nloc_x || j >= nloc_y) {
         return;
     }
@@ -1095,10 +1212,11 @@ void {fn_name}(double *out, double *a, int *loc_x, int *loc_y,
 
     kernel = _kernel_registery[fn_name]
     out = cupy.zeros((nloc_x, nloc_y))
-    blocks = ((nloc_y+15)//16, (nloc_x+15)//16)
+    blocks_x = (nloc_x + 15) // 16
+    blocks_y = (nloc_y + 15) // 16
+    blocks = (blocks_x * blocks_y,)
     threads = (16, 16)
     kernel(blocks, threads, (out, a, loc_x, loc_y, nloc_x, nloc_y, counts))
-    cupy.cuda.Stream.null.synchronize()
     if do_transpose:
         out = out.T
     return out
@@ -1122,7 +1240,9 @@ def sandwich_dot(a, c, out=None):
         out = out[0]
     return out
 
-def set_conditional_mempool_malloc(n_bytes_threshold=100000000):
+MEMPOOL_THRESHOLD = 100*1024*1024
+
+def set_conditional_mempool_malloc(n_bytes_threshold=MEMPOOL_THRESHOLD):
     '''
     Customize CuPy memory allocator.
 
@@ -1137,40 +1257,165 @@ def set_conditional_mempool_malloc(n_bytes_threshold=100000000):
     cuda_malloc = cupy.cuda.memory._malloc
     default_mempool_malloc = cupy.get_default_memory_pool().malloc
     def malloc(size):
-        if size >= n_bytes_threshold:
+        if size > n_bytes_threshold:
             return cuda_malloc(size)
         return default_mempool_malloc(size)
     cupy.cuda.set_allocator(malloc)
 
+def vec_dot(vec1, vec2):
+    '''
+    einsum('g,g->', vec1, vec2)
+    '''
+    vec1 = cupy.asarray(vec1)
+    vec2 = cupy.asarray(vec2)
+    assert vec1.dtype == vec2.dtype == cupy.float64
+    assert vec1.shape == vec2.shape
+    n = vec1.size
+
+    fn_name = 'vec_dot_kernel_order'
+    if fn_name not in _kernel_registery:
+        kernel_code = (r'''
+extern "C" __global__
+void ''' + fn_name + r'''(double *out, double *vec1, double *vec2, long long n) {
+    int tid = threadIdx.x;
+    int idx = blockDim.x * blockIdx.x + tid;
+    int stride = gridDim.x * blockDim.x;
+    double sum = 0;
+    for (long long g = idx; g < n; g += stride) {
+        sum += vec1[g] * vec2[g];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    int lane = tid % 32;
+    if (lane == 0) atomicAdd(out, sum);
+}''')
+        _kernel_registery[fn_name] = cupy.RawKernel(kernel_code, fn_name)
+
+    kernel = _kernel_registery[fn_name]
+    out = cupy.zeros(1)
+    workers = gpu_specs['multiProcessorCount']
+    kernel((workers*2,), (1024,), (out, vec1, vec2, n))
+    return out[0]
+
 def batched_vec3_norm2(batched_vec3):
-    assert type(batched_vec3) is cupy.ndarray
+    '''
+    einsum('gx,gx->g', vec3, vec3) for the (N,3)-array vec3
+    '''
+    assert isinstance(batched_vec3, cupy.ndarray)
     assert batched_vec3.dtype == cupy.float64
     assert batched_vec3.ndim == 2
-    assert batched_vec3.shape[1] == 3
+    assert batched_vec3.shape[0] == 3 or batched_vec3.shape[1] == 3
     assert batched_vec3.flags.c_contiguous
 
-    fn_name = "vec3_norm2_kernel"
+    order = "c" if batched_vec3.shape[1] == 3 else "f"
+
+    n = batched_vec3.shape[0] if order == "c" else batched_vec3.shape[1]
+    assert n != 3, "Ambiguous array order, cannot determine if the array is C or Fortran order from the shape"
+    assert n * 3 < np.iinfo(np.int32).max
+
+    if order == "c":
+        return batched_vec_norm2(batched_vec3)
+    else:
+        return batched_vec_norm2(batched_vec3.T)
+
+def batched_vec_norm2(vec, out=None):
+    '''
+    einsum('gx,gx->g', vec, vec)
+    '''
+    vec = cupy.asarray(vec)
+    assert vec.dtype == cupy.float64
+    assert vec.ndim == 2
+    n, x = vec.shape
+    c_order = vec.flags.c_contiguous
+
+    if c_order:
+        fn_name = f'vec{x}_norm2_kernel_c_order'
+    else:
+        assert vec.flags.f_contiguous
+        fn_name = f'vec{x}_norm2_kernel_f_order'
+
     if fn_name not in _kernel_registery:
-        kernel_code = r'''
-            extern "C" __global__
-            void vec3_norm2_kernel(const double* __restrict__ vec3, double* __restrict__ norm2, const int n) {
-                const int i = blockDim.x * blockIdx.x + threadIdx.x;
-                if (i >= n) return;
-                const double x = vec3[i * 3 + 0];
-                const double y = vec3[i * 3 + 1];
-                const double z = vec3[i * 3 + 2];
-                norm2[i] = x*x + y*y + z*z;
-            }
-        '''
+        if c_order:
+            loop = ('for (int j = 0; j < ' + str(x) + '; j++) {'
+                    'double s = vec[i*' + str(x) + '+j];'
+                    'val += s * s; }')
+        else:
+            loop = ('for (int j = 0; j < ' + str(x) + '; j++) {'
+                    'double s = vec[n*j+i];'
+                    'val += s * s; }')
+        kernel_code = (
+            r'''extern "C" __global__ void ''' +
+            fn_name + r'''(double* __restrict__ vec, double* __restrict__ norm2, long long n, long long m) {
+                size_t off = (size_t)blockIdx.x * m * blockDim.x;
+                for (int k = 0; k < m; k++) {
+                    size_t i = off + blockDim.x * k + threadIdx.x;
+                    if (i >= n) break;
+                    double val = 0;
+                    ''' + loop + '''
+                    norm2[i] = val;
+                }
+            }''')
         _kernel_registery[fn_name] = cupy.RawKernel(kernel_code, fn_name)
+
     kernel = _kernel_registery[fn_name]
+    out = ndarray(n, np.float64, out)
+    m = max(n // (2000 * 1024), 1)
+    kernel(((n + m*1024 - 1) // (m*1024),), (1024,), (vec, out, n, m))
+    return out
 
-    n = batched_vec3.shape[0]
-    assert n < np.iinfo(np.int32).max
-    batched_norm2 = cupy.zeros(n, dtype = cupy.float64)
-    kernel(((n + 1024 - 1) // 1024,), (1024,), (batched_vec3, batched_norm2, cupy.int32(n)))
+def batched_vec_dot(vec1, vec2, out=None):
+    '''
+    einsum('gx,gx->g', vec1, vec2)
+    '''
+    vec1 = cupy.asarray(vec1)
+    vec2 = cupy.asarray(vec2)
+    assert vec1.dtype == cupy.float64
+    assert vec2.dtype == cupy.float64
+    assert vec1.ndim == 2
+    assert vec1.shape == vec2.shape
+    n, x = vec1.shape
+    c_order = vec1.flags.c_contiguous
 
-    return batched_norm2
+    if c_order:
+        assert vec2.flags.c_contiguous
+        fn_name = f'vec{x}_dot_kernel_c_order'
+    else:
+        assert vec1.flags.f_contiguous
+        assert vec2.flags.f_contiguous
+        fn_name = f'vec{x}_dot_kernel_f_order'
+
+    if fn_name not in _kernel_registery:
+        if c_order:
+            loop = ('for (int j = 0; j < ' + str(x) + '; j++) {'
+                    'double s1 = vec1[i*' + str(x) + '+j];'
+                    'double s2 = vec2[i*' + str(x) + '+j];'
+                    'val += s1 * s2; }')
+        else:
+            loop = ('for (int j = 0; j < ' + str(x) + '; j++) {'
+                    'double s1 = vec1[n*j+i];'
+                    'double s2 = vec2[n*j+i];'
+                    'val += s1 * s2; }')
+        kernel_code = (
+            r'''extern "C" __global__ void ''' +
+            fn_name + r'''(double* __restrict__ vec1, double* __restrict__ vec2,
+                double* __restrict__ norm2, long long n, long long m) {
+                size_t off = (size_t)blockIdx.x * m * blockDim.x;
+                for (int k = 0; k < m; k++) {
+                    size_t i = off + blockDim.x * k + threadIdx.x;
+                    if (i >= n) break;
+                    double val = 0;
+                    ''' + loop + '''
+                    norm2[i] = val;
+                }
+            }''')
+        _kernel_registery[fn_name] = cupy.RawKernel(kernel_code, fn_name)
+
+    kernel = _kernel_registery[fn_name]
+    out = ndarray(n, np.float64, out)
+    m = max(n // (2000 * 1024), 1)
+    kernel(((n + m*1024 - 1) // (m*1024),), (1024,), (vec1, vec2, out, n, m))
+    return out
 
 cholesky = cusolver.cholesky
 
@@ -1181,19 +1426,69 @@ def eigh(a, b=None, overwrite=False):
 
     Note: both a and b matrices are overwritten when overwrite is specified.
     '''
+    if b is None:
+        if a.shape[0] > 32600:
+            if not SCIPY_EIGH_FOR_LARGE_ARRAYS:
+                raise RuntimeError('Array is too large for cupy eigh.')
+            a = a.get()
+            e, c = scipy.linalg.eigh(a, overwrite_a=True)
+            e = asarray(e)
+            c = asarray(c)
+            return e, c
+        return cupy.linalg.eigh(a)
+
     if a.shape[0] > cusolver.MAX_EIGH_DIM:
         if not SCIPY_EIGH_FOR_LARGE_ARRAYS:
             raise RuntimeError(
                 f'Array size exceeds the maximum size {cusolver.MAX_EIGH_DIM}.')
         a = a.get()
-        if b is not None:
-            b = b.get()
+        b = b.get()
         e, c = scipy.linalg.eigh(a, b, overwrite_a=True)
         e = asarray(e)
         c = asarray(c)
         return e, c
 
-    if b is not None:
-        return cusolver.eigh(a, b, overwrite)
+    return cusolver.eigh(a, b, overwrite)
 
-    return cupy.linalg.eigh(a)
+def stack_with_padding(arrays):
+    '''
+    Stack orbital coefficients, padding zeros to smaller arrays
+    '''
+    if not arrays:
+        raise ValueError("arrays must be a non-empty sequence")
+
+    max_nmo = max(a.shape[1] for a in arrays)
+    nao = arrays[0].shape[0]
+    dtype = np.result_type(*arrays)
+    out = cupy.empty((len(arrays), nao, max_nmo), dtype=dtype)
+
+    for k, a in enumerate(arrays):
+        nmo = a.shape[1]
+        out[k,:,:nmo] = a
+        if nmo < max_nmo:
+            out[k,:,nmo:] = 0
+    return out
+
+def empty_aligned(shape, dtype, alignment=128):
+    '''
+    Allocate an array with a memory alignment.
+
+    Args:
+        shape : tuple or int
+            Shape of the array to allocate.
+
+    Kwargs:
+        dtype : Numpy data type.
+
+        alignment : int
+            Byte alignment for the underlying device memory pointer.
+            128 bytes is optimal for coalesced global memory access on most CUDA
+            architectures.
+
+    '''
+    dtype = np.dtype(dtype)
+    size = int(np.prod(shape))
+    nbytes = size * dtype.itemsize + alignment
+    buf = cupy.empty(nbytes, dtype=np.uint8)
+    offset = (alignment - buf.data.ptr % alignment) % alignment
+    return ndarray(shape, dtype, buf[offset:])

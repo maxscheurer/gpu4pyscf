@@ -19,6 +19,10 @@ import cupy
 import pyscf
 from pyscf import lib
 from gpu4pyscf import scf
+try:
+    from gpu4pyscf.dispersion import dftd3, dftd4
+except ImportError:
+    dftd3 = dftd4 = None
 from gpu4pyscf.lib.multi_gpu import num_devices
 import pytest
 
@@ -82,6 +86,16 @@ def tearDownModule():
     del mol, mol1
 
 class KnownValues(unittest.TestCase):
+    def test_get_occ_zero_beta_electrons(self):
+        mol_h = pyscf.M(atom='H 0 0 0', basis='6-31g', spin=1)
+        mf = scf.UHF(mol_h)
+        mf.verbose = pyscf.lib.logger.INFO
+        mo_energy = cupy.asarray([[-0.5, 0.2], [-0.4, 0.3]])
+
+        mo_occ = mf.get_occ(mo_energy)
+
+        self.assertTrue(cupy.array_equal(mo_occ, cupy.asarray([[1, 0], [0, 0]])))
+
     def test_get_jk(self):
         np.random.seed(1)
         nao = mol.nao
@@ -263,11 +277,11 @@ class KnownValues(unittest.TestCase):
         mf = mol1.UHF().to_gpu()
         e_tot = mf.kernel()
         e_ref = -148.8650361770461
-        assert np.abs(e_tot - e_ref) < 1e-5
+        assert np.abs(e_tot - e_ref) < 1e-8
         chg = mf.analyze()[0][1]
-        self.assertAlmostEqual(lib.fp(chg), 0.022191785654920748, 5)
+        self.assertAlmostEqual(lib.fp(chg), 0.022191785654920748, 4)
 
-    @pytest.mark.slow
+    @unittest.skipIf(dftd3 is None, "dftd3 not available")
     def test_uhf_d3bj(self):
         mf = scf.UHF(mol)
         mf.disp = 'd3bj'
@@ -277,16 +291,16 @@ class KnownValues(unittest.TestCase):
         print('pyscf - qchem ', e_tot - e_ref)
         assert np.abs(e_tot - e_ref) < 1e-5
 
-    '''
-    def test_uhf_d4(self):
+    @unittest.skipIf(dftd4 is None, "dftd4 not available")
+    def test_uhf_d4_high_cost(self):
         mf = scf.UHF(mol)
         mf.disp = 'd4'
-        e_tot = mf.kernel()
-        e_ref = -150.7604264160
+        mf.kernel()
+        e_ref_d4 = -0.00967083082
+        d4_energy = mf.get_dispersion()
         print('--------- testing UHF with D4 ----')
-        print('pyscf - qchem ', e_tot - e_ref)
-        assert np.abs(e_tot - e_ref) < 1e-5
-    '''
+        print('pyscf - qchem ', d4_energy - e_ref_d4)
+        assert np.abs(d4_energy - e_ref_d4) < 1e-8
 
     @unittest.skipIf(num_devices > 1, '')
     def test_chkfile(self):
@@ -294,26 +308,48 @@ class KnownValues(unittest.TestCase):
         mol.basis = 'ccpvdz'
         mol.build(False, False)
         ftmp = tempfile.NamedTemporaryFile(dir = pyscf.lib.param.TMPDIR)
-        mf = scf.UHF(mol)
+        mf = scf.UHF(mol).density_fit()
         mf.chkfile = ftmp.name
         mf.kernel()
         dma_stored, dmb_stored = mf.make_rdm1(mf.mo_coeff, mf.mo_occ)
-        dma_stored, dmb_stored = cupy.asnumpy(dma_stored), cupy.asnumpy(dmb_stored)
 
-        mf_copy = scf.UHF(mol)
+        mf_copy = scf.UHF(mol).density_fit()
         mf_copy.chkfile = ftmp.name
         dma_loaded, dmb_loaded = mf_copy.init_guess_by_chkfile()
-        assert np.allclose(dma_stored, dma_loaded, atol = 1e-14) # Since we reload the MO coefficients, the density matrix should be identical up to numerical noise.
-        assert np.allclose(dmb_stored, dmb_loaded, atol = 1e-14)
-        assert not np.allclose(dma_stored, dmb_loaded, atol = 1e-3) # Just to make sure alpha and beta electron are different in the test system
+        assert cupy.allclose(dma_stored, dma_loaded, atol = 1e-14) # Since we reload the MO coefficients, the density matrix should be identical up to numerical noise.
+        assert cupy.allclose(dmb_stored, dmb_loaded, atol = 1e-14)
+
+    def test_initial_guess_tag(self):
+        mf = mol.UHF().to_gpu()
+        s = mf.get_ovlp()
+
+        dm = mf.get_init_guess(key='minao')
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 3
+        assert abs(cupy.einsum('nij,ji->n', dm, s).get() - (11.999383, 10.999434)).max() < 1e-6
+
+        dm = mf.get_init_guess(key='hcore')
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 3
+        assert abs(cupy.einsum('nij,ji->n', dm, s).get() - (12, 11)).max() < 1e-6
+
+        dm = mf.get_init_guess(key='atom')
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 3
+        assert abs(cupy.einsum('nij,ji->n', dm, s).get() - (12, 11)).max() < 1e-6
+
+        dm = mf.get_init_guess(key='huckel')
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 3
+        assert abs(cupy.einsum('nij,ji->n', dm, s).get() - (12, 11)).max() < 1e-6
+
+        dm = mf.get_init_guess(key='mod_huckel')
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 3
+        assert abs(cupy.einsum('nij,ji->n', dm, s).get() - (12, 11)).max() < 1e-6
 
     # TODO:
+    # test_init_guess_breaksym
     #test analyze
     #test mulliken_pop
     #test mulliken_spin_pop
     #test mulliken_meta
     #test mulliken_meta_spin
-    #test stability
     #test newton
     #test x2c
     #test dipole

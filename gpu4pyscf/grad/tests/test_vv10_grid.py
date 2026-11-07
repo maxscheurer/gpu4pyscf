@@ -16,6 +16,7 @@ import numpy as np
 import unittest
 import pytest
 import pyscf
+from pyscf import lib
 from gpu4pyscf.dft import rks, uks
 from gpu4pyscf.grad.rks import _get_denlc
 from gpu4pyscf.lib.multi_gpu import num_devices
@@ -292,7 +293,20 @@ class KnownValues(unittest.TestCase):
 
         assert np.linalg.norm(test_gradient - reference_gradient) < 2e-6
 
-    def test_wb97xv_densityfit_dense_grid_without_response(self):
+    def test_wb97xv_densityfit(self):
+        mol = pyscf.M(atom='H 0 0 0; H .2 .1 .8', basis='sto3g', verbose=0)
+        mf = mol.RKS(xc='wb97x-v').density_fit().to_gpu()
+        mf.grids.level = 1
+        mf.nlcgrids.level = 0
+        mf.run(conv_tol=1e-12)
+        assert mf.converged
+        grad = mf.Gradients()
+        grad.grid_response = False
+        g = grad.kernel()
+        assert abs(lib.fp(g[0]) - 0.006972389657848941) < 1e-7
+        assert abs(g.sum()) < 1e-9
+
+    def test_wb97xv_densityfit_dense_grid_without_response_high_cost(self):
         mf = make_mf(mol, nlc_atom_grid_dense, density_fit = True)
         grad_obj = mf.Gradients()
         assert grad_obj.grid_response is False
@@ -489,6 +503,55 @@ class KnownValues(unittest.TestCase):
         gpu_gradient = gpu_grad_obj.kernel()
 
         assert np.linalg.norm(gpu_gradient - cpu_gradient) < 1e-7
+
+    def test_grid_response_gradient_ghost_atom_far_away(self):
+        mol = pyscf.M(
+            atom = """
+                O      0.000000    0.000000    0.000000
+                H      0.957200    0.000000    0.000000
+                H     -0.239987    0.927297    0.000000
+                ghost:O      22.000000    0.000000    0.000000
+                ghost:H      22.957200    0.000000    0.000000
+                ghost:O      2.000000    0.000000    0.000000
+                ghost:H      2.957200    0.000000    0.000000
+                ghost:H      1.760013    0.927297    0.000000
+                ghost:O      2.000000    20.000000    0.000000
+                ghost:H      2.957200    20.000000    0.000000
+            """,
+            basis = "sto-6g",
+            verbose = 0,
+        )
+
+        from gpu4pyscf.dft import rks as gpu_rks
+        mf = gpu_rks.RKS(mol, xc = "wb97mv").density_fit(auxbasis = "def2-universal-jkfit")
+        mf.grids.atom_grid = (50,194)
+        mf.nlcgrids.atom_grid = (49,110)
+        mf.conv_tol = 1e-12
+
+        test_energy = mf.kernel()
+        assert mf.converged
+
+        gobj = mf.Gradients()
+        gobj.grid_response = True
+        test_gradient = gobj.kernel()
+
+        # Reference come from removing the ghost atom far away
+        ref_energy = -76.02665256617135
+        ref_gradient = np.array([
+            [ 0.0557732315405932,  0.0737014727900909,  0.0000000000000011],
+            [-0.0637777885905613, -0.0102100391760461, -0.0000000000000007],
+            [ 0.0028399377889354, -0.0637134405199884, -0.0000000000000008],
+            [ 0, 0, 0 ],
+            [ 0, 0, 0 ],
+            [ 0.0014909325052633, -0.0000120529615038,  0.0000000000000009],
+            [ 0.0000273273841539,  0.0000089786373412, -0.0000000000000002],
+            [ 0.0036463593716917,  0.0002250812302098, -0.0000000000000003],
+            [ 0, 0, 0 ],
+            [ 0, 0, 0 ],
+        ])
+
+        assert np.abs(test_energy - ref_energy) < 1e-9
+        assert np.linalg.norm(test_gradient - ref_gradient) < 1e-7
 
 if __name__ == "__main__":
     print("Full Tests for vv10 gradient, including grid response")

@@ -17,13 +17,17 @@ import unittest
 import ctypes
 import numpy as np
 import cupy as cp
+from pyscf import lib
 from pyscf.pbc import gto as pgto
 from pyscf.pbc.df import ft_ao as ft_ao_cpu
+from pyscf.pbc.lib.kpts_helper import kk_adapted_iter
 from gpu4pyscf.pbc.tools.k2gamma import kpts_to_kmesh
 from gpu4pyscf.pbc.df import ft_ao as ft_ao_gpu
 from gpu4pyscf.pbc.df.ft_ao import ft_aopair, ft_aopair_kpts
 from gpu4pyscf.pbc.lib.kpts_helper import conj_images_in_bvk_cell
 from gpu4pyscf.pbc.df.ft_ao import libpbc
+from gpu4pyscf.pbc.df.aft import AFTDF
+from gpu4pyscf.pbc.tools import get_coulG
 
 def setUpModule():
     global cell
@@ -78,6 +82,11 @@ class KnownValues(unittest.TestCase):
         Gv = cell.get_Gv([7,3,3])
         dat = ft_aopair_kpts(cell, Gv, kptjs=kpts).get()
         ref = ft_ao_cpu.ft_aopair_kpts(cell, Gv, kptjs=kpts)
+        self.assertAlmostEqual(abs(ref-dat).max(), 0, 9)
+
+        q = kpts[11]
+        dat = ft_aopair_kpts(cell, Gv, q=q, kptjs=kpts).get()
+        ref = ft_ao_cpu.ft_aopair_kpts(cell, Gv, q=q, kptjs=kpts)
         self.assertAlmostEqual(abs(ref-dat).max(), 0, 9)
 
         Gv = cell.get_Gv([7]*3)[-257:]
@@ -159,6 +168,136 @@ class KnownValues(unittest.TestCase):
         ref = ft_ao_cpu.ft_ao(pcell, Gv)
         self.assertAlmostEqual(abs(ref-dat).max(), 0, 9)
 
+    def test_contract_dm(self):
+        nao = cell.nao
+        cp.random.seed(10)
+        dm = cp.random.rand(nao,nao)
+        dm = dm.dot(dm.T)
+        Gv = cell.get_Gv(mesh=[9,11,3])
+        ft_opt = ft_ao_gpu.FTOpt(cell).build()
+        rhoG = ft_opt.contract_dm(ft_opt.cell.apply_C_mat_CT(dm), Gv).get()
+
+        ref = cp.einsum('Gpq,qp->G', ft_aopair(cell, Gv), dm).get()
+        self.assertAlmostEqual(abs(ref-rhoG).max(), 0, 10)
+
+    def test_j(self):
+        cp.random.seed(10)
+        nao = cell.nao
+        dm = cp.random.rand(nao, nao)
+        dm = dm + dm.T
+        mesh = [9,11,3]
+        Gv = cell.get_Gv(mesh=mesh)
+        ft_opt = ft_ao_gpu.FTOpt(cell).build()
+        rhoG = ft_opt.contract_dm(ft_opt.cell.apply_C_mat_CT(dm), Gv)
+        coulG = rhoG * cp.array(get_coulG(cell, Gv=Gv)) / cell.vol
+        vj = ft_opt.contract_rhoG(coulG, -Gv, sort_output=True)
+
+        mydf  = AFTDF(cell).set(mesh=mesh)
+        jref = mydf.get_jk(dm, with_k=False)[0]
+        assert abs(vj - jref).max().get() < 1e-9
+
+    @unittest.skip('FTOpt.contract_dm with kpts not supported')
+    def test_j_kpts(self):
+        cp.random.seed(10)
+        kmesh = [3,2,1]
+        kpts = cell.make_kpts(kmesh)
+        nk = len(kpts)
+        nao = cell.nao
+        dm = cp.random.rand(nk, nao, nao)
+        dm = dm + dm.transpose(0, 2, 1)
+        mesh = [9,11,3]
+        Gv = cell.get_Gv(mesh=mesh)
+        ft_opt = ft_ao_gpu.FTOpt(cell)
+        rhoG = ft_opt.contract_dm(ft_opt.cell.apply_C_mat_CT(dm), Gv, kpts=kpts)
+        coulG = rhoG * cp.array(get_coulG(cell, Gv=Gv)) / cell.vol
+        vj = ft_opt.contract_rhoG(coulG, -Gv, kpts=kpts, sort_output=True)
+
+        mydf  = AFTDF(cell).set(mesh=mesh)
+        jref = mydf.get_jk(dm, kpts=kpts, with_k=False)[0]
+        assert abs(vj - jref).max().get() < 1e-9
+
+    def test_gen_ft_kernel(self):
+        kmesh = [2, 3, 2]
+        kpts = cell.make_kpts(kmesh)
+        kpt_iters = list(kk_adapted_iter(cell, kpts))
+
+        opt = ft_ao_gpu.FTOpt(cell, kmesh)
+        ft_kern = opt.gen_ft_kernel()
+
+        Gv = cell.get_Gv([3,2,5])
+        for kpt, ki_idx, kj_idx, self_conj in kpt_iters:
+            dat = ft_kern(Gv, kpt, kpts, kj_idx)
+            dat_conj = ft_kern(-Gv, -kpt, -kpts, kj_idx)
+            self.assertAlmostEqual(abs(dat_conj-dat.conj()).max().get(), 0, 9)
+
+            ref = ft_ao_cpu.ft_aopair_kpts(cell, Gv, q=kpt, kptjs=kpts)
+            self.assertAlmostEqual(abs(ref-dat.get()).max(), 0, 9)
+
+    def test_ft_ao_strain_deriv(self):
+        from gpu4pyscf.gto.mole import SortedGTO
+        from gpu4pyscf.pbc.grad.rhf import _finite_diff_cells
+        cell = pgto.M(
+            verbose=5, output='/dev/null',
+            atom='''N1   .19   .1      1.4
+                    N2   .5   2.4      .7 ''',
+            basis={'N1': [[3, [.5, 1.]], [6, [2., 1.]]], 'N2': 'ccpvdz'},
+            a=np.diag([2.5, 3.9, 2.2]),
+            unit='B',
+            precision=1e-8)
+
+        ft_opt = ft_ao_gpu.FTOpt(cell).build()
+        nao = ft_opt.cell.nao
+        cp.random.seed(6)
+        dm = cp.random.rand(nao, nao) * .4
+        dm = dm + dm.T
+        mesh = [5, 5, 5]
+        Gv = cell.get_Gv(mesh)
+        GvT = cp.asarray(Gv.T, order='C')
+        auxG = ft_ao_gpu.ft_ao(ft_opt.cell, Gv, sort_output=False).T
+        dm_auxG = dm.dot(auxG)
+        grad = cp.zeros((2, 3))
+        sigma = cp.zeros((3, 3))
+        aux_ft_envs = ft_ao_gpu.RysIntEnvVars.new(
+            ft_opt.cell.natm, ft_opt.cell.nbas, ft_opt.cell._atm,
+            ft_opt.cell._bas, ft_ao_gpu._scale_sp_ctr_coeff(ft_opt.cell),
+            ft_opt.cell.ao_loc)
+        err = libpbc.PBC_ft_ao_deriv(
+            ctypes.cast(grad.data.ptr, ctypes.c_void_p),
+            ctypes.cast(sigma.data.ptr, ctypes.c_void_p),
+            lib.c_null_ptr(),
+            ctypes.cast(dm_auxG.data.ptr, ctypes.c_void_p),
+            ctypes.cast(GvT.data.ptr, ctypes.c_void_p),
+            ctypes.byref(aux_ft_envs),
+            ctypes.c_int(len(Gv)),
+            ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
+        assert err == 0
+
+        grad = grad.get()
+        sigma = sigma.get()
+        assert abs(grad.sum(axis=0)).max() < 1e-10
+
+        disp = 1e-5
+        def eval_aux(c):
+            Gv = c.get_Gv(mesh)
+            auxG = ft_ao_gpu.ft_ao(SortedGTO.from_cell(c), Gv, sort_output=False).T
+            return cp.einsum('ag,ag->', auxG.conj(), dm_auxG).real.get()
+
+        for (i, j) in [(0, 0), (0, 1), (0, 2), (1, 1), (2, 0), (2, 2)]:
+            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=disp)
+            e1 = eval_aux(cell1)
+            e2 = eval_aux(cell2)
+            assert abs(sigma[i, j] - (e1-e2)/2/disp) < 3e-8
+
+        coords = cell.atom_coords()
+        for i in range(cell.natm):
+            for j in range(3):
+                coords[i,j] += disp
+                e1 = eval_aux(cell.set_geom_(coords, inplace=False))
+                coords[i,j] -= 2*disp
+                e2 = eval_aux(cell.set_geom_(coords, inplace=False))
+                coords[i,j] += disp
+                assert abs(grad[i, j] - (e1-e2)/2/disp) < 3e-8
+
 if __name__ == '__main__':
-    print('Full Tests for ft_ao_cpu')
+    print('Full Tests for ft_ao')
     unittest.main()

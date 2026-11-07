@@ -18,26 +18,10 @@ import numpy as np
 from pyscf import gto, lib
 from gpu4pyscf.dft import rks
 import gpu4pyscf.tdscf.ris as ris
+from gpu4pyscf.grad.tests.test_tdrhf_grad import diagonalize
 
 PLACES = 3
 
-
-def diagonalize(a, b, nroots=5):
-    nocc, nvir = a.shape[:2]
-    nov = nocc * nvir
-    a = a.reshape(nov, nov)
-    b = b.reshape(nov, nov)
-    h = np.block([[a        , b       ],
-                     [-b.conj(),-a.conj()]])
-    e, xy = np.linalg.eig(np.asarray(h))
-    sorted_indices = np.argsort(e)
-    
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-    
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
 
 class KnownValues(unittest.TestCase):
     @classmethod
@@ -196,6 +180,60 @@ class KnownValues(unittest.TestCase):
         e_ab = diagonalize(a, b, self.nstates)[0]*27.21138602
 
         self.assertAlmostEqual(abs(e_ab-np.array(energies)).max(),0, 2) # TODO: change to PLACES
+
+    def test_tda_scanner(self):
+        mol = gto.M(
+            verbose = 0,
+            atom = '''
+              H  0.2  0.   .8
+              F  0.   0.2  0.''',
+            basis = '631g')
+        mf = mol.RKS(xc='pbe0').to_gpu().density_fit().run(conv_tol=1e-10)
+        td = ris.TDA(mf)
+        td.conv_tol = 1e-6
+        td.single = False
+        td.nstates = 5
+        ref = td.kernel()[0]
+        td_scan = td.as_scanner()
+        td_scan.max_iter = 1
+        td_scan(mol)
+        self.assertAlmostEqual(abs(td_scan.energies - ref).max(), 0, delta=.2e-5)
+
+    def test_td_pbe0_scanner(self):
+        mol = gto.M(
+            verbose = 0,
+            atom = '''
+              H  0.2  0.   .8
+              F  0.   0.2  0.''',
+            basis = '631g')
+        mf = mol.RKS(xc='pbe0').to_gpu().density_fit().run(conv_tol=1e-10)
+        td = ris.TDDFT(mf)
+        td.conv_tol = 1e-6
+        td.single = False
+        td.nstates = 5
+        ref = td.kernel()[0]
+        td_scan = td.as_scanner()
+        td_scan.max_iter = 1
+        td_scan(mol)
+        self.assertAlmostEqual(abs(td_scan.energies - ref).max(), 0, delta=.2e-5)
+
+    def test_td_pbe_scanner(self):
+        mol = gto.M(
+            verbose = 0,
+            atom = '''
+              H  0.2  0.   .8
+              F  0.   0.2  0.''',
+            basis = '631g')
+        mf = mol.RKS(xc='pbe').to_gpu().density_fit().run(conv_tol=1e-10)
+        td = ris.TDA(mf)
+        td.conv_tol = 1e-6
+        td.single = False
+        td.nstates = 5
+        ref = td.kernel()[0]
+        td_scan = td.as_scanner()
+        td_scan.max_iter = 1
+        td_scan(mol)
+        self.assertAlmostEqual(abs(td_scan.energies - ref).max(), 0, delta=.2e-5)
 
 
 if __name__ == "__main__":

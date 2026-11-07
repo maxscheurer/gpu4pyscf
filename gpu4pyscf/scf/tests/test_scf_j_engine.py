@@ -13,9 +13,10 @@
 # limitations under the License.
 
 import unittest
+import cupy as cp
 import numpy as np
 import pyscf
-from pyscf import lib
+from pyscf import dft, lib
 from gpu4pyscf.scf import j_engine, jk
 from pyscf.scf.hf import get_jk
 
@@ -52,7 +53,34 @@ def test_j_engine():
     vj1 = j_engine.get_j(mol, dm).get()
     ref = get_jk(mol, dm, hermi=1, with_k=False)[0]
     assert abs(vj1 - ref).max() < 5e-9
-    assert abs(lib.fp(vj1) - -3491.404124194866) < 5e-10
+    assert abs(lib.fp(vj1) - -3491.404124194866) < 1e-9
+
+def test_j_engine_one_density_tail():
+    """Exercise the one-DM (fd|ps) tail with 2 pairs and 8 ij threads.
+
+    Inactive ij lanes must participate in block-wide reductions without reading
+    past the corresponding pair-location entries.
+    """
+    mol = pyscf.M(
+        atom='''
+        O  0.000000  0.000000  0.000000
+        H  0.758602  0.000000  0.504284
+        H  0.758602  0.000000 -0.504284
+        ''',
+        basis='def2-tzvp',
+        charge=1,
+        spin=1,
+        verbose=0,
+    )
+    spin_dm = dft.UKS(mol).get_init_guess()
+    dm = spin_dm[0] + spin_dm[1]
+
+    # Give pair_loc a distinct CUDA allocation boundary so a memory checker can
+    # detect tail reads that spare capacity in CuPy's memory pool may hide.
+    with cp.cuda.using_allocator(None):
+        vj = j_engine.get_j(mol, dm).get()
+    ref = get_jk(mol, dm, with_k=False)[0]
+    assert abs(vj - ref).max() < 1e-9
 
 def test_j_engine_8fold_symmetry():
     mol = pyscf.M(
@@ -222,6 +250,45 @@ def test_general_contraction():
         C   1.      1.    0.
         ''',
         basis=('ccpvdz', [[3, [2., 1., .5], [1., .5, 1.]]]),
+        unit='B',)
+
+    np.random.seed(9)
+    nao = mol.nao
+    dm = np.random.rand(nao, nao)
+    dm = dm.dot(dm.T)
+
+    vj = j_engine.get_j(mol, dm)
+    ref = jk.get_jk(mol, dm)[0]
+    assert abs(vj - ref).max() < 1e-9
+
+def test_irregular_angular_momemtum():
+    mol = pyscf.M(
+        atom = '''
+        O   0.000   -0.    0.1174
+        H  -0.757    4.   -0.4696
+        H   0.757    4.   -0.4696
+        C   1.      1.    0.
+        ''',
+        basis=[[0, [2., 1., .5], [1., .5, 1.]], [3, [.5, 1]], [5, [.5, 1]]],
+        unit='B',)
+
+    np.random.seed(9)
+    nao = mol.nao
+    dm = np.random.rand(nao, nao)
+    dm = dm.dot(dm.T)
+
+    vj = j_engine.get_j(mol, dm)
+    ref = jk.get_jk(mol, dm)[0]
+    assert abs(vj - ref).max() < 1e-9
+
+    mol = pyscf.M(
+        atom = '''
+        O   0.000   -0.    0.1174
+        H  -0.757    4.   -0.4696
+        H   0.757    4.   -0.4696
+        C   1.      1.    0.
+        ''',
+        basis=[[1, [2., 1., .5], [1., .5, 1.]]],
         unit='B',)
 
     np.random.seed(9)

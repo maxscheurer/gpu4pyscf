@@ -19,6 +19,8 @@ import pytest
 from pyscf import scf, dft, tdscf
 import gpu4pyscf
 from gpu4pyscf import scf as gpu_scf
+from gpu4pyscf.grad.tests.test_tdrhf_grad import diagonalize, diagonalize_tda
+
 
 atom = """
 O       0.0000000000     0.0000000000     0.0000000000
@@ -27,39 +29,6 @@ H       0.0000000000     0.7570000000     0.5870000000
 """
 
 bas0 = "def2svpd"
-
-
-def diagonalize(a, b, nroots=5):
-    nocc, nvir = a.shape[:2]
-    nov = nocc * nvir
-    a = a.reshape(nov, nov)
-    b = b.reshape(nov, nov)
-    h = np.block([[a        , b       ],
-                     [-b.conj(),-a.conj()]])
-    e, xy = np.linalg.eig(np.asarray(h))
-    sorted_indices = np.argsort(e)
-    
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-    
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
-
-
-def diagonalize_tda(a, nroots=5):
-    nocc, nvir = a.shape[:2]
-    nov = nocc * nvir
-    a = a.reshape(nov, nov)
-    e, xy = np.linalg.eig(np.asarray(a))
-    sorted_indices = np.argsort(e)
-    
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-    
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
 
 
 def cal_analytic_gradient(mol, td, tdgrad, nocc, nvir, grad_elec, tda):
@@ -222,6 +191,33 @@ class KnownValues(unittest.TestCase):
 
     # def test_grad_tpss_tdhf_singlet_numerical(self):
     #     _check_grad(mol, tol=1e-4, xc="tpss", tda=False, method="numerical")
+
+    def test_grad_b3lyp_tda_ris_zvector_solver(self):
+        mf = dft.RKS(mol).density_fit().to_gpu()
+        mf.xc = "b3lyp"
+        mf.run()
+
+        td = mf.TDA()
+        td.kernel()
+
+        g = td.nuc_grad_method()
+        g.ris_zvector_solver=True
+        g.kernel()
+
+        ref = np.array([
+            [-0.0000000000,  0.0000000000,  0.0839721135],
+            [ 0.0000000000,  0.0553443688, -0.0419902424],
+            [ 0.0000000000, -0.0553443688, -0.0419902424],
+        ])
+
+        g1 = td.nuc_grad_method()
+        g1.ris_zvector_solver=False
+        g1.kernel()
+
+        print(g.de - g1.de)
+
+        assert np.abs(g1.de - g.de).max() < 1e-2
+        assert np.abs(g.de - ref).max() < 2e-6
 
 
 if __name__ == "__main__":

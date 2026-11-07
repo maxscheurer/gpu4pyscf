@@ -90,21 +90,20 @@ def energy_elec(mf, dm=None, h1e=None, vhf=None):
     """
     if dm is None: dm = mf.make_rdm1()
     if h1e is None: h1e = mf.get_hcore()
-    if vhf is None: vhf = mf.get_veff(mf.mol, dm)
-    e1 = cp.einsum('ij,nji->', h1e, dm).get()[()].real
+    if vhf is None or getattr(vhf, 'ecoul', None) is None:
+        vhf = mf.get_veff(mf.mol, dm)
+    e1 = float(cp.einsum('ij,nji->', h1e, dm).real.get())
     ecoul = vhf.ecoul.real
     exc = vhf.exc.real
     E_U = vhf.E_U
-    if isinstance(ecoul, cp.ndarray):
-        ecoul = ecoul.get()[()]
-    if isinstance(exc, cp.ndarray):
-        exc = exc.get()[()]
     e2 = ecoul + exc + E_U
     mf.scf_summary['e1'] = e1
+    mf.scf_summary['e2'] = e2
     mf.scf_summary['coul'] = ecoul
     mf.scf_summary['exc'] = exc
     mf.scf_summary['E_U'] = E_U
-    logger.debug(mf, 'E1 = %s  Ecoul = %s  Exc = %s  EU = %s', e1, ecoul, exc, E_U)
+    logger.debug(mf, 'E1 = %s  E2 = %s  Ecoul = %s  Exc = %s  EU = %s',
+                 e1, e2, ecoul, exc, E_U)
     return e1+e2, e2
 
 class UKSpU(uks.UKS):
@@ -220,7 +219,7 @@ def linear_response_u(mf_plus_u, alphalist=(0.02, 0.05, 0.08)):
 
         # The first iteration of SCF
         fock = mf.get_fock(dm=bare_dm)
-        e, mo = mf.eig(fock, ovlp)
+        e, mo = mf.eig(cp.ascontiguousarray(fock), cp.ascontiguousarray(ovlp))
         local_occ = 0
         for c in C_inv:
             C_on_site = [c.dot(mo[0]), c.dot(mo[1])]

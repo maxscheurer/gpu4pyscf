@@ -22,25 +22,26 @@ import numpy
 import cupy
 import cupy as cp
 import numpy as np
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from pyscf.hessian import rhf as rhf_hess_cpu
 from pyscf import lib, gto
 from pyscf.gto import ATOM_OF
 from gpu4pyscf.gto.ecp import get_ecp_ip, get_ecp_ipip
 from gpu4pyscf.scf import cphf, j_engine
-from gpu4pyscf.lib.cupy_helper import (reduce_to_device,
-    contract, tag_array, transpose_sum, get_avail_mem, condense,
-    krylov)
+from gpu4pyscf.lib.cupy_helper import (
+    contract, tag_array, transpose_sum, get_avail_mem, condense, krylov)
 from gpu4pyscf.__config__ import props as gpu_specs
 from gpu4pyscf.__config__ import num_devices
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib import multi_gpu
 from gpu4pyscf.lib import utils
+from gpu4pyscf import scf
 from gpu4pyscf.scf.jk import (
     LMAX, QUEUE_DEPTH, SHM_SIZE, THREADS, GROUP_SIZE, libvhf_rys, _VHFOpt,
-    _make_tril_tile_mappings, _make_tril_pair_mappings, _nearest_power2)
+    _nearest_power2, _cache_q_cond_and_non0pairs, _check_rsh_factors,
+    _TimingCollector)
 from gpu4pyscf.grad import rhf as rhf_grad
+from . import dispersion
+from gpu4pyscf.gto.mole import extract_pgto_params, SortedMole
 
 libvhf_rys.RYS_per_atom_jk_ip2_type12.restype = ctypes.c_int
 libvhf_rys.RYS_per_atom_jk_ip2_type3.restype = ctypes.c_int
@@ -50,14 +51,12 @@ GB = 1024*1024*1024
 ALIGNED = 4
 DD_CACHE_MAX = rhf_grad.DD_CACHE_MAX
 
-libvhf_rys.RYS_build_vjk_ip1_init(ctypes.c_int(SHM_SIZE))
-libvhf_rys.RYS_build_ejk_ip2_init(ctypes.c_int(SHM_SIZE))
-
 def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
               mo1=None, mo_e1=None, h1mo=None,
               atmlst=None, max_memory=4000, verbose=None):
     ''' Different from PySF, using h1mo instead of h1ao for saving memory
     '''
+    from gpu4pyscf.pbc.gto import int1e
     log = logger.new_logger(hessobj, verbose)
     time0 = t1 = log.init_timer()
     mol = hessobj.mol
@@ -74,7 +73,7 @@ def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     mo_coeff = cupy.asarray(mo_coeff)
     de2 = hessobj.partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst,
                                     max_memory, log)
-    t1 = log.timer_debug1('hess elec', *t1)
+    t1 = log.timer_debug1('partial hess elec', *t1)
     if h1mo is None:
         h1mo = hessobj.make_h1(mo_coeff, mo_occ, None, atmlst, log)
         if h1mo.size * 8 * 5 > get_avail_mem():
@@ -95,8 +94,7 @@ def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     nao = mo_coeff.shape[0]
     mocc = mo_coeff[:,mo_occ>0]
     mocc_e = mocc * mo_energy[mo_occ>0]
-    s1a = -mol.intor('int1e_ipovlp', comp=3)
-    s1a = cupy.asarray(s1a)
+    s1a = -int1e.int1e_ipovlp(mol)
 
     aoslices = mol.aoslice_by_atom()
     for i0, (p0, p1) in enumerate(aoslices[:,2:]):
@@ -143,37 +141,125 @@ def _partial_hess_ejk(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
 
     # Energy weighted density matrix
     dme0 = (mocc * mo_energy[mo_occ>0]).dot(mocc.T) * 2
-    de_hcore = _e_hcore_generator(hessobj, dm0)
-    s1aa, s1ab, s1a = get_ovlp(mol)
-
-    aoslices = mol.aoslice_by_atom()
-    e1 = cupy.zeros((mol.natm,mol.natm,3,3))
-    for i0, ia in enumerate(atmlst):
-        p0, p1 = aoslices[ia][2:]
-        e1[i0,i0] -= contract('xypq,pq->xy', s1aa[:,:,p0:p1], dme0[p0:p1])*2
-
-        for j0, ja in enumerate(atmlst[:i0+1]):
-            q0, q1 = aoslices[ja][2:]
-            # *2 for +c.c.
-            e1[i0,j0] -= contract('xypq,pq->xy', s1ab[:,:,p0:p1,q0:q1], dme0[p0:p1,q0:q1])*2
-            e1[i0,j0] += de_hcore(ia, ja)
-        
-        for j0 in range(i0):
-            e1[j0,i0] = e1[i0,j0].T
-
+    de_hcore = _hcore_energy(hessobj, dm0, dme0)
     log.timer('RHF partial hessian', *time0)
-    return e1, ejk
+    return de_hcore, ejk
 
-def _partial_ejk_ip2(mol, dm, vhfopt=None, j_factor=1., k_factor=1., verbose=None):
+def _hcore_energy(hessobj, dm0, dme0):
+    mol = hessobj.mol
+    if mol._pseudo:
+        raise NotImplementedError("Pseudopotential hessian not supported for molecular system yet")
+
+    de_hcore = _hess_nuc_without_ecp(mol, dm0)
+    with_ecp = len(mol._ecpbas) > 0
+    if with_ecp:
+        de_hcore += hess_nuc_elec_ecp(mol, dm0).transpose(2,3,0,1) * 2.
+
+    h1aa = cp.asarray(mol.intor('int1e_ipipkin', comp=9))
+    h1ab = cp.asarray(mol.intor('int1e_ipkinip', comp=9))
+    if with_ecp:
+        h1aa += get_ecp_ipip(mol, 'ipipv').sum(axis=0)
+        h1ab += get_ecp_ipip(mol, 'ipvip').sum(axis=0)
+    nao = h1ab.shape[1]
+    h1aa = contract('xypq,qp->pxy', h1aa.reshape(3, 3, nao, nao), dm0)
+    h1ab = contract('xypq,qp->pqxy', h1ab.reshape(3, 3, nao, nao), dm0)
+
+    s1aa, s1ab, _ = get_ovlp(mol)
+    s1aa = contract('xypq,qp->pxy', s1aa.reshape(3, 3, nao, nao), dme0)
+    s1ab = contract('xypq,qp->pqxy', s1ab.reshape(3, 3, nao, nao), dme0)
+
+    natm = mol.natm
+    ao_loc = mol.ao_loc
+    atm_labels = np.repeat(mol._bas[:,ATOM_OF], ao_loc[1:]-ao_loc[:-1])
+    de = _aggregate_to_atoms(h1ab-s1ab, natm, atm_labels, axis=(0,1))
+
+    de_diag = cp.zeros((natm, 3, 3))
+    cp.add.at(de_diag, atm_labels, h1aa-s1aa)
+    de[np.diag_indices(natm)] += de_diag
+    de_hcore += de + de.transpose(1,0,3,2)
+    return de_hcore
+
+def _aggregate_to_atoms(a, natm, atom_labels, axis):
+    if axis == 0:
+        shape = list(a.shape)
+        shape[0] = natm
+        indices = atom_labels
+    elif axis == 1:
+        shape = list(a.shape)
+        shape[1] = natm
+        indices = (slice(None), atom_labels)
+    elif axis == (0, 1):
+        shape = [natm if i in axis else n for i, n in enumerate(a.shape)]
+        indices = (atom_labels[:,None], atom_labels)
+    else:
+        raise NotImplementedError
+    out = cp.zeros(shape)
+    cp.add.at(out, indices, a)
+    return out
+
+def _hess_nuc_without_ecp(mol, dm0):
+    from gpu4pyscf.df.int3c2e_bdiv import Int3c2eOpt
+    from gpu4pyscf.df.hessian.rhf import int3c2e_scheme_ip2, get_ao_pair_loc
+    natm = mol.natm
+    coords = mol.atom_coords()
+    charges = cp.asarray(-mol.atom_charges(), dtype=np.float64)
+    fakemol = gto.fakemol_for_charges(coords)
+
+    sorted_mol = SortedMole.from_mol(mol, decontract=True)
+    int3c2e_opt = Int3c2eOpt(sorted_mol, fakemol).build()
+    dm = sorted_mol.apply_C_mat_CT(dm0)
+
+    omega, lr_factor, sr_factor = 0., 1., 1.
+
+    nsp_per_block, gout_stride, shm_size = int3c2e_scheme_ip2()
+    gout_stride = cp.asarray(gout_stride, dtype=np.int32)
+    lmax = sorted_mol.uniq_l_ctr[:,0].max()
+    shm_size_max = shm_size[0,:lmax+1,:lmax+1].max()
+    bas_ij_idx, shl_pair_offsets = sorted_mol.aggregate_shl_pairs(
+        int3c2e_opt.bas_ij_cache, nsp_per_block[0]*4)
+    ao_pair_loc = get_ao_pair_loc(sorted_mol.uniq_l_ctr[:,0], int3c2e_opt.bas_ij_cache)
+    auxmol = int3c2e_opt.auxmol
+    ksh_offsets_cpu = np.append(0, np.cumsum(auxmol.l_ctr_counts))
+    ksh_offsets_gpu = cp.asarray(ksh_offsets_cpu+sorted_mol.nbas, dtype=np.int32)
+
+    int3c2e_envs = int3c2e_opt.int3c2e_envs
+    de = cp.zeros((natm, natm, 3, 3))
+    err = libvhf_rys.ejk_int3c2e_ip2(
+        ctypes.cast(de.data.ptr, ctypes.c_void_p),
+        ctypes.cast(dm.data.ptr, ctypes.c_void_p),
+        ctypes.cast(charges.data.ptr, ctypes.c_void_p),
+        ctypes.c_double(omega),
+        ctypes.c_double(lr_factor),
+        ctypes.c_double(sr_factor),
+        ctypes.byref(int3c2e_envs),
+        ctypes.c_int(shm_size_max),
+        ctypes.c_int(len(shl_pair_offsets) - 1),
+        ctypes.c_int(len(ksh_offsets_gpu) - 1),
+        ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
+        ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
+        ctypes.cast(ksh_offsets_gpu.data.ptr, ctypes.c_void_p),
+        ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
+        ctypes.cast(ao_pair_loc.data.ptr, ctypes.c_void_p),
+        ctypes.c_int(0),
+        ctypes.c_int(natm),
+        ctypes.c_void_p(cupy.cuda.get_current_stream().ptr))
+    if err != 0:
+        raise RuntimeError('ejk_int3c2e_ip2 failed')
+    de = de + de.transpose(1,0,3,2)
+    de *= 2
+    return de
+
+def _partial_ejk_ip2(mol, dm, vhfopt=None, j_factor=1., k_factor=1.,
+                     omega=None, lr_factor=None, sr_factor=None,
+                     verbose=None):
     '''Compute the energy per atom for
         j_factor * J_derivatives - k_factor * K_derivatives
     '''
+    assert lr_factor is None and sr_factor is None
     log = logger.new_logger(mol, verbose)
     cput0 = log.init_timer()
     if vhfopt is None:
-        vhfopt = _VHFOpt(mol, tile=1).build()
-    assert vhfopt.tile == 1
-
+        vhfopt = _VHFOpt(mol).build()
     mol = vhfopt.sorted_mol
     nao_orig = vhfopt.mol.nao
 
@@ -185,130 +271,138 @@ def _partial_ejk_ip2(mol, dm, vhfopt=None, j_factor=1., k_factor=1., verbose=Non
     n_dm, nao = dms.shape[:2]
     assert n_dm <= 2
 
+    omega, lr_factor, sr_factor = _check_rsh_factors(mol, omega, lr_factor, sr_factor)
+
     ao_loc = mol.ao_loc
-    uniq_l_ctr = vhfopt.uniq_l_ctr
+    uniq_l_ctr = mol.uniq_l_ctr
     uniq_l = uniq_l_ctr[:,0]
-    l_ctr_bas_loc = vhfopt.l_ctr_offsets
+    l_ctr_bas_loc = np.append(0, np.cumsum(mol.l_ctr_counts))
     l_symb = [lib.param.ANGULAR[i] for i in uniq_l]
     assert uniq_l.max() <= LMAX
 
+    log_cutoff = math.log(vhfopt.direct_scf_tol)
+    dm_penalty = 0
+    diffuse_exps, diffuse_ctr_coef = extract_pgto_params(mol, 'diffuse')
+
     n_groups = len(uniq_l_ctr)
-    tasks = ((i, j, k, l)
-             for i in range(n_groups)
-             for j in range(i+1)
-             for k in range(i+1)
-             for l in range(k+1))
+    # Materialize task metadata before sharing the iterator across workers.
+    tasks = iter([(i, j, k, l)
+                  for i in range(n_groups)
+                  for j in range(i+1)
+                  for k in range(i+1)
+                  for l in range(k+1)])
 
     def proc():
         device_id = cp.cuda.device.get_device_id()
         log = logger.new_logger(mol, verbose)
         cput0 = log.init_timer()
 
-        timing_counter = Counter()
+        timing_collection = _TimingCollector(log.timer_debug1)
         kern_counts = 0
         kern1 = libvhf_rys.RYS_per_atom_jk_ip2_type12
         kern2 = libvhf_rys.RYS_per_atom_jk_ip2_type3
 
         _dms = cp.asarray(dms, order='C')
-        s_ptr = lib.c_null_ptr()
-        if mol.omega < 0:
-            s_ptr = ctypes.cast(vhfopt.s_estimator.data.ptr, ctypes.c_void_p)
-
         natm = mol.natm
         ejk = cp.zeros((natm, natm, 3, 3))
 
         dm_cond = cp.log(condense('absmax', _dms, ao_loc) + 1e-300).astype(np.float32)
-        q_cond = cp.asarray(vhfopt.q_cond)
-        log_max_dm = float(dm_cond.max())
-        log_cutoff = math.log(vhfopt.direct_scf_tol)
-        pair_mappings = _make_tril_pair_mappings(
-            l_ctr_bas_loc, q_cond, log_cutoff-log_max_dm, tile=6)
+        _diffuse_exps = cp.asarray(diffuse_exps, dtype=np.float32)
+        bas_pair_cache = {k: [cp.asarray(x) for x in v]
+                          for k, v in vhfopt.bas_pair_cache.items()}
+
         rys_envs = vhfopt.rys_envs
         workers = gpu_specs['multiProcessorCount']
         pool = cp.empty(workers*QUEUE_DEPTH+1, dtype=np.int32)
         dd_pool = cp.empty((workers, DD_CACHE_MAX), dtype=np.float64)
         t1 = log.timer_debug1(f'q_cond and dm_cond on Device {device_id}', *cput0)
 
+        stream = cupy.cuda.get_current_stream()
         for i, j, k, l in tasks:
             shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1, k, k+1, l, l+1]]
             llll = f'({l_symb[i]}{l_symb[j]}|{l_symb[k]}{l_symb[l]})'
-            pair_ij_mapping = pair_mappings[i,j]
-            pair_kl_mapping = pair_mappings[k,l]
+            pair_ij_mapping, q_cond_ij, s_cond_ij = bas_pair_cache[i,j]
+            pair_kl_mapping, q_cond_kl, s_cond_kl = bas_pair_cache[k,l]
             npairs_ij = pair_ij_mapping.size
             npairs_kl = pair_kl_mapping.size
             if npairs_ij == 0 or npairs_kl == 0:
                 continue
             scheme1 = _ip2_quartets_scheme(mol, uniq_l_ctr[[i, j, k, l]])
             scheme3 = _ip2_type3_quartets_scheme(mol, uniq_l_ctr[[i, j, k, l]])
-            for pair_kl0, pair_kl1 in lib.prange(0, npairs_kl, QUEUE_DEPTH):
-                _pair_kl_mapping = pair_kl_mapping[pair_kl0:]
-                _npairs_kl = pair_kl1 - pair_kl0
+            blksize = QUEUE_DEPTH - 512
+            for b0, b1 in lib.prange(0, npairs_kl, blksize):
                 err1 = kern1(
                     ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
                     ctypes.c_double(j_factor), ctypes.c_double(k_factor),
                     ctypes.cast(_dms.data.ptr, ctypes.c_void_p),
                     ctypes.c_int(n_dm), ctypes.c_int(nao),
+                    ctypes.c_double(omega),
+                    ctypes.c_double(lr_factor),
+                    ctypes.c_double(sr_factor),
                     rys_envs, (ctypes.c_int*2)(*scheme1),
                     (ctypes.c_int*8)(*shls_slice),
-                    ctypes.c_int(npairs_ij), ctypes.c_int(_npairs_kl),
+                    ctypes.c_int(npairs_ij), ctypes.c_int(b1-b0),
                     ctypes.cast(pair_ij_mapping.data.ptr, ctypes.c_void_p),
-                    ctypes.cast(_pair_kl_mapping.data.ptr, ctypes.c_void_p),
-                    ctypes.cast(q_cond.data.ptr, ctypes.c_void_p),
-                    s_ptr,
+                    ctypes.cast(pair_kl_mapping[b0:].data.ptr, ctypes.c_void_p),
+                    ctypes.cast(q_cond_ij.data.ptr, ctypes.c_void_p),
+                    ctypes.cast(q_cond_kl[b0:].data.ptr, ctypes.c_void_p),
+                    ctypes.cast(s_cond_ij.data.ptr, ctypes.c_void_p),
+                    ctypes.cast(s_cond_kl[b0:].data.ptr, ctypes.c_void_p),
+                    ctypes.cast(_diffuse_exps.data.ptr, ctypes.c_void_p),
                     ctypes.cast(dm_cond.data.ptr, ctypes.c_void_p),
                     ctypes.c_float(log_cutoff),
+                    ctypes.c_float(dm_penalty),
                     ctypes.cast(pool.data.ptr, ctypes.c_void_p),
                     ctypes.cast(dd_pool.data.ptr, ctypes.c_void_p),
                     mol._atm.ctypes, ctypes.c_int(mol.natm),
-                    mol._bas.ctypes, ctypes.c_int(mol.nbas), mol._env.ctypes)
+                    mol._bas.ctypes, ctypes.c_int(mol.nbas), mol._env.ctypes,
+                    ctypes.c_void_p(stream.ptr))
 
                 err2 = kern2(
                     ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
                     ctypes.c_double(j_factor), ctypes.c_double(k_factor),
                     ctypes.cast(_dms.data.ptr, ctypes.c_void_p),
                     ctypes.c_int(n_dm), ctypes.c_int(nao),
+                    ctypes.c_double(omega),
+                    ctypes.c_double(lr_factor),
+                    ctypes.c_double(sr_factor),
                     rys_envs, (ctypes.c_int*2)(*scheme3),
                     (ctypes.c_int*8)(*shls_slice),
-                    ctypes.c_int(npairs_ij), ctypes.c_int(_npairs_kl),
+                    ctypes.c_int(npairs_ij), ctypes.c_int(b1-b0),
                     ctypes.cast(pair_ij_mapping.data.ptr, ctypes.c_void_p),
-                    ctypes.cast(_pair_kl_mapping.data.ptr, ctypes.c_void_p),
-                    ctypes.cast(q_cond.data.ptr, ctypes.c_void_p),
-                    s_ptr,
+                    ctypes.cast(pair_kl_mapping[b0:].data.ptr, ctypes.c_void_p),
+                    ctypes.cast(q_cond_ij.data.ptr, ctypes.c_void_p),
+                    ctypes.cast(q_cond_kl[b0:].data.ptr, ctypes.c_void_p),
+                    ctypes.cast(s_cond_ij.data.ptr, ctypes.c_void_p),
+                    ctypes.cast(s_cond_kl[b0:].data.ptr, ctypes.c_void_p),
+                    ctypes.cast(_diffuse_exps.data.ptr, ctypes.c_void_p),
                     ctypes.cast(dm_cond.data.ptr, ctypes.c_void_p),
                     ctypes.c_float(log_cutoff),
+                    ctypes.c_float(dm_penalty),
                     ctypes.cast(pool.data.ptr, ctypes.c_void_p),
                     ctypes.cast(dd_pool.data.ptr, ctypes.c_void_p),
                     mol._atm.ctypes, ctypes.c_int(mol.natm),
-                    mol._bas.ctypes, ctypes.c_int(mol.nbas), mol._env.ctypes)
+                    mol._bas.ctypes, ctypes.c_int(mol.nbas), mol._env.ctypes,
+                    ctypes.c_void_p(stream.ptr))
 
                 if err1 != 0 or err2 != 0:
                     raise RuntimeError(f'RYS_per_atom_jk_ip2 kernel for {llll} failed')
+                kern_counts += 2
             if log.verbose >= logger.DEBUG1:
                 ntasks = npairs_ij * npairs_kl
                 msg = f'processing {llll} on Device {device_id} tasks ~= {ntasks}'
-                t1, t1p = log.timer_debug1(msg, *t1), t1
-                timing_counter[llll] += t1[1] - t1p[1]
-                kern_counts += 1
+                t1 = timing_collection.collect(llll, t1, msg)
 
         ejk = ejk + ejk.transpose(1,0,3,2)
-        return ejk, kern_counts, timing_counter
+        return ejk, kern_counts, timing_collection
 
     results = multi_gpu.run(proc, non_blocking=True)
 
-    kern_counts = 0
-    timing_collection = Counter()
-    ejk_dist = []
-    for ejk, counts, counter in results:
-        kern_counts += counts
-        timing_collection += counter
-        ejk_dist.append(ejk)
-
     if log.verbose >= logger.DEBUG1:
-        log.debug1('kernel launches %d', kern_counts)
-        for llll, t in timing_collection.items():
-            log.debug1('%s wall time %.2f', llll, t)
+        log.debug1('kernel launches %d', sum(x[1] for x in results))
+        _TimingCollector.summary(log.debug1, (x[2] for x in results))
 
-    ejk = reduce_to_device(ejk_dist, inplace=True)
+    ejk = multi_gpu.array_reduce([x[0] for x in results], inplace=True)
 
     log.timer_debug1('ejk_ip2', *cput0)
     return ejk
@@ -321,7 +415,7 @@ def _ip2_quartets_scheme(mol, l_ctr_pattern, shm_size=SHM_SIZE):
     nps = l_ctr_pattern[:,1]
     ij_prims = nps[0] * nps[1]
     nroots = (order + 2) // 2 + 1
-    unit = nroots*2 + g_size*3 + 8
+    unit = nroots*2 + g_size*3 + 6
     if mol.omega < 0: # SR
         unit += nroots * 2
     counts = (shm_size - ij_prims*8) // (unit*8)
@@ -337,7 +431,7 @@ def _ip2_type3_quartets_scheme(mol, l_ctr_pattern, shm_size=SHM_SIZE):
     nps = l_ctr_pattern[:,1]
     ij_prims = nps[0] * nps[1]
     nroots = (order + 2) // 2 + 1
-    unit = nroots*2 + g_size*3 + 8
+    unit = nroots*2 + g_size*3 + 6
     if mol.omega < 0: # SR
         unit += nroots * 2
     counts = (shm_size - ij_prims*8) // (unit*8)
@@ -377,7 +471,8 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
         vj = vk = vhf = None
     return h1mo
 
-def _get_jk_ip1(mol, dm, with_j=True, with_k=True, atoms_slice=None, verbose=None):
+def _get_jk_ip1(mol, dm, with_j=True, with_k=True, atoms_slice=None,
+                omega=None, lr_factor=None, sr_factor=None, verbose=None):
     r'''
     For each atom, compute
     J = ((\nabla_X i) j| kl) (D_lk + D_ji)
@@ -386,17 +481,18 @@ def _get_jk_ip1(mol, dm, with_j=True, with_k=True, atoms_slice=None, verbose=Non
     assert mol.omega >= 0
     log = logger.new_logger(mol, verbose)
     cput0 = log.init_timer()
-    vhfopt = _VHFOpt(mol, tile=1).build()
+    vhfopt = _VHFOpt(mol).build()
 
     mol = vhfopt.sorted_mol
-    nao_orig = vhfopt.mol.nao
-
     dm = cp.asarray(dm, order='C')
+    nao_orig = dm.shape[-1]
     dms = dm.reshape(-1,nao_orig,nao_orig)
     #:dms = cp.einsum('pi,nij,qj->npq', vhfopt.coeff, dms, vhfopt.coeff)
     dms = vhfopt.apply_coeff_C_mat_CT(dms)
     n_dm, nao = dms.shape[:2]
     assert n_dm == 1
+
+    omega, lr_factor, sr_factor = _check_rsh_factors(mol, omega, lr_factor, sr_factor)
 
     natm = mol.natm
     if atoms_slice is None:
@@ -404,24 +500,33 @@ def _get_jk_ip1(mol, dm, with_j=True, with_k=True, atoms_slice=None, verbose=Non
     atom0, atom1 = atoms_slice
 
     ao_loc = mol.ao_loc
-    uniq_l_ctr = vhfopt.uniq_l_ctr
+    uniq_l_ctr = mol.uniq_l_ctr
     uniq_l = uniq_l_ctr[:,0]
-    l_ctr_bas_loc = vhfopt.l_ctr_offsets
+    l_ctr_bas_loc = np.append(0, np.cumsum(mol.l_ctr_counts))
     l_symb = [lib.param.ANGULAR[i] for i in uniq_l]
     assert uniq_l.max() <= LMAX
 
+    log_cutoff = math.log(vhfopt.direct_scf_tol)
+    diffuse_exps, diffuse_ctr_coef = extract_pgto_params(mol, 'diffuse')
+
+    bas_ij_cache = _cache_q_cond_and_non0pairs(
+        mol, vhfopt.rys_envs, vhfopt.direct_scf_tol, 6, tril=False)
+    bas_ij_cache = _make_pair_mappings_for_atoms_slice(
+        mol, bas_ij_cache, atoms_slice)
+
     n_groups = len(uniq_l_ctr)
-    tasks = ((i, j, k, l)
-             for i in range(n_groups)
-             for j in range(n_groups)
-             for k in range(n_groups)
-             for l in range(k+1))
+    # Materialize task metadata before sharing the iterator across workers.
+    tasks = iter([(i, j, k, l)
+                  for i in range(n_groups)
+                  for j in range(n_groups)
+                  for k in range(n_groups)
+                  for l in range(k+1)])
 
     def proc():
         device_id = cp.cuda.device.get_device_id()
         log = logger.new_logger(mol, verbose)
         cput0 = log.init_timer()
-        timing_counter = Counter()
+        timing_collection = _TimingCollector(log.timer_debug1)
         kern_counts = 0
         kern = libvhf_rys.RYS_build_jk_ip1
 
@@ -438,14 +543,12 @@ def _get_jk_ip1(mol, dm, with_j=True, with_k=True, atoms_slice=None, verbose=Non
             vj_ptr = ctypes.cast(vj.data.ptr, ctypes.c_void_p)
 
         dm_cond = cp.log(condense('absmax', _dms, ao_loc) + 1e-300).astype(np.float32)
-        q_cond = cp.asarray(vhfopt.q_cond)
-        log_max_dm = float(dm_cond.max())
-        log_cutoff = math.log(vhfopt.direct_scf_tol)
-        cutoff = log_cutoff - log_max_dm
-        pair_kl_mappings = _make_tril_pair_mappings(
-            l_ctr_bas_loc, q_cond, cutoff, tile=6)
-        pair_ij_mappings = _make_pair_mappings_for_atoms_slice(
-            mol, l_ctr_bas_loc, q_cond, cutoff, atoms_slice, tile=6)
+        dm_penalty = float(dm_cond.max())
+        _diffuse_exps = cp.asarray(diffuse_exps, dtype=np.float32)
+        bas_kl_cache = {k: [cp.asarray(x) for x in v]
+                        for k, v in vhfopt.bas_pair_cache.items()}
+        _bas_ij_cache = {k: [cp.asarray(x) for x in v]
+                         for k, v in bas_ij_cache.items()}
 
         rys_envs = vhfopt.rys_envs
         workers = gpu_specs['multiProcessorCount']
@@ -454,67 +557,59 @@ def _get_jk_ip1(mol, dm, with_j=True, with_k=True, atoms_slice=None, verbose=Non
 
         for i, j, k, l in tasks:
             shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1, k, k+1, l, l+1]]
-            llll = f'({l_symb[i]}{l_symb[j]}|{l_symb[k]}{l_symb[l]})'
-            pair_ij_mapping = pair_ij_mappings[i,j]
-            pair_kl_mapping = pair_kl_mappings[k,l]
+            pair_ij_mapping, q_cond_ij, s_cond_ij = _bas_ij_cache[i,j]
+            pair_kl_mapping, q_cond_kl, s_cond_kl = bas_kl_cache[k,l]
             npairs_ij = pair_ij_mapping.size
             npairs_kl = pair_kl_mapping.size
             if npairs_ij == 0 or npairs_kl == 0:
                 continue
-
+            llll = f'({l_symb[i]}{l_symb[j]}|{l_symb[k]}{l_symb[l]})'
             scheme = _ip1_quartets_scheme(mol, uniq_l_ctr[[i, j, k, l]])
-            for pair_kl0, pair_kl1 in lib.prange(0, npairs_kl, QUEUE_DEPTH):
-                _pair_kl_mapping = pair_kl_mapping[pair_kl0:]
-                _npairs_kl = pair_kl1 - pair_kl0
-                err = kern(
-                    vj_ptr, vk_ptr, ctypes.cast(_dms.data.ptr, ctypes.c_void_p),
-                    ctypes.c_int(n_dm), ctypes.c_int(nao), ctypes.c_int(atom0),
-                    rys_envs, (ctypes.c_int*2)(*scheme),
-                    (ctypes.c_int*8)(*shls_slice),
-                    ctypes.c_int(npairs_ij), ctypes.c_int(_npairs_kl),
-                    ctypes.cast(pair_ij_mapping.data.ptr, ctypes.c_void_p),
-                    ctypes.cast(_pair_kl_mapping.data.ptr, ctypes.c_void_p),
-                    ctypes.cast(q_cond.data.ptr, ctypes.c_void_p),
-                    lib.c_null_ptr(),
-                    ctypes.cast(dm_cond.data.ptr, ctypes.c_void_p),
-                    ctypes.c_float(log_cutoff),
-                    ctypes.cast(pool.data.ptr, ctypes.c_void_p),
-                    mol._atm.ctypes, ctypes.c_int(mol.natm),
-                    mol._bas.ctypes, ctypes.c_int(mol.nbas), mol._env.ctypes)
-                if err != 0:
-                    raise RuntimeError(f'RYS_build_jk kernel for {llll} failed')
+            err = kern(
+                vj_ptr, vk_ptr, ctypes.cast(_dms.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(n_dm), ctypes.c_int(nao), ctypes.c_int(atom0),
+                ctypes.c_double(omega),
+                ctypes.c_double(lr_factor),
+                ctypes.c_double(sr_factor),
+                rys_envs, (ctypes.c_int*2)(*scheme),
+                (ctypes.c_int*8)(*shls_slice),
+                ctypes.c_int(npairs_ij), ctypes.c_int(npairs_kl),
+                ctypes.cast(pair_ij_mapping.data.ptr, ctypes.c_void_p),
+                ctypes.cast(pair_kl_mapping.data.ptr, ctypes.c_void_p),
+                ctypes.cast(q_cond_ij.data.ptr, ctypes.c_void_p),
+                ctypes.cast(q_cond_kl.data.ptr, ctypes.c_void_p),
+                ctypes.cast(s_cond_ij.data.ptr, ctypes.c_void_p),
+                ctypes.cast(s_cond_kl.data.ptr, ctypes.c_void_p),
+                ctypes.cast(_diffuse_exps.data.ptr, ctypes.c_void_p),
+                ctypes.cast(dm_cond.data.ptr, ctypes.c_void_p),
+                ctypes.c_float(log_cutoff),
+                ctypes.c_float(dm_penalty),
+                ctypes.cast(pool.data.ptr, ctypes.c_void_p),
+                mol._bas.ctypes, mol._env.ctypes,
+                ctypes.c_void_p(cupy.cuda.get_current_stream().ptr))
+            if err != 0:
+                raise RuntimeError(f'RYS_build_jk kernel for {llll} failed')
+            kern_counts += 1
             if log.verbose >= logger.DEBUG1:
                 ntasks = npairs_ij * npairs_kl
                 msg = f'processing {llll} on Device {device_id} tasks ~= {ntasks}'
-                t1, t1p = log.timer_debug1(msg, *t1), t1
-                timing_counter[llll] += t1[1] - t1p[1]
-                kern_counts += 1
-        return vj, vk, kern_counts, timing_counter
+                t1 = timing_collection.collect(llll, t1, msg)
+        return vj, vk, kern_counts, timing_collection
 
     results = multi_gpu.run(proc, non_blocking=True)
 
-    kern_counts = 0
-    timing_collection = Counter()
-    vj_dist = []
-    vk_dist = []
-    for vj, vk, counts, counter in results:
-        kern_counts += counts
-        timing_collection += counter
-        vj_dist.append(vj)
-        vk_dist.append(vk)
-
     if log.verbose >= logger.DEBUG1:
-        log.debug1('kernel launches %d', kern_counts)
-        for llll, t in timing_collection.items():
-            log.debug1('%s wall time %.2f', llll, t)
+        log.debug1('kernel launches %d', sum(x[2] for x in results))
+        _TimingCollector.summary(log.debug1, (x[3] for x in results))
 
+    vj = vk = None
     if with_k:
-        vk = reduce_to_device(vk_dist, inplace=True)
+        vk = multi_gpu.array_reduce([x[1] for x in results], inplace=True)
         vk = vhfopt.apply_coeff_CT_mat_C(vk)
         vk = transpose_sum(vk)
         vk = vk.reshape(atom1-atom0, 3, nao_orig, nao_orig)
     if with_j:
-        vj = reduce_to_device(vj_dist, inplace=True)
+        vj = multi_gpu.array_reduce([x[0] for x in results], inplace=True)
         vj = vhfopt.apply_coeff_CT_mat_C(vj)
         vj = transpose_sum(vj)
         vj *= 2.
@@ -536,7 +631,7 @@ def _ip1_quartets_scheme(mol, l_ctr_pattern, shm_size=SHM_SIZE):
     ij_prims = nps[0] * nps[1]
     nroots = (order + 1) // 2 + 1
 
-    unit = nroots*2 + g_size*3 + 9
+    unit = nroots*2 + g_size*3 + 6
     counts = (shm_size - ij_prims * 8) // (unit*8)
     n = min(THREADS, _nearest_power2(counts))
     gout_stride = THREADS // n
@@ -546,58 +641,25 @@ def _ip1_quartets_scheme(mol, l_ctr_pattern, shm_size=SHM_SIZE):
         gout_stride *= 2
     return n, gout_stride
 
-def _make_pair_mappings_for_atoms_slice(mol, l_ctr_bas_loc, q_cond, cutoff,
-                                        atoms_slice, tile=4):
-    nbas = q_cond.shape[0]
+def _make_pair_mappings_for_atoms_slice(mol, bas_pair_cache, atoms_slice):
+    nbas = mol.nbas
     atom0, atom1 = atoms_slice
-    mask = q_cond > cutoff
-    mask[(mol._bas[:,ATOM_OF] <  atom0) |
-         (mol._bas[:,ATOM_OF] >= atom1)] = False
-    mask = mask.ravel()
-    n_groups = len(l_ctr_bas_loc) - 1
-    pair_mappings = {}
-    tile = 6
-    for i in range(n_groups):
-        for j in range(n_groups):
-            ish0, ish1 = l_ctr_bas_loc[i], l_ctr_bas_loc[i+1]
-            jsh0, jsh1 = l_ctr_bas_loc[j], l_ctr_bas_loc[j+1]
-            nish = ish1 - ish0
-            njsh = jsh1 - jsh0
-            ntiles_i = (nish+tile-1) // tile
-            ntiles_j = (njsh+tile-1) // tile
-            pair_ij = (cp.arange(ish0, ish0+ntiles_i*tile, dtype=np.int32)[:,None] * nbas +
-                       cp.arange(jsh0, jsh0+ntiles_j*tile, dtype=np.int32))
-            pair_ij = pair_ij.reshape(ntiles_i,tile,ntiles_j,tile).transpose(0,2,1,3)
-            ish = cp.arange(ish0, ish0+ntiles_i*tile, dtype=np.int32).reshape(ntiles_i,tile)
-            jsh = cp.arange(jsh0, jsh0+ntiles_j*tile, dtype=np.int32).reshape(ntiles_j,tile)
-            ish = ish[:,None,:,None]
-            jsh = jsh[None,:,None,:]
-            pair_ij = pair_ij[(ish < ish1) & (jsh < jsh1)]
-            pair_ij = pair_ij[mask[pair_ij]]
-            pair_mappings[i,j] = cp.asarray(pair_ij, dtype=np.int32)
-    return pair_mappings
-
-def get_hcore(mol):
-    '''Part of the second derivatives of core Hamiltonian'''
-    h1aa = mol.intor('int1e_ipipkin', comp=9)
-    h1ab = mol.intor('int1e_ipkinip', comp=9)
-    if mol._pseudo:
-        NotImplementedError('Nuclear hessian for GTH PP')
-    else:
-        h1aa+= mol.intor('int1e_ipipnuc', comp=9)
-        h1ab+= mol.intor('int1e_ipnucip', comp=9)
-    h1aa = cupy.asarray(h1aa)
-    h1ab = cupy.asarray(h1ab)
-    if len(mol._ecpbas) > 0:
-        #h1aa += mol.intor('ECPscalar_ipipnuc', comp=9)
-        #h1ab += mol.intor('ECPscalar_ipnucip', comp=9)
-        h1aa += get_ecp_ipip(mol, 'ipipv').sum(axis=0)
-        h1ab += get_ecp_ipip(mol, 'ipvip').sum(axis=0)
-    nao = h1aa.shape[-1]
-    return h1aa.reshape(3,3,nao,nao), h1ab.reshape(3,3,nao,nao)
+    atom_id = cp.array(mol._bas[:,ATOM_OF])
+    out = {}
+    for k, (pair, q_cond, s_cond) in bas_pair_cache.items():
+        pair = cp.asarray(pair)
+        q_cond = cp.asarray(q_cond)
+        s_cond = cp.asarray(s_cond)
+        ish = pair // nbas
+        i_atom = atom_id[ish]
+        mask = (i_atom >= atom0) & (i_atom < atom1)
+        idx = cp.where(mask)[0]
+        out[k] = pair[idx], q_cond[idx], s_cond[idx]
+    return out
 
 def get_ovlp(mol):
-    s1a =-mol.intor('int1e_ipovlp', comp=3)
+    from gpu4pyscf.pbc.gto import int1e
+    s1a = -int1e.int1e_ipovlp(mol)
     nao = s1a.shape[-1]
     s1aa = mol.intor('int1e_ipipovlp', comp=9).reshape(3,3,nao,nao)
     s1ab = mol.intor('int1e_ipovlpip', comp=9).reshape(3,3,nao,nao)
@@ -618,6 +680,7 @@ def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1mo,
             A function to generate the induced potential.
             See also the function gen_vind.
     '''
+    from gpu4pyscf.pbc.gto import int1e
     mol = mf.mol
     log = logger.new_logger(mf, verbose)
     t0 = log.init_timer()
@@ -648,14 +711,13 @@ def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1mo,
         v[:,occidx,:] = 0
         return v.reshape(-1,nmo*nocc)
 
-    ipovlp = -mol.intor('int1e_ipovlp', comp=3)
-    ipovlp = cp.asarray(ipovlp)
+    ipovlp = -int1e.int1e_ipovlp(mol)
     cp.get_default_memory_pool().free_all_blocks()
 
     avail_mem = get_avail_mem()
     # *4 for input dm, vj, vk, and vxc
-    blksize = int(min(avail_mem*.3 / (8*3*nao*nocc*4), # in MO
-                      avail_mem*.3 / (8*nao*nao*3*3))) # vj, vk, dm in AO
+    blksize = int(min(avail_mem*.5 / (8*3*(nao*nocc*3+nao*nao)), # in MO
+                      avail_mem*.5 / (8*nao*nao*3*3))) # vj, vk, dm in AO
     if blksize < ALIGNED**2:
         raise RuntimeError('GPU memory insufficient for solving CPHF equations')
 
@@ -669,9 +731,7 @@ def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1mo,
     for i0, i1 in lib.prange(0, natm, blksize):
         log.info('Solving CPHF equation for atoms [%d:%d]', i0, i1)
 
-        h1mo_blk = h1mo[i0:i1]
-        if not isinstance(h1mo, cp.ndarray):
-            h1mo_blk = cp.asarray(h1mo_blk)
+        h1mo_blk = cp.asarray(h1mo[i0:i1])
         s1mo_blk = cp.empty_like(h1mo_blk)
         for k, (p0, p1) in enumerate(aoslices[i0:i1,2:]):
             s1ao = cp.zeros((3,nao,nao))
@@ -687,8 +747,9 @@ def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1mo,
         hs = s1mo_blk = h1mo_blk = None
 
         tol = mf.conv_tol_cpscf * (i1 - i0)
+        lindep = max(tol**2, np.finfo(mo1.real.dtype).eps)
         raw_mo1 = krylov(fvind_vo, mo1.reshape(-1,nmo*nocc),
-                         tol=tol, max_cycle=max_cycle, verbose=log)
+                         tol=tol, max_cycle=max_cycle, lindep=lindep, verbose=log)
         raw_mo1 = raw_mo1.reshape(i1-i0,3,nmo,nocc)
         raw_mo1[:,:,occidx] = mo1[:,:,occidx]
 
@@ -708,59 +769,19 @@ def gen_vind(hessobj, mo_coeff, mo_occ):
     mo_coeff = cupy.asarray(mo_coeff)
     mo_occ = cupy.asarray(mo_occ)
     nao, nmo = mo_coeff.shape
-    mocc = mo_coeff[:,mo_occ>0]
-    nocc = mocc.shape[1]
-    mocc_2 = mocc * 2
+    orbo = mo_coeff[:,mo_occ>0]
+    nocc = orbo.shape[1]
+    orbo_2 = orbo * 2
 
     def fx(mo1):
         mo1 = cupy.asarray(mo1)
         mo1 = mo1.reshape(-1,nmo,nocc)
         mo1_mo = contract('npo,ip->nio', mo1, mo_coeff)
-        dm1 = mo1_mo.dot(mocc_2.T)
-        dm1 = transpose_sum(dm1)
-        dm1 = tag_array(dm1, mo1=mo1_mo, occ_coeff=mocc, mo_occ=mo_occ)
+        dm1 = cp.asarray(contract('npi,qi->npq', mo1_mo, orbo_2), order='C')
+        transpose_sum(dm1, inplace=True, hermi=1)
+        dm1 = tag_array(dm1, mo1=mo1_mo, occ_coeff=orbo, symmetrize=1)
         return hessobj.get_veff_resp_mo(mol, dm1, mo_coeff, mo_occ, hermi=1)
     return fx
-
-def hess_nuc_elec(mol, dm):
-    '''
-    H1e hessian nuclear repulsion contribution that originates from differentiating nuclear position
-    (both first derivative d2I_dAdC and second derivative d2I_dC2)
-    w/o ECP
-    '''
-    coords = mol.atom_coords()
-    charges = cupy.asarray(mol.atom_charges(), dtype=np.float64)
-
-    aoslice = mol.aoslice_by_atom()
-    aoslice = numpy.array(aoslice)
-
-    from gpu4pyscf.gto import int3c1e
-    from gpu4pyscf.gto.int3c1e_ipip import int1e_grids_ip1ip2, int1e_grids_ipip2
-    intopt_derivative = int3c1e.VHFOpt(mol)
-    intopt_derivative.build(cutoff = 1e-14, aosym = False)
-
-    d2e = cupy.zeros([3, 3, mol.natm, mol.natm])
-
-    for j_atom in range(mol.natm):
-        # TODO: It is computing one charge at a time, and it's likely slow
-        g0,g1 = j_atom,j_atom+1
-        d2I_dAdC = int1e_grids_ip1ip2(mol, coords[g0:g1, :], charges = charges[g0:g1], intopt = intopt_derivative)
-
-        for i_atom in range(mol.natm):
-            p0,p1 = aoslice[i_atom, 2:]
-            d2e[:, :, i_atom, j_atom] += contract('ij,dDij->dD', dm[p0:p1, :], d2I_dAdC[:, :, p0:p1, :])
-            d2e[:, :, i_atom, j_atom] += contract('ij,dDij->dD', dm[:, p0:p1], d2I_dAdC[:, :, p0:p1, :].transpose(0,1,3,2))
-
-            d2e[:, :, j_atom, i_atom] += contract('ij,dDij->dD', dm[p0:p1, :], d2I_dAdC[:, :, p0:p1, :].transpose(1,0,2,3))
-            d2e[:, :, j_atom, i_atom] += contract('ij,dDij->dD', dm[:, p0:p1], d2I_dAdC[:, :, p0:p1, :].transpose(1,0,3,2))
-    d2I_dAdC = None
-
-    d2I_dC2 = int1e_grids_ipip2(mol, coords, dm = dm, intopt = intopt_derivative)
-    for i_atom in range(mol.natm):
-        d2e[:, :, i_atom, i_atom] += d2I_dC2[:, :, i_atom] * charges[i_atom]
-    d2I_dC2 = None
-
-    return -d2e
 
 def hess_nuc_elec_ecp(mol, dm):
     '''
@@ -778,11 +799,11 @@ def hess_nuc_elec_ecp(mol, dm):
         de = cupy.asarray([cupy.sum(de[:,:,p0:p1], axis=2) for p0,p1 in aoslices[:,2:]])
         de_ecp[:,:,atm_id] += de.transpose([1,2,0])
         de_ecp[:,:,:,atm_id] += de.transpose([2,1,0])
-        
+
         # 2nd derivative on ECP basis
         de = contract('xypq,pq->xy', rinv2aa[idx], dm)
         de_ecp[:,:,atm_id,atm_id] -= de
-    
+
     rinv2ab = -get_ecp_ipip(mol, ip_type='ipvip').reshape(n_ecp_atm,3,3,nao,nao)
     for idx, atm_id in enumerate(ecp_atoms):
         de = contract('xypq,pq->xyp', rinv2ab[idx], dm).transpose(1,0,2)
@@ -798,7 +819,10 @@ def hess_nuc_elec_ecp(mol, dm):
 
 def kernel(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
     cput0 = (logger.process_clock(), logger.perf_counter())
-    if mo_energy is None: mo_energy = hessobj.base.mo_energy
+    if mo_energy is None:
+        if hessobj.base.mo_energy is None:
+            hessobj.base.run()
+        mo_energy = hessobj.base.mo_energy
     if mo_coeff is None: mo_coeff = hessobj.base.mo_coeff
     if mo_occ is None: mo_occ = hessobj.base.mo_occ
     if atmlst is None:
@@ -824,48 +848,6 @@ def kernel(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
 
     return hessobj.de
 
-def _e_hcore_generator(hessobj, dm):
-    with_x2c = getattr(hessobj.base, 'with_x2c', None)
-    if with_x2c:
-        hcore_deriv = with_x2c.hcore_deriv_generator(deriv=2)
-        dm = dm.get()
-        return lambda i, j: cp.asarray(np.einsum('xypq,pq->xy', hcore_deriv(i, j), dm))
-
-    assert dm.dtype == np.float64
-    mol = hessobj.mol
-    log = logger.new_logger(mol)
-    t1 = log.init_timer()
-    de_nuc_elec = hess_nuc_elec(mol, dm)
-    t1 = log.timer_debug1('hess_nuc_elec', *t1)
-    dm = dm.get()
-    with_ecp = len(mol._ecpbas) > 0
-    aoslices = mol.aoslice_by_atom()
-    if with_ecp:
-        de_ecp = hess_nuc_elec_ecp(mol, dm)
-
-    if mol._pseudo:
-        raise NotImplementedError("Pseudopotential hessian not supported for molecular system yet")
-
-    # Move data to GPU, get_hcore is slow on CPU
-    h1aa, h1ab = hessobj.get_hcore(mol)
-    h1aa = cupy.asarray(h1aa)
-    h1ab = cupy.asarray(h1ab)
-
-    t1 = log.timer_debug1('get_hcore', *t1)
-    def get_hcore(iatm, jatm):
-        i0, i1 = aoslices[iatm][2:]
-        j0, j1 = aoslices[jatm][2:]
-        if iatm == jatm:
-            de = contract('xypq,pq->xy', h1aa[:,:,i0:i1], dm[i0:i1])
-            de+= contract('xypq,pq->xy', h1ab[:,:,i0:i1,i0:i1], dm[i0:i1,i0:i1])
-        else:
-            de = contract('xypq,pq->xy', h1ab[:,:,i0:i1,j0:j1],dm[i0:i1,j0:j1])
-        if with_ecp:
-            de += de_ecp[:,:,iatm,jatm]
-        # 2.0* due to the symmetry
-        return cp.asarray(2.0*de + de_nuc_elec[:,:,iatm,jatm])
-    return get_hcore
-
 def hcore_generator(hessobj, mol=None):
     raise NotImplementedError
 
@@ -874,13 +856,13 @@ def _ao2mo(v_ao, mocc, mo_coeff):
     return contract('nio,ip->npo', v_ao, mo_coeff)
 
 def _get_jk_mo(hessobj, mol, dms, mo_coeff, mo_occ,
-            hermi=1, with_j=True, with_k=True, omega=None):
+               hermi=1, with_j=True, with_k=True,
+               omega=None, lr_factor=None, sr_factor=None):
     ''' Compute J/K matrices in MO for multiple DMs
     '''
     assert hermi == 1
     mf = hessobj.base
-    if omega is None:
-        omega = mol.omega
+    omega, lr_factor, sr_factor = _check_rsh_factors(mol, omega, lr_factor, sr_factor)
     vj = vk = None
     nao = dms.shape[-1]
     dms = dms.reshape(-1,nao,nao)
@@ -899,10 +881,10 @@ def _get_jk_mo(hessobj, mol, dms, mo_coeff, mo_occ,
     if with_k:
         if omega not in mf._opt_gpu:
             with mol.with_range_coulomb(omega):
-                mf._opt_gpu[omega] = _VHFOpt(mol, mf.direct_scf_tol, tile=1).build()
+                mf._opt_gpu[omega] = _VHFOpt(mol, mf.direct_scf_tol).build()
         kopt = mf._opt_gpu[omega]
         _dms = kopt.apply_coeff_C_mat_CT(dms)
-        vk = kopt.get_k(_dms, hermi, mf.verbose)
+        vk = kopt.get_k(_dms, hermi, mf.verbose, omega, lr_factor, sr_factor)
         _mo_coeff = kopt.apply_coeff_C_mat(mo_coeff)
         _mocc = _mo_coeff[:,mo_occ>0.5]
         vk = _ao2mo(vk, _mocc, _mo_coeff).reshape(n_dm,-1)
@@ -929,13 +911,11 @@ class HessianBase(lib.StreamObject):
     make_h1         = rhf_hess_cpu.HessianBase.make_h1
     hcore_generator = hcore_generator  # the functionality is different from cpu version
     hess_nuc        = rhf_hess_cpu.HessianBase.hess_nuc
+    get_dispersion  = dispersion.get_dispersion
     gen_vind        = NotImplemented
     get_jk          = NotImplemented
+    get_hcore       = NotImplemented
     kernel = hess = kernel
-
-    def get_hcore(self, mol=None):
-        if mol is None: mol = self.mol
-        return get_hcore(mol)
 
     def solve_mo1(self, mo_energy, mo_coeff, mo_occ, h1mo,
                   fx=None, atmlst=None, max_memory=4000, verbose=None):
@@ -965,6 +945,7 @@ class Hessian(HessianBase):
     '''Non-relativistic restricted Hartree-Fock hessian'''
 
     def __init__(self, scf_method):
+        assert isinstance(scf_method, scf.hf.SCF)
         self.verbose = scf_method.verbose
         self.stdout = scf_method.stdout
         self.mol = scf_method.mol
@@ -983,5 +964,4 @@ class Hessian(HessianBase):
     get_veff_resp_mo = _get_veff_resp_mo
 
 # Inject to RHF class
-from gpu4pyscf import scf
 scf.hf.RHF.Hessian = lib.class_as_method(Hessian)

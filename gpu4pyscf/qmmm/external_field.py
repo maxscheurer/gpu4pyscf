@@ -21,6 +21,7 @@ from pyscf import lib
 
 import gpu4pyscf
 from gpu4pyscf.lib import logger
+from gpu4pyscf.grad.rhf import contract_h1e_dm
 
 def add_external_field(scf_method, electric_field=None, origin=None):
     ''' Field and origin in AU '''
@@ -33,8 +34,7 @@ def external_field_for_scf(method, electric_field=None, origin=None):
     assert (isinstance(method, gpu4pyscf.scf.hf.SCF))
 
     if isinstance(method, EXTF):
-        method.electric_field = cp.asarray(electric_field)
-        method.origin = cp.asarray(origin).get()
+        method._set_field(electric_field, origin)
         return method
 
     cls = EXTFSCF
@@ -49,10 +49,13 @@ class EXTFSCF(EXTF):
 
     def __init__(self, method, electric_field=None, origin=None):
         self.__dict__.update(method.__dict__)
+        self._set_field(electric_field, origin)
 
+    def _set_field(self, electric_field, origin):
+        # Apply the same disabled-field/default-origin contract on every update.
         if electric_field is not None:
             electric_field = cp.asarray(electric_field)
-            assert type(electric_field) is cp.ndarray
+            assert isinstance(electric_field, cp.ndarray)
             assert electric_field.shape == (3,)
         self.electric_field = electric_field
 
@@ -60,7 +63,7 @@ class EXTFSCF(EXTF):
             origin = np.zeros(3)
         else:
             origin = cp.asarray(origin).get()
-            assert type(origin) is np.ndarray
+            assert isinstance(origin, np.ndarray)
             assert origin.shape == (3,)
         self.origin = origin
 
@@ -90,7 +93,7 @@ class EXTFSCF(EXTF):
         if self.electric_field is not None:
             with mol.with_common_orig(self.origin):
                 dipole_integral = cp.asarray(mol.intor('int1e_r'))
-            h1e -= cp.einsum('d,dij->ij', self.electric_field, dipole_integral)
+            h1e += cp.einsum('d,dij->ij', self.electric_field, dipole_integral)
 
         return h1e
 
@@ -101,7 +104,7 @@ class EXTFSCF(EXTF):
         nuclear_coords = self.mol.atom_coords()
         if self.electric_field is not None:
             nuclear_dipole = nuclear_charges @ (nuclear_coords - self.origin[None, :])
-            nuc += float(nuclear_dipole @ self.electric_field.get())
+            nuc -= float(nuclear_dipole @ self.electric_field.get())
         return nuc
 
     def Gradients(self):
@@ -115,8 +118,7 @@ def add_external_field_grad(scf_grad, electric_field=None, origin=None):
     # if unit is None:
     #     unit = mol.unit
     gobj = external_field_grad_for_scf(scf_grad)
-    gobj.base.electric_field = cp.asarray(electric_field)
-    gobj.base.origin = cp.asarray(origin).get()
+    gobj.base._set_field(electric_field, origin)
     return gobj
 
 def external_field_grad_for_scf(scf_grad):
@@ -161,8 +163,27 @@ class EXTFGrad:
                 dipole_integral_derivative = mol.intor('int1e_irp').reshape(3, 3, mol.nao, mol.nao).transpose(0,1,3,2)
                 dipole_integral_derivative = cp.asarray(dipole_integral_derivative)
 
-            dhcore += cp.einsum('Edij,E->dij', dipole_integral_derivative, self.base.electric_field)
+            dhcore -= cp.einsum('Edij,E->dij', dipole_integral_derivative, self.base.electric_field)
         return dhcore
+
+    def extra_force(self, atom_id=None):
+        assert atom_id is None
+        e1_grad = super().extra_force()
+        if self.base.electric_field is None:
+            return e1_grad
+
+        mol = self.mol
+        with mol.with_common_orig(self.base.origin):
+            # The original order is (3 dimension of r, 3 dimension of derivative, ao (not differentiated), ao (differentiated))
+            dipole_integral_derivative = mol.intor('int1e_irp').reshape(3, 3, mol.nao, mol.nao).transpose(0,1,3,2)
+            dipole_integral_derivative = cp.asarray(dipole_integral_derivative)
+
+        dhcore = cp.einsum('Edij,E->dij', dipole_integral_derivative, self.base.electric_field)
+        dm = self.base.make_rdm1()
+        if dm.ndim == 3: #UHF
+            dm = dm[0] + dm[1]
+        e1_grad = e1_grad - contract_h1e_dm(self.mol, dhcore, dm, hermi=1)
+        return e1_grad
 
     def grad_nuc(self, mol=None, atmlst=None):
         if mol is None: mol = self.mol
@@ -171,7 +192,7 @@ class EXTFGrad:
         nuclear_charges = mol.atom_charges()
         # nuclear_coords = mol.atom_coords()
         if self.base.electric_field is not None:
-            g_nuc += np.einsum('q,E->qE', nuclear_charges, self.base.electric_field.get())
+            g_nuc -= np.einsum('q,E->qE', nuclear_charges, self.base.electric_field.get())
         return g_nuc
 
 # Inject EXTF interface wrapper to other modules

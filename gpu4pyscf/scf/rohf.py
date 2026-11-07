@@ -18,6 +18,28 @@ import cupy
 from pyscf.scf import rohf as rohf_cpu
 from gpu4pyscf.scf import hf, uhf
 from gpu4pyscf.lib.cupy_helper import tag_array, contract
+from gpu4pyscf.lib import logger
+
+
+def _to_uhf_dm(dm):
+    """Adapt shared-orbital density tags for unrestricted J/K and DFT routines."""
+    mo_coeff = getattr(dm, 'mo_coeff', None)
+    mo_occ = getattr(dm, 'mo_occ', None)
+    if dm.ndim == 2:
+        # A spin-summed density is split equally, including its orbital tags.
+        dm = cupy.repeat(cupy.asarray(dm)[None]*.5, 2, axis=0)
+        if mo_coeff is not None:
+            mo_coeff = cupy.repeat(mo_coeff[None], 2, axis=0)
+            mo_occ = cupy.repeat(mo_occ[None]*.5, 2, axis=0)
+    elif mo_coeff is not None and mo_coeff.ndim == 2:
+        mo_coeff = cupy.repeat(mo_coeff[None], 2, axis=0)
+        if mo_occ.ndim == 1:
+            mo_occa = cupy.minimum(mo_occ, 1.)
+            mo_occb = mo_occ - mo_occa
+            mo_occ = cupy.stack([mo_occa, mo_occb])
+    if mo_coeff is not None:
+        dm = tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
+    return dm
 
 
 def get_roothaan_fock(focka_fockb, dma_dmb, s):
@@ -74,51 +96,62 @@ class ROHF(hf.RHF):
 
     nelec = rohf_cpu.ROHF.nelec
     check_sanity = hf.SCF.check_sanity
-    get_jk = hf._get_jk
+    get_jk = hf.RHF.get_jk
     scf = kernel = hf.RHF.kernel
     # FIXME: Needs more tests for get_fock and get_occ
     get_occ = hf.return_cupy_array(rohf_cpu.ROHF.get_occ)
     get_hcore = hf.RHF.get_hcore
     get_ovlp = hf.RHF.get_ovlp
-    get_init_guess = uhf.UHF.get_init_guess
-    init_guess_by_minao      = rohf_cpu.ROHF.init_guess_by_minao
-    init_guess_by_atom       = rohf_cpu.ROHF.init_guess_by_atom
-    init_guess_by_huckel     = rohf_cpu.ROHF.init_guess_by_huckel
-    init_guess_by_mod_huckel = rohf_cpu.ROHF.init_guess_by_mod_huckel
-    init_guess_by_1e         = rohf_cpu.ROHF.init_guess_by_1e
-    init_guess_by_chkfile    = rohf_cpu.ROHF.init_guess_by_chkfile
+    init_guess_by_huckel     = hf.return_cupy_array(rohf_cpu.ROHF.init_guess_by_huckel)
+    init_guess_by_mod_huckel = hf.return_cupy_array(rohf_cpu.ROHF.init_guess_by_mod_huckel)
+    init_guess_by_1e         = hf.return_cupy_array(rohf_cpu.ROHF.init_guess_by_1e)
+    init_guess_by_chkfile    = hf.return_cupy_array(rohf_cpu.ROHF.init_guess_by_chkfile)
     make_rdm2 = NotImplemented
     x2c = x2c1e = sfx2c1e = NotImplemented
-    to_rhf = NotImplemented
-    to_uhf = NotImplemented
-    to_ghf = NotImplemented
-    to_rks = NotImplemented
-    to_uks = NotImplemented
-    to_gks = NotImplemented
-    to_ks = NotImplemented
     stability = NotImplemented
-    mulliken_pop = NotImplemented
     mulliken_meta = NotImplemented
     nuc_grad_method = NotImplemented
 
     canonicalize = canonicalize
 
+    def init_guess_by_minao(self, mol=None, high_spin=False):
+        dm = hf.SCF.init_guess_by_minao(self, mol, high_spin=high_spin)
+        if high_spin:
+            return tag_array(dm, mo_coeff=dm.mo_coeff[0],
+                             mo_occ=dm.mo_occ[0]+dm.mo_occ[1])
+        # Explicit spin occupations preserve the spin-averaged atomic guess.
+        return tag_array(cupy.stack([dm*.5, dm*.5]), mo_coeff=dm.mo_coeff,
+                         mo_occ=cupy.stack([dm.mo_occ*.5, dm.mo_occ*.5]))
+
+    def init_guess_by_atom(self, mol=None, high_spin=False):
+        dm = hf.SCF.init_guess_by_atom(self, mol, high_spin=high_spin)
+        if high_spin:
+            return tag_array(dm, mo_coeff=dm.mo_coeff[0],
+                             mo_occ=dm.mo_occ[0]+dm.mo_occ[1])
+        return tag_array(cupy.stack([dm*.5, dm*.5]), mo_coeff=dm.mo_coeff,
+                         mo_occ=cupy.stack([dm.mo_occ*.5, dm.mo_occ*.5]))
+
+    get_init_guess = hf.SCF.get_init_guess
+
     def make_rdm1(self, mo_coeff=None, mo_occ=None, **kwargs):
-        '''One-particle density matrix.  mo_occ is a 1D array, with occupancy 1 or 2.
+        '''One-particle density matrix from shared spatial orbitals.
+
+        A 1D mo_occ gives total occupations, split into aligned alpha/beta
+        channels. Fractional occupations are supported for atomic guesses.
         '''
         if mo_coeff is None: mo_coeff = self.mo_coeff
         if mo_occ is None: mo_occ = self.mo_occ
         if isinstance(mo_occ, cupy.ndarray) and mo_occ.ndim == 1:
-            mo_occa = (mo_occ > 0).astype(np.double)
-            mo_occb = (mo_occ ==2).astype(np.double)
+            mo_occa = cupy.minimum(mo_occ, 1.)
+            mo_occb = mo_occ - mo_occa
         else:
             mo_occa, mo_occb = mo_occ
         dm_a = cupy.dot(mo_coeff*mo_occa, mo_coeff.conj().T)
         dm_b = cupy.dot(mo_coeff*mo_occb, mo_coeff.conj().T)
         return tag_array((dm_a, dm_b), mo_coeff=mo_coeff, mo_occ=mo_occ)
 
-    def eig(self, fock, s, overwrite=False):
-        e, c = self._eigh(fock, s, overwrite)
+    def eig(self, fock, s, overwrite=False, x=None):
+        e, c = self._eigh(fock, s, overwrite, x)
         if getattr(fock, 'focka', None) is not None:
             mo_ea = contract('pi,pi->i', c.conj(), fock.focka.dot(c)).real
             mo_eb = contract('pi,pi->i', c.conj(), fock.fockb.dot(c)).real
@@ -128,21 +161,13 @@ class ROHF(hf.RHF):
     def energy_elec(self, dm=None, h1e=None, vhf=None):
         if dm is None: dm = self.make_rdm1()
         elif isinstance(dm, cupy.ndarray) and dm.ndim == 2:
-            dm = [dm*.5, dm*.5]
+            dm = cupy.repeat(dm[None]*.5, 2, axis=0)
         return uhf.energy_elec(self, dm, h1e, vhf)
 
-    def get_veff(self, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
+    def get_veff(self, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
         if dm is None:
             dm = self.make_rdm1()
-        elif getattr(dm, 'mo_coeff', None) is not None:
-            mo_coeff = cupy.repeat(dm.mo_coeff[None], 2, axis=0)
-            mo_occ = cupy.asarray([dm.mo_occ>0, dm.mo_occ==2],
-                                  dtype=np.double)
-            if dm.ndim == 2:  # RHF DM
-                dm = cupy.repeat(dm[None]*.5, 2, axis=0)
-            dm = tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
-        elif dm.ndim == 2:  # RHF DM
-            dm = cupy.repeat(dm[None]*.5, 2, axis=0)
+        dm = _to_uhf_dm(dm)
         return uhf.UHF.get_veff(self, mol, dm, dm_last, vhf_last, hermi)
 
     def get_fock(self, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
@@ -215,3 +240,38 @@ class ROHF(hf.RHF):
     def newton(self):
         from gpu4pyscf.scf.soscf import newton
         return newton(self)
+
+    def spin_square(self, mo_coeff=None, s=None):
+        '''Spin square and multiplicity of a ROHF determinant'''
+        neleca, nelecb = self.nelec
+        ms = (neleca - nelecb) * .5
+        ss = ms * (ms + 1)
+        return ss, ms*2+1
+
+    def to_ks(self, xc='HF'):
+        '''Convert to UKS object.
+        '''
+        from gpu4pyscf import dft
+        return self._transfer_attrs_(dft.ROKS(self.mol, xc=xc))
+
+
+class HF1e(ROHF):
+    def kernel(self, *args):
+        logger.info(self, '\n')
+        logger.info(self, '******** 1 electron system ********')
+        h = self.get_hcore()
+        s = self.get_ovlp()
+        self.mo_energy, self.mo_coeff = self.eig(h, s)
+        self.mo_occ = self.get_occ(self.mo_energy, self.mo_coeff)
+        self.e_tot = self.mo_energy[0].real.get() + self.mol.energy_nuc()
+        if self.chkfile:
+            self.dump_chk({
+                'e_tot': self.e_tot,
+                'mo_energy': self.mo_energy,
+                'mo_coeff': self.mo_coeff,
+                'mo_occ': self.mo_occ
+            })
+        self.converged = True
+        self._finalize()
+        return self.e_tot
+    scf = kernel

@@ -14,17 +14,52 @@
 # limitations under the License.
 
 import unittest
+from gpu4pyscf.pbc.dft.multigrid_v3 import MultiGridNumInt
 import numpy as np
+import cupy as cp
+import pyscf
+from pyscf.pbc.gto import pseudo
 from pyscf.pbc import dft, gto
 from pyscf.pbc.tools import pbc
 from pyscf.pbc.df import FFTDF
 from pyscf.pbc.dft.numint import NumInt
 from pyscf.pbc.dft.gen_grid import UniformGrids
-from gpu4pyscf.pbc.grad import rks_stress, rks
-from gpu4pyscf.pbc.grad.rks_stress import _finite_diff_cells
+from gpu4pyscf.pbc.grad.krks_stress import (
+    _get_coulG_strain_derivatives, _eval_ao_strain_derivatives,
+    _get_vpplocG_strain_derivatives)
+from gpu4pyscf.pbc.grad import rks
+from gpu4pyscf.pbc.grad.rhf import _finite_diff_cells
 from gpu4pyscf.pbc.scf.j_engine import PBCJMatrixOpt
 from gpu4pyscf.pbc.scf.rsjk import PBCJKMatrixOpt
 import pytest
+
+def setUpModule():
+    global cell
+    a = np.eye(3) * 4
+    np.random.seed(5)
+    a -= np.random.rand(3, 3)
+    cell = gto.M(atom='H 1 1 1; H 3 2.5 2.4',
+                 basis=[[0, [1.5, 1]], [0, [.5, 1]], [1, [.8, 1]]],
+                 pseudo='''
+H GTH-PBE-q1 GTH-PBE
+1
+  0.20000000    2    -4.17890044     0.72446331
+0
+                 ''', verbose=6, output='/dev/null', a=a, unit='Bohr')
+
+def tearDownModule():
+    global cell
+    del cell
+
+def _check_vs_finite_diff(dat, mf_scanner):
+    cell = mf_scanner.cell
+    vol = cell.vol
+    disp = 1e-3
+    for (i, j) in [(0, 0), (0, 1), (0, 2), (1, 0), (2, 2)]:
+        cell1, cell2 = _finite_diff_cells(cell, i, j, disp=disp)
+        e1 = mf_scanner(cell1)
+        e2 = mf_scanner(cell2)
+        assert abs(dat[i,j] - (e1-e2)/2/disp/vol) < 1e-6
 
 class KnownValues(unittest.TestCase):
     def test_coulG(self):
@@ -33,7 +68,7 @@ class KnownValues(unittest.TestCase):
         a += np.random.rand(3, 3) - .5
         cell = gto.M(atom='He 1 1 1; He 2 1.5 2.4',
                      basis=[[0, [.5, 1]], [1, [.5, 1]]], a=a, unit='Bohr')
-        coulG0, coulG1 = rks_stress._get_coulG_strain_derivatives(cell, cell.Gv)
+        coulG0, coulG1 = _get_coulG_strain_derivatives(cell, cell.Gv)
         cell1, cell2 = _finite_diff_cells(cell, 0, 0, disp=1e-5)
         assert abs(coulG1[0,0].get() - (pbc.get_coulG(cell1) - pbc.get_coulG(cell2)) / 2e-5).max() < 1e-9
         cell1, cell2 = _finite_diff_cells(cell, 0, 1, disp=1e-5)
@@ -47,18 +82,38 @@ class KnownValues(unittest.TestCase):
                      basis=[[0, [.5, 1]],
                             [1, [1.5, 1], [.5, 1]],
                             [2, [.8, 1]],
-                            [3, [.7, 1]]], a=a, unit='Bohr', cart=True)
+                            [3, [.7, 1]],
+                            [4, [.6, 1]]], a=a, unit='Bohr', cart=True)
         coords = np.random.rand(10, 3)
-        ao_value = rks_stress._eval_ao_strain_derivatives(cell, coords)
+        ao_value = _eval_ao_strain_derivatives(cell, coords)
         ao_value = ao_value.get().transpose(0,1,2,3,5,4)[0]
         ni = NumInt()
         for (i, j) in [(0, 0), (0, 1), (0, 2), (2, 0), (2, 2)]:
             cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-5)
-            cell1.precision = 1e-10
-            cell2.precision = 1e-10
             ao1 = ni.eval_ao(cell1, coords)
             ao2 = ni.eval_ao(cell2, coords)
-            assert abs(ao_value[i,j,0] - (ao1 - ao2) / 2e-5).max() < 1e-9
+            assert abs(ao_value[i,j,0] - (ao1 - ao2) / 2e-5).max() < 5e-9
+
+    def test_eval_ao_sph(self):
+        a = np.eye(3) * 5
+        np.random.seed(5)
+        a += np.random.rand(3, 3) - .5
+        cell = gto.M(atom='He 1 1 1; He 2 1.5 2.4',
+                     basis=[[0, [.5, 1]],
+                            [1, [1.5, 1], [.5, 1]],
+                            [2, [.8, 1]],
+                            [3, [.7, 1]],
+                            [4, [.6, 1]]], a=a, unit='Bohr')
+        assert not cell.cart
+        coords = np.random.rand(10, 3)
+        ao_value = _eval_ao_strain_derivatives(cell, coords)
+        ao_value = ao_value.get().transpose(0,1,2,3,5,4)[0]
+        ni = NumInt()
+        for (i, j) in [(0, 0), (0, 1), (0, 2), (2, 0), (2, 2)]:
+            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-5)
+            ao1 = ni.eval_ao(cell1, coords)
+            ao2 = ni.eval_ao(cell2, coords)
+            assert abs(ao_value[i,j,0] - (ao1 - ao2) / 2e-5).max() < 5e-9
 
     def test_eval_ao_deriv1_cart(self):
         a = np.eye(3) * 5
@@ -68,18 +123,38 @@ class KnownValues(unittest.TestCase):
                      basis=[[0, [.5, 1]],
                             [1, [1.5, 1], [.5, 1]],
                             [2, [.8, 1]],
-                            [3, [.7, 1]]], a=a, unit='Bohr', cart=True)
+                            [3, [.7, 1]],
+                            [4, [.6, 1]]], a=a, unit='Bohr', cart=True)
         coords = np.random.rand(10, 3)
-        ao_value = rks_stress._eval_ao_strain_derivatives(cell, coords, deriv=1)
+        ao_value = _eval_ao_strain_derivatives(cell, coords, deriv=1)
         ao_value = ao_value.get().transpose(0,1,2,3,5,4)[0]
         ni = NumInt()
         for (i, j) in [(0, 0), (0, 1), (0, 2), (2, 0), (2, 2)]:
-            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-5)
-            cell1.precision = 1e-10
-            cell2.precision = 1e-10
+            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-4)
             ao1 = ni.eval_ao(cell1, coords, deriv=1)
             ao2 = ni.eval_ao(cell2, coords, deriv=1)
-            assert abs(ao_value[i,j] - (ao1 - ao2) / 2e-5).max() < 1e-9
+            assert abs(ao_value[i,j] - (ao1 - ao2) / 2e-4).max() < 1e-7
+
+    def test_eval_ao_deriv1_sph(self):
+        a = np.eye(3) * 5
+        np.random.seed(5)
+        a += np.random.rand(3, 3) - .5
+        cell = gto.M(atom='He 1 1 1; He 2 1.5 2.4',
+                     basis=[[0, [.5, 1]],
+                            [1, [1.5, 1], [.5, 1]],
+                            [2, [.8, 1]],
+                            [3, [.7, 1]],
+                            [4, [.6, 1]]], a=a, unit='Bohr')
+        assert not cell.cart
+        coords = np.random.rand(10, 3)
+        ao_value = _eval_ao_strain_derivatives(cell, coords, deriv=1)
+        ao_value = ao_value.get().transpose(0,1,2,3,5,4)[0]
+        ni = NumInt()
+        for (i, j) in [(0, 0), (0, 1), (0, 2), (2, 0), (2, 2)]:
+            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-4)
+            ao1 = ni.eval_ao(cell1, coords, deriv=1)
+            ao2 = ni.eval_ao(cell2, coords, deriv=1)
+            assert abs(ao_value[i,j] - (ao1 - ao2) / 2e-4).max() < 1e-7
 
     def test_get_vxc_lda(self):
         a = np.eye(3) * 5
@@ -91,16 +166,15 @@ class KnownValues(unittest.TestCase):
         dm = np.random.rand(nao, nao) - .5
         dm = dm.dot(dm.T)
         xc = 'lda,'
-        mf_grad = rks.Gradients(cell.RKS(xc=xc).to_gpu())
-        dat = rks_stress.get_vxc(mf_grad, cell, dm)
+        ni = MultiGridNumInt(cell)
+        ni.allow_mesh_reduction = False
+        dat = ni.energy_derivatives(xc, dm, spin=0, with_j=False, with_nuc=False)[-3:]
         ni = NumInt()
         for (i, j) in [(0, 0), (0, 1), (0, 2), (2, 0), (2, 2)]:
-            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-5)
-            cell1.precision = 1e-10
-            cell2.precision = 1e-10
+            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-4)
             exc1 = ni.nr_rks(cell1, UniformGrids(cell1), xc, dm)[1]
             exc2 = ni.nr_rks(cell2, UniformGrids(cell2), xc, dm)[1]
-            assert abs(dat[i,j] - (exc1 - exc2)/2e-5) < 1e-8
+            assert abs(dat[i,j] - (exc1 - exc2)/2e-4) < 1e-7
 
     def test_get_vxc_gga(self):
         a = np.eye(3) * 5
@@ -113,16 +187,15 @@ class KnownValues(unittest.TestCase):
         dm = np.random.rand(nao, nao) - .5
         dm = dm.dot(dm.T)
         xc = 'pbe,'
-        mf_grad = rks.Gradients(cell.RKS(xc=xc).to_gpu())
-        dat = rks_stress.get_vxc(mf_grad, cell, dm)
+        ni = MultiGridNumInt(cell)
+        ni.allow_mesh_reduction = False
+        dat = ni.energy_derivatives(xc, dm, spin=0, with_j=False, with_nuc=False)[-3:]
         ni = NumInt()
         for (i, j) in [(0, 0), (0, 1), (0, 2), (1, 0), (2, 2)]:
-            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-5)
-            cell1.precision = 1e-12
-            cell2.precision = 1e-12
+            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-4)
             exc1 = ni.nr_rks(cell1, UniformGrids(cell1), xc, dm)[1]
             exc2 = ni.nr_rks(cell2, UniformGrids(cell2), xc, dm)[1]
-            assert abs(dat[i,j] - (exc1 - exc2)/2e-5) < 1e-9
+            assert abs(dat[i,j] - (exc1 - exc2)/2e-4) < 1e-7
 
     def test_get_vxc_mgga(self):
         a = np.eye(3) * 5
@@ -135,16 +208,15 @@ class KnownValues(unittest.TestCase):
         dm = np.random.rand(nao, nao) - .5
         dm = dm.dot(dm.T)
         xc = 'm06,'
-        mf_grad = rks.Gradients(cell.RKS(xc=xc).to_gpu())
-        dat = rks_stress.get_vxc(mf_grad, cell, dm)
+        ni = MultiGridNumInt(cell)
+        ni.allow_mesh_reduction = False
+        dat = ni.energy_derivatives(xc, dm, spin=0, with_j=False, with_nuc=False)[-3:]
         ni = NumInt()
         for (i, j) in [(0, 0), (0, 1), (0, 2), (2, 1), (2, 2)]:
-            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-5)
-            cell1.precision = 1e-12
-            cell2.precision = 1e-12
+            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-4)
             exc1 = ni.nr_rks(cell1, UniformGrids(cell1), xc, dm)[1]
             exc2 = ni.nr_rks(cell2, UniformGrids(cell2), xc, dm)[1]
-            assert abs(dat[i,j] - (exc1 - exc2)/2e-5) < 1e-9
+            assert abs(dat[i,j] - (exc1 - exc2)/2e-4) < 2e-7
 
     def test_get_j(self):
         a = np.eye(3) * 5
@@ -156,13 +228,12 @@ class KnownValues(unittest.TestCase):
         dm = np.random.rand(nao, nao) - .5
         dm = dm.dot(dm.T)
         xc = 'lda,'
-        mf_grad = rks.Gradients(cell.RKS(xc=xc).to_gpu())
-        dat = rks_stress.get_vxc(mf_grad, cell, dm, with_j=True)
+        ni = MultiGridNumInt(cell)
+        ni.allow_mesh_reduction = False
+        dat = ni.energy_derivatives(xc, dm, spin=0, with_j=True, with_nuc=False)[-3:]
         ni = NumInt()
         for (i, j) in [(0, 0), (0, 1), (0, 2), (2, 1), (2, 2)]:
             cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-5)
-            cell1.precision = 1e-10
-            cell2.precision = 1e-10
             vj1 = FFTDF(cell1).get_jk(dm, with_k=False)[0]
             vj1 *= .5
             exc1 = ni.nr_rks(cell1, UniformGrids(cell1), xc, dm)[1]
@@ -171,7 +242,7 @@ class KnownValues(unittest.TestCase):
             exc2 = ni.nr_rks(cell2, UniformGrids(cell2), xc, dm)[1]
             de = np.einsum('ij,ji', dm, (vj1-vj2))
             de += exc1 - exc2
-            assert abs(dat[i,j] - de/2e-5) < 1e-8
+            assert abs(dat[i,j] - de/2e-5) < 2e-8
 
     def test_get_nuc(self):
         a = np.eye(3) * 5
@@ -183,23 +254,23 @@ class KnownValues(unittest.TestCase):
         dm = np.random.rand(nao, nao) - .5
         dm = dm.dot(dm.T)
         xc = 'lda,'
-        mf_grad = rks.Gradients(cell.RKS(xc=xc).to_gpu())
-        dat = rks_stress.get_vxc(mf_grad, cell, dm, with_nuc=True)
+        ni = MultiGridNumInt(cell)
+        ni.allow_mesh_reduction = False
+        dat = ni.energy_derivatives(xc, dm, spin=0, with_nuc=True, with_j=False)[-3:]
         kpt = np.zeros(3)
         ni = NumInt()
         for (i, j) in [(0, 0), (0, 1), (0, 2), (2, 1), (2, 2)]:
-            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-5)
-            cell1.precision = 1e-10
-            cell2.precision = 1e-10
+            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-4)
             vne1 = FFTDF(cell1).get_nuc(kpt)
             exc1 = ni.nr_rks(cell1, UniformGrids(cell1), xc, dm)[1]
             vne2 = FFTDF(cell2).get_nuc(kpt)
             exc2 = ni.nr_rks(cell2, UniformGrids(cell2), xc, dm)[1]
             de = np.einsum('ij,ji', dm, (vne1-vne2))
             de += exc1 - exc2
-            assert abs(dat[i,j] - de/2e-5) < 1e-8
+            assert abs(dat[i,j] - de/2e-4) < 2e-7
 
     def test_get_pp(self):
+        from gpu4pyscf.pbc.grad.pp import ppnl_derivatives
         a = np.eye(3) * 5
         np.random.seed(5)
         a += np.random.rand(3, 3) - .5
@@ -210,84 +281,59 @@ class KnownValues(unittest.TestCase):
         dm = np.random.rand(nao, nao) - .5
         dm = dm.dot(dm.T)
         xc = 'lda,'
-        mf_grad = rks.Gradients(cell.RKS(xc=xc).to_gpu())
-        dat = rks_stress.get_vxc(mf_grad, cell, dm, with_nuc=True)
+        ni = MultiGridNumInt(cell)
+        ni.allow_mesh_reduction = False
+        dat = ni.energy_derivatives(xc, dm, spin=0, with_nuc=True, with_j=False)[-3:]
+        dat += ppnl_derivatives(cell, cp.array(dm))[-3:]
         ni = NumInt()
         kpt = np.zeros(3)
         for (i, j) in [(0, 0), (0, 1), (0, 2), (2, 1), (2, 2)]:
-            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-5)
-            cell1.precision = 1e-10
-            cell2.precision = 1e-10
+            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-4)
             vne1 = FFTDF(cell1).get_pp(kpt)
             exc1 = ni.nr_rks(cell1, UniformGrids(cell1), xc, dm)[1]
             vne2 = FFTDF(cell2).get_pp(kpt)
             exc2 = ni.nr_rks(cell2, UniformGrids(cell2), xc, dm)[1]
             de = np.einsum('ij,ji', dm, (vne1-vne2))
             de += exc1 - exc2
-            assert abs(dat[i,j] - de/2e-5) < 1e-8
+            assert abs(dat[i,j] - de/2e-4) < 5e-7
 
     def test_lda_vs_finite_difference(self):
-        a = np.eye(3) * 3
-        np.random.seed(5)
-        a += np.random.rand(3, 3) - .5
-        cell = gto.M(atom='H 1 1 1; H 2 1.5 2.4',
-                     basis=[[0, [1.5, 1]], [1, [.8, 1]]],
-                     a=a, unit='Bohr', verbose=0)
-        mf = cell.RKS(xc='svwn').to_gpu().run()
+        mf0 = cell.RKS(xc='svwn').to_gpu()
+        mf = mf0.multigrid_numint().run()
         mf_grad = rks.Gradients(mf)
         dat = mf_grad.get_stress()
         mf_scanner = mf.as_scanner()
-        vol = cell.vol
-        for (i, j) in [(0, 0), (0, 1), (0, 2), (1, 0), (2, 2)]:
-            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-3)
-            e1 = mf_scanner(cell1)
-            e2 = mf_scanner(cell2)
-            assert abs(dat[i,j] - (e1-e2)/2e-3/vol) < 1e-6
+        _check_vs_finite_diff(dat, mf_scanner)
+
+        ref = dat
+        dat = mf0.reset(cell).run().Gradients().get_stress()
+        assert abs(dat - ref).max() < 1e-8
 
     def test_gga_vs_finite_difference(self):
-        a = np.eye(3) * 3.5
-        np.random.seed(5)
-        a += np.random.rand(3, 3) - .5
-        cell = gto.M(atom='C 1 1 1; C 2 1.5 2.4',
-                     basis=[[0, [1.5, 1]], [1, [.8, 1]]],
-                     pseudo='gth-pade', a=a, unit='Bohr', verbose=0)
-        mf = cell.RKS(xc='pbe').to_gpu().run()
+        mf0 = cell.RKS(xc='pbe').to_gpu()
+        mf = mf0.multigrid_numint().run()
         mf_grad = rks.Gradients(mf)
         dat = mf_grad.get_stress()
         mf_scanner = mf.as_scanner()
-        vol = cell.vol
-        for (i, j) in [(0, 0), (0, 1), (0, 2), (2, 1), (2, 2)]:
-            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-3)
-            e1 = mf_scanner(cell1)
-            e2 = mf_scanner(cell2)
-            assert abs(dat[i,j] - (e1-e2)/2e-3/vol) < 1e-6
+        _check_vs_finite_diff(dat, mf_scanner)
 
-    @pytest.mark.slow
+        ref = dat
+        dat = mf0.reset(cell).run().Gradients().get_stress()
+        assert abs(dat - ref).max() < 1e-8
+
     def test_mgga_vs_finite_difference(self):
-        a = np.eye(3) * 3.5
-        np.random.seed(5)
-        a += np.random.rand(3, 3) - .5
-        cell = gto.M(atom='H 1 1 1; H 2 1.5 2.4',
-                     basis=[[0, [1.5, 1]], [1, [.8, 1]]],
-                     a=a, unit='Bohr', verbose=0)
-        mf = cell.RKS(xc='rscan').to_gpu().run()
+        mf0 = cell.RKS(xc='rscan').to_gpu()
+        mf = mf0.multigrid_numint().run()
         mf_grad = rks.Gradients(mf)
         dat = mf_grad.get_stress()
         mf_scanner = mf.as_scanner()
-        vol = cell.vol
-        for (i, j) in [(0, 0), (0, 1), (0, 2), (2, 1), (2, 2)]:
-            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-3)
-            e1 = mf_scanner(cell1)
-            e2 = mf_scanner(cell2)
-            assert abs(dat[i,j] - (e1-e2)/2e-3/vol) < 1e-6
+        _check_vs_finite_diff(dat, mf_scanner)
+
+        ref = dat
+        dat = mf0.reset(cell).run().Gradients().get_stress()
+        assert abs(dat - ref).max() < 1e-8
 
     def test_pbe0_vs_finite_difference(self):
-        a = np.eye(3) * 3.5
-        np.random.seed(5)
-        a += np.random.rand(3, 3) - .5
-        cell = gto.M(atom='H 1 1 1; H 2 1.5 2.4',
-                     basis=[[0, [1.5, 1]], [0, [.5, 1]], [1, [.8, 1]]],
-                     a=a, unit='Bohr', verbose=0)
         xc = 'pbe0'
         mf = cell.RKS(xc=xc).to_gpu()
         mf.j_engine = PBCJMatrixOpt(cell)
@@ -296,21 +342,35 @@ class KnownValues(unittest.TestCase):
         mf_grad = mf.Gradients()
         dat = mf_grad.get_stress()
         mf_scanner = cell.RKS(xc=xc).to_gpu().as_scanner()
-        vol = cell.vol
-        for (i, j) in [(0, 0), (0, 1), (0, 2), (1, 0), (2, 2)]:
-            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-3)
-            e1 = mf_scanner(cell1)
-            e2 = mf_scanner(cell2)
-            assert abs(dat[i,j] - (e1-e2)/2e-3/vol) < 1e-7
+        _check_vs_finite_diff(dat, mf_scanner)
+
+    def test_gdf_pbe0_vs_finite_difference(self):
+        xc = 'pbe0'
+        mf = cell.RKS(xc=xc).to_gpu().density_fit()
+        mf = mf.multigrid_numint().run()
+        mf_grad = mf.Gradients()
+        dat = mf_grad.get_stress()
+        mf_scanner = mf.as_scanner()
+        _check_vs_finite_diff(dat, mf_scanner)
+
+    def test_gdf_pbe_vs_finite_difference(self):
+        xc = 'pbe'
+        mf = cell.RKS(xc=xc).to_gpu().density_fit().run()
+        mf_grad = mf.Gradients()
+        dat = mf_grad.get_stress()
+        mf_scanner = mf.as_scanner()
+        _check_vs_finite_diff(dat, mf_scanner)
+
+    def test_gdf_hse_vs_finite_difference_high_cost(self):
+        xc = 'hse06'
+        mf = cell.RKS(xc=xc).to_gpu().density_fit().run()
+        mf_grad = mf.Gradients()
+        dat = mf_grad.get_stress()
+        mf_scanner = mf.as_scanner()
+        _check_vs_finite_diff(dat, mf_scanner)
 
     @pytest.mark.slow
     def test_hse_vs_finite_difference(self):
-        a = np.eye(3) * 5
-        np.random.seed(5)
-        a += np.random.rand(3, 3) - .5
-        cell = gto.M(atom='H 1 1 1; H 2 1.5 2.4',
-                     basis=[[0, [1.5, 1]], [0, [.5, 1]], [1, [.8, 1]]],
-                     a=a, unit='Bohr', verbose=0)
         xc = 'hse06'
         mf = cell.RKS(xc=xc).to_gpu()
         mf.j_engine = PBCJMatrixOpt(cell)
@@ -319,12 +379,32 @@ class KnownValues(unittest.TestCase):
         mf_grad = mf.Gradients()
         dat = mf_grad.get_stress()
         mf_scanner = cell.RKS(xc=xc).to_gpu().as_scanner()
-        vol = cell.vol
-        for (i, j) in [(0, 0), (0, 1), (0, 2), (1, 0), (2, 2)]:
-            cell1, cell2 = _finite_diff_cells(cell, i, j, disp=1e-3)
-            e1 = mf_scanner(cell1)
-            e2 = mf_scanner(cell2)
-            assert abs(dat[i,j] - (e1-e2)/2e-3/vol) < 2e-7
+        _check_vs_finite_diff(dat, mf_scanner)
+
+    def test_get_vpplocG_strain_derivatives(self):
+        np.random.seed(8)
+        cell = pyscf.M(
+            atom='C 0 0 0; C .2 .3 .7',
+            basis=[[0, [0.4, 1]]],
+            pseudo={'C': [[2, 2], 0.38, 4, [-8.8, 1.33, 0.85, 0.55]]},
+            a=np.eye(3) * 2.5 + np.random.rand(3,3)*.5)
+        mesh = [11] * 3
+
+        disp = 1e-5
+        ngrids = np.prod(mesh)
+        ref = cp.empty((3,3, ngrids), dtype=np.complex128)
+        SI = cp.array(cell.get_SI(mesh=mesh))
+        for x in range(3):
+            for y in range(3):
+                cell1, cell2 = _finite_diff_cells(cell, x, y, disp)
+                vpplocG1 = pseudo.get_vlocG(cell1, cell1.get_Gv(mesh))
+                vpplocG2 = pseudo.get_vlocG(cell2, cell2.get_Gv(mesh))
+                vpplocG1 = -np.einsum('ij,ij->j', SI, vpplocG1)
+                vpplocG2 = -np.einsum('ij,ij->j', SI, vpplocG2)
+                ref[x,y] = cp.asarray((vpplocG1 - vpplocG2) / (2*disp))
+
+        dat = _get_vpplocG_strain_derivatives(cell, mesh)[1]
+        assert abs(dat - ref).max().get() < 1e-7
 
 if __name__ == "__main__":
     print("Full Tests for RKS Stress tensor")

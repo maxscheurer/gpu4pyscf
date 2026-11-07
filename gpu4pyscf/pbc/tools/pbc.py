@@ -17,8 +17,9 @@ import cupy as cp
 from scipy.special import erfc
 from pyscf import lib
 from pyscf.pbc.gto.cell import Cell
-from pyscf.pbc.tools.pbc import madelung, get_monkhorst_pack_size
-from gpu4pyscf.lib.cupy_helper import asarray
+from pyscf.pbc.tools.pbc import get_monkhorst_pack_size, cutoff_to_mesh
+from gpu4pyscf.lib.cupy_helper import asarray, batched_vec_norm2
+from gpu4pyscf.pbc.gto.cell import get_Gv, get_Gv_weights, get_SI
 
 def fft(f, mesh):
     '''Perform the 3D FFT from real (R) to reciprocal (G) space.
@@ -100,32 +101,6 @@ def ifftk(g, mesh, expikr):
     '''
     return ifft(g, mesh) * expikr
 
-def _get_Gv(cell, mesh):
-    assert cell.dimension == 3
-    # Default, the 3D uniform grids
-    rx = cp.fft.fftfreq(mesh[0], 1./mesh[0])
-    ry = cp.fft.fftfreq(mesh[1], 1./mesh[1])
-    rz = cp.fft.fftfreq(mesh[2], 1./mesh[2])
-    b = cp.asarray(cell.reciprocal_vectors())
-    #:Gv = lib.cartesian_prod(Gvbase).dot(b)
-    Gv = (rx[:,None,None,None] * b[0] +
-          ry[:,None,None] * b[1] +
-          rz[:,None] * b[2])
-    return Gv.reshape(-1, 3)
-
-def _get_Gv_with_base(cell, mesh):
-    assert cell.dimension == 3
-    # Default, the 3D uniform grids
-    rx = cp.fft.fftfreq(mesh[0], 1./mesh[0])
-    ry = cp.fft.fftfreq(mesh[1], 1./mesh[1])
-    rz = cp.fft.fftfreq(mesh[2], 1./mesh[2])
-    b = cp.asarray(cell.reciprocal_vectors())
-    #:Gv = lib.cartesian_prod(Gvbase).dot(b)
-    Gv = (rx[:,None,None,None] * b[0] +
-          ry[:,None,None] * b[1] +
-          rz[:,None] * b[2])
-    return Gv.reshape(-1, 3), (rx, ry, rz)
-
 def _Gv_wrap_around(cell, Gv, k, mesh):
     '''wrap around the high frequency k+G vectors into their lower frequency
     counterparts. Important if you want the gamma point and k-point answers to
@@ -186,7 +161,7 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None, mesh=None, Gv=None,
     if mesh is None:
         mesh = cell.mesh
     if Gv is None:
-        Gv = _get_Gv(cell, mesh)
+        Gv = get_Gv(cell, mesh)
     Gv = asarray(Gv)
 
     if omega is None:
@@ -231,7 +206,8 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None, mesh=None, Gv=None,
     else:
         kG = Gv
 
-    absG2 = cp.einsum('gi,gi->g', kG, kG)
+    # absG2 = cp.einsum('gi,gi->g', kG, kG)
+    absG2 = batched_vec_norm2(kG)
     G0_idx = 0
     if not is_gamma_point:
         G0_idx = None
@@ -287,6 +263,7 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None, mesh=None, Gv=None,
     # using Ewald probe charge (the function madelung below)
     if cell.dimension > 0 and exxdiv == 'ewald' and G0_idx is not None:
         if kpts is None:
+            Nk = 1
             kpts = np.zeros((1, 3))
             if mf is not None:
                 raise DeprecationWarning(
@@ -295,20 +272,82 @@ def get_coulG(cell, k=np.zeros(3), exx=False, mf=None, mesh=None, Gv=None,
         else:
             assert kpts.ndim == 2
         Nk = len(kpts)
-        if omega is None or omega == 0:
-            coulG[G0_idx] += Nk*cell.vol*madelung(cell, kpts)
-        else: # G=0 term should be handled separately in RSGDF and RSJK
-            raise NotImplementedError(f'exx=ewald for omega={omega}')
+        coulG[G0_idx] += Nk*cell.vol*madelung(cell, kpts, omega)
     return coulG
 
-def probe_charge_sr_coulomb(cell, omega, kpts=None):
-    if kpts is None:
-        kmesh = np.array([1, 1, 1])
-    else:
-        kmesh = get_monkhorst_pack_size(cell, kpts)
+def probe_charge_sr_coulomb(cell, omega, kmesh=None):
+    if kmesh is None:
+        kmesh = np.ones(3, dtype=int)
     rcut = (-np.log(cell.precision*1e-3)/omega**2)**.5
     Ls = cell.get_lattice_Ls(rcut=rcut) * kmesh
     r = np.linalg.norm(Ls, axis=1)
     r = r[(r > 1e-10) & (omega * r < 7)]
     ewovrl = .5 * (erfc(omega * r) / r).sum()
     return 2 * ewovrl * np.prod(kmesh)
+
+def madelung(cell, kpts=None, omega=None):
+    if kpts is None:
+        Nk = np.array([1,1,1])
+    else:
+        Nk = get_monkhorst_pack_size(cell, kpts)
+    ecell = cell.copy(deep=False)
+    ecell._atm = np.array([[1, cell._env.size, 0, 0, 0, 0]])
+    ecell._env = np.append(cell._env, [0., 0., 0.])
+    ecell.unit = 'B'
+    #ecell.verbose = 0
+    ecell.a = a = np.einsum('xi,x->xi', cell.lattice_vectors(), Nk)
+
+    if omega is None:
+        omega = cell.omega
+
+    if omega == 0:
+        return -2*ecell.ewald()
+
+    else:
+        # cell.ewald function does not use the Coulomb kernel function
+        # get_coulG. When computing the nuclear interactions with attenuated
+        # Coulomb operator, the Ewald summation technique is not needed
+        # because the Coulomb kernel 4pi/G^2*exp(-G^2/4/omega**2) decays
+        # quickly.
+        precision = cell.precision
+        Ecut = 10.
+        Ecut = np.log(16*np.pi**2/(2*omega**2*(2*Ecut)**.5) / precision + 1.) * 2*omega**2
+        Ecut = np.log(16*np.pi**2/(2*omega**2*(2*Ecut)**.5) / precision + 1.) * 2*omega**2
+        mesh = cutoff_to_mesh(a, Ecut)
+        Gv, Gvbase, weights = get_Gv_weights(ecell, mesh)
+        wcoulG = get_coulG(ecell, Gv=Gv, omega=abs(omega), exxdiv=None) * weights
+        SI = get_SI(ecell, mesh=mesh)
+        ZSI = SI[0]
+        e_lr = 2*abs(omega)/np.pi**0.5 - float(ZSI.conj().dot(ZSI * wcoulG).real)
+        if omega > 0:
+            return e_lr
+        else:
+            e_fr = -2*ecell.ewald() # The full-range Coulomb
+            return e_fr - e_lr
+
+def ke_to_mesh(a, cutoff):
+    '''
+    Based on pyscf.pbc.tools.pbc.cutoff_to_mesh
+    '''
+    b = 2 * np.pi * np.linalg.inv(a.T)
+    rx = np.linalg.qr(b[[1,2,0]].T)[1][2,2]
+    ry = np.linalg.qr(b[[2,0,1]].T)[1][2,2]
+    rz = np.linalg.qr(b.T)[1][2,2]
+
+    Gmax = (2*cutoff)**.5 / np.abs([rx, ry, rz])
+    mesh = np.ceil(Gmax * 2).astype(np.int32)
+    return mesh
+
+def mesh_to_ke(a, mesh):
+    '''
+    Based on pyscf.pbc.tools.pbc.mesh_to_cutoff
+    '''
+    b = 2 * np.pi * np.linalg.inv(a.T)
+    rx = np.linalg.qr(b[[1,2,0]].T)[1][2,2]
+    ry = np.linalg.qr(b[[2,0,1]].T)[1][2,2]
+    rz = np.linalg.qr(b.T)[1][2,2]
+
+    gs = np.asarray(mesh) / 2
+    Gmax = gs * np.array([rx, ry, rz])
+    ke_cutoff = Gmax**2 / 2
+    return ke_cutoff

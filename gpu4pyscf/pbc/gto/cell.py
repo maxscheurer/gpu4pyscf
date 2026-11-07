@@ -1,0 +1,111 @@
+#!/usr/bin/env python
+# Copyright 2026 The PySCF Developers. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import numpy as np
+import cupy as cp
+from gpu4pyscf.gto.mole import Cell, SortedCell
+
+__all__ = [
+    'get_Gv_weights', 'get_Gv', 'get_SI',
+]
+
+def get_Gv_base(cell, mesh=None):
+    if mesh is None:
+        mesh = cell.mesh
+
+    # Default, the 3D uniform grids
+    rx = cp.fft.fftfreq(mesh[0], 1./mesh[0])
+    ry = cp.fft.fftfreq(mesh[1], 1./mesh[1])
+    rz = cp.fft.fftfreq(mesh[2], 1./mesh[2])
+    return rx, ry, rz
+
+def get_Gv_weights(cell, mesh=None):
+    '''Calculate G-vectors and weights.
+
+    This is the CuPy version for pyscf.pbc.gto.cell.get_Gv_weights
+
+    Returns:
+        Gv : (ngris, 3) ndarray of floats
+            The array of G-vectors.
+    '''
+    if cell.dimension <= 2 and cell.low_dim_ft_type == 'inf_vacuum':
+        raise NotImplementedError
+
+    rx, ry, rz = Gvbase = get_Gv_base(cell, mesh)
+    b = cell.reciprocal_vectors()
+    weights = abs(np.linalg.det(b)) / (2*np.pi)**3
+
+    #:Gv = lib.cartesian_prod(Gvbase).dot(b)
+    b = cp.asarray(b)
+    brx = b[0,:,None] * rx
+    bry = b[1,:,None] * ry
+    brz = b[2,:,None] * rz
+    Gv = brx[:,:,None,None] + bry[:,None,:,None] + brz[:,None,None,:]
+    Gv = Gv.reshape(3,-1).T
+    return Gv, Gvbase, weights
+
+def get_Gv(cell, mesh=None):
+    return get_Gv_weights(cell, mesh)[0]
+
+def get_SI(cell, Gv=None, mesh=None, atmlst=None):
+    '''Calculate the structure factor (0D, 1D, 2D, 3D) for all atoms; see MH (3.34).
+
+    Args:
+        cell : instance of :class:`Cell`
+
+        Gv : (N,3) array
+            G vectors
+
+        atmlst : list of ints, optional
+            Indices of atoms for which the structure factors are computed.
+
+    Returns:
+        SI : (natm, ngrids) ndarray, dtype=np.complex128
+            The structure factor for each atom at each G-vector.
+    '''
+    coords = cp.asarray(cell.atom_coords())
+    if atmlst is not None:
+        coords = coords[np.asarray(atmlst)]
+    if Gv is None:
+        if mesh is None:
+            mesh = cell.mesh
+        basex, basey, basez = get_Gv_base(cell, mesh)
+        basex = cp.asarray(basex)
+        basey = cp.asarray(basey)
+        basez = cp.asarray(basez)
+        b = cp.asarray(cell.reciprocal_vectors())
+        rb = coords.dot(b.T)
+        SIx = cp.exp(-1j*rb[:,0,None] * basex)
+        SIy = cp.exp(-1j*rb[:,1,None] * basey)
+        SIz = cp.exp(-1j*rb[:,2,None] * basez)
+        SI = SIx[:,:,None,None] * SIy[:,None,:,None] * SIz[:,None,None,:]
+        natm = coords.shape[0]
+        SI = SI.reshape(natm, -1)
+    else:
+        SI = cp.exp(-1j*coords.dot(cp.asarray(Gv).T))
+    return SI
+
+def get_uniform_grids(cell, mesh=None, wrap_around=True):
+    '''CuPy version for pyscf.pbc.gto.cell.get_uniform_grids
+    '''
+    assert wrap_around
+    if mesh is None:
+        mesh = cell.mesh
+    freqs = [cp.fft.fftfreq(n) for n in mesh]
+    qv = cp.empty(tuple(mesh) + (3,))
+    qv[:,:,:,0] = freqs[0][:,None,None]
+    qv[:,:,:,1] = freqs[1][None,:,None]
+    qv[:,:,:,2] = freqs[2][None,None,:]
+    return cp.dot(qv.reshape(-1, 3), cp.asarray(cell.lattice_vectors()))

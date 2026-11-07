@@ -13,12 +13,14 @@
 # limitations under the License.
 
 import pyscf
+import cupy as cp
 import numpy as np
 import unittest
 import pytest
 from pyscf import scf, dft, tdscf
 import gpu4pyscf
 from gpu4pyscf import scf as gpu_scf
+from gpu4pyscf.grad.tests.test_tduhf_grad import diagonalize, diagonalize_tda
 
 atom = """
 O       0.0000000000     0.0000000000     0.0000000000
@@ -46,48 +48,6 @@ def tearDownModule():
     global mol
     mol.stdout.close()
     del mol
-
-
-def diagonalize(a, b, nroots=5):
-    a_aa, a_ab, a_bb = a
-    b_aa, b_ab, b_bb = b
-    nocc_a, nvir_a, nocc_b, nvir_b = a_ab.shape
-    a_aa = a_aa.reshape((nocc_a * nvir_a, nocc_a * nvir_a))
-    a_ab = a_ab.reshape((nocc_a * nvir_a, nocc_b * nvir_b))
-    a_bb = a_bb.reshape((nocc_b * nvir_b, nocc_b * nvir_b))
-    b_aa = b_aa.reshape((nocc_a * nvir_a, nocc_a * nvir_a))
-    b_ab = b_ab.reshape((nocc_a * nvir_a, nocc_b * nvir_b))
-    b_bb = b_bb.reshape((nocc_b * nvir_b, nocc_b * nvir_b))
-    a = np.block([[a_aa, a_ab], [a_ab.T, a_bb]])
-    b = np.block([[b_aa, b_ab], [b_ab.T, b_bb]])
-    abba = np.asarray(np.block([[a, b], [-b.conj(), -a.conj()]]))
-    e, xy = np.linalg.eig(abba)
-    sorted_indices = np.argsort(e)
-
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
-
-
-def diagonalize_tda(a, nroots=5):
-    a_aa, a_ab, a_bb = a
-    nocc_a, nvir_a, nocc_b, nvir_b = a_ab.shape
-    a_aa = a_aa.reshape((nocc_a * nvir_a, nocc_a * nvir_a))
-    a_ab = a_ab.reshape((nocc_a * nvir_a, nocc_b * nvir_b))
-    a_bb = a_bb.reshape((nocc_b * nvir_b, nocc_b * nvir_b))
-    a = np.block([[a_aa, a_ab], [a_ab.T, a_bb]])
-    e, xy = np.linalg.eig(a)
-    sorted_indices = np.argsort(e)
-
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
 
 
 def cal_analytic_gradient(mol, td, tdgrad, nocc_a, nvir_a, nocc_b, nvir_b, grad_elec, tda):
@@ -176,20 +136,17 @@ def cal_mf(mol, xc):
     mf.run()
     return mf
 
-
-def benchmark_with_finite_diff(mol_input, delta=0.1, xc='b3lyp', tda=False,
-                               tol=1e-5, coords_indices=None):
-    mol = mol_input.copy()
+def get_analytical_gradient(mol, xc='b3lyp', tda=False):
     mf = cal_mf(mol, xc)
     td = get_td(mf, tda, xc)
     tdgrad = td.nuc_grad_method()
     assert hasattr(tdgrad.base._scf, 'with_df')
 
     mo_occ = mf.mo_occ
-    occidxa = np.where(mo_occ[0]>0)[0]
-    occidxb = np.where(mo_occ[1]>0)[0]
-    viridxa = np.where(mo_occ[0]==0)[0]
-    viridxb = np.where(mo_occ[1]==0)[0]
+    occidxa = cp.where(mo_occ[0]>0)[0]
+    occidxb = cp.where(mo_occ[1]>0)[0]
+    viridxa = cp.where(mo_occ[0]==0)[0]
+    viridxb = cp.where(mo_occ[1]==0)[0]
     nocca = len(occidxa)
     noccb = len(occidxb)
     nvira = len(viridxa)
@@ -200,7 +157,12 @@ def benchmark_with_finite_diff(mol_input, delta=0.1, xc='b3lyp', tda=False,
     else:
         grad_elec = gpu4pyscf.grad.tduks.grad_elec
 
-    gradient_ana = cal_analytic_gradient(mol, td, tdgrad, nocca, nvira, noccb, nvirb, grad_elec, tda)
+    return cal_analytic_gradient(mol, td, tdgrad, nocca, nvira, noccb, nvirb, grad_elec, tda)
+
+def benchmark_with_finite_diff(mol_input, delta=0.1, xc='b3lyp', tda=False,
+                               tol=1e-5, coords_indices=None):
+    mol = mol_input.copy()
+    gradient_ana = get_analytical_gradient(mol, xc, tda)
 
     coords = mol.atom_coords(unit='Ang')*1.0
     if coords_indices is None:
@@ -234,25 +196,67 @@ class KnownValues(unittest.TestCase):
     @pytest.mark.slow
     def test_grad_svwn_tda_spinconserve_numerical(self):
         _check_grad(mol, tol=1e-4, xc="svwn", tda=True, method="numerical")
-    # def test_grad_svwn_tdhf_spinconserve_numerical(self):
-    #     _check_grad(mol, tol=1e-4, xc="svwn", tda=False, method="numerical")
 
-    # def test_grad_b3lyp_tda_spinconserve_numerical(self):
-    #     _check_grad(mol, tol=1e-4, xc="b3lyp", tda=True, method="numerical")
-    # def test_grad_b3lyp_tdhf_spinconserve_numerical(self):
-    #     _check_grad(mol, tol=1e-4, xc="b3lyp", tda=False, method="numerical")
+    def test_grad_svwn_tdhf_spinconserve_numerical(self):
+        #_check_grad(mol, tol=1e-4, xc="svwn", tda=False, method="numerical")
+        dat = get_analytical_gradient(mol, xc='svwn', tda=False)
+        ref = np.array(
+            [[0., 0.            ,-1.88780644e-02],
+             [0., 8.67007640e-02, 9.43904899e-03],
+             [0.,-8.67007640e-02, 9.43904899e-03],])
+        assert abs(dat - ref).max() < 1e-6
 
+    @pytest.mark.slow
+    def test_grad_b3lyp_tda_spinconserve_numerical(self):
+        #_check_grad(mol, tol=1e-4, xc="b3lyp", tda=True, method="numerical")
+        dat = get_analytical_gradient(mol, xc='b3lyp', tda=True)
+        ref = np.array(
+            [[0., 0.            ,-3.26248238e-02],
+             [0., 8.18759303e-02, 1.63124939e-02],
+             [0.,-8.18759303e-02, 1.63124939e-02],])
+        assert abs(dat - ref).max() < 1e-6
+
+    @pytest.mark.slow
+    def test_grad_b3lyp_tdhf_spinconserve_numerical(self):
+        #_check_grad(mol, tol=1e-4, xc="b3lyp", tda=False, method="numerical")
+        dat = get_analytical_gradient(mol, xc='b3lyp', tda=False)
+        ref = np.array(
+            [[0., 0.            ,-3.26534891e-02],
+             [0., 8.13758960e-02, 1.63268360e-02],
+             [0.,-8.13758960e-02, 1.63268360e-02],])
+        assert abs(dat - ref).max() < 1e-6
+
+    @pytest.mark.slow
     def test_grad_camb3lyp_tda_spinconserve_numerical(self):
         _check_grad(mol, tol=1e-4, xc="camb3lyp", tda=True, method="numerical")
-    # def test_grad_camb3lyp_tdhf_spinconserve_numerical(self):
-    #     _check_grad(mol, tol=1e-4, xc="camb3lyp", tda=False, method="numerical")
 
-    # def test_grad_tpss_tda_spinconserve_numerical(self):
-    #     _check_grad(mol, tol=1e-4, xc="tpss", tda=True, method="numerical")
+    def test_grad_camb3lyp_tdhf_spinconserve_numerical(self):
+        #_check_grad(mol, tol=1e-4, xc="camb3lyp", tda=False, method="numerical")
+        dat = get_analytical_gradient(mol, xc='camb3lyp', tda=False)
+        ref = np.array(
+            [[0., 0.            ,-3.23095737e-02],
+             [0., 8.15857769e-02, 1.61548788e-02],
+             [0.,-8.15857769e-02, 1.61548788e-02],])
+        assert abs(dat - ref).max() < 1e-6
+
+    def test_grad_tpss_tda_spinconserve_numerical(self):
+        #_check_grad(mol, tol=1e-4, xc="tpss", tda=True, method="numerical")
+        dat = get_analytical_gradient(mol, xc='tpss', tda=True)
+        ref = np.array(
+            [[0., 0.            ,-2.71597488e-02],
+             [0., 8.41304849e-02, 1.35798831e-02],
+             [0.,-8.41304849e-02, 1.35798831e-02],])
+        assert abs(dat - ref).max() < 1e-6
 
     @pytest.mark.slow
     def test_grad_tpss_tdhf_spinconserve_numerical(self):
-        _check_grad(mol, tol=1e-4, xc="tpss", tda=False, method="numerical")
+        #_check_grad(mol, tol=1e-4, xc="tpss", tda=False, method="numerical")
+        dat = get_analytical_gradient(mol, xc='tpss', tda=False)
+        ref = np.array(
+            [[0., 0.            ,-3.01291618e-02],
+             [0., 8.49331433e-02, 1.50646010e-02],
+             [0.,-8.49331433e-02, 1.50646010e-02],])
+        assert abs(dat - ref).max() < 1e-6
 
 
 if __name__ == "__main__":

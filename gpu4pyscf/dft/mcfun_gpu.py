@@ -13,12 +13,14 @@
 # limitations under the License.
 
 
+import math
 import warnings
 import cupy as cp
 import numpy as np
+from gpu4pyscf.lib.cupy_helper import contract
 from pyscf.dft.LebedevGrid import MakeAngularGrid
 
-MAX_GRIDS_PER_TASK = 4096
+MAX_GRIDS_PER_TASK = 65536
 
 def eval_xc_eff(func, rho_tm, deriv=1, spin_samples=770,
                 collinear_threshold=None, collinear_samples=200):
@@ -135,10 +137,11 @@ def eval_xc_collinear_spin(func, rho_tm, deriv, spin_samples):
     ngrids = rho_tm.shape[-1]
     # samples on z=cos(theta) and their weights between [0, 1]
     sgridz, weights = _make_paxis_samples(spin_samples)
-    blksize = int(cp.ceil(1e5 / ngrids)) * 8
+    blksize = math.ceil(1e5 / ngrids) * 8
 
     if rho_tm.ndim == 2:
         nvar = 1
+        rho_tm = rho_tm[:,None]
     else:
         nvar = rho_tm.shape[1]
 
@@ -151,12 +154,11 @@ def eval_xc_collinear_spin(func, rho_tm, deriv, spin_samples):
 
     xc_orig = func(rho_ts, deriv)
     exc_eff = xc_orig[0]
-    exc_eff = exc_eff[:,0]
 
     omega = omega.reshape(3, ngrids)
     if deriv > 0:
         vxc = xc_orig[1].reshape(2, nvar, ngrids)
-        vxc_eff = cp.vstack((vxc[:1], cp.einsum('xg,rg->rxg', vxc[1], omega)))
+        vxc_eff = cp.vstack((vxc[:1], contract('xg,rg->rxg', vxc[1], omega)))
 
     if deriv > 1:
         # spin-conserve part
@@ -165,7 +167,7 @@ def eval_xc_collinear_spin(func, rho_tm, deriv, spin_samples):
         fxc_eff[0,:,0] = fxc[0,:,0]
         fz1 = cp.einsum('xyg,rg->rxyg', fxc[1,:,0], omega)
         fxc_eff[1:,:,0 ] = fz1
-        fxc_eff[0 ,:,1:] = fz1.transpose(1,0,2,3)
+        fxc_eff[0 ,:,1:] = fz1.transpose(2,0,1,3)
         tmp = cp.einsum('xyg,rg->rxyg', fxc[1,:,1,:], omega)
         fxc_eff[1:,:,1:] = cp.einsum('rxyg,sg->rxsyg', tmp, omega)
 
@@ -201,13 +203,16 @@ def _eval_xc_lebedev(func, rho_tm, deriv, spin_samples,
     sgrids, weights = _make_sph_samples(spin_samples)
     sgrids = cp.asarray(sgrids)
     weights = cp.asarray(weights)
-    blksize = int(cp.ceil(1e4 / ngrids)) * 8
-    # import pdb
-    # pdb.set_trace()
+
     if rho_tm.ndim == 2:
         nvar = 1
     else:
         nvar = rho_tm.shape[1]
+    if nvar >=5:
+        ndim = 2
+    else:
+        ndim = 4
+    blksize = math.ceil(ndim*1e5 / ngrids) * 8
     exc_eff = vxc_eff = fxc_eff = kxc_eff = 0
     for p0, p1 in _prange(0, weights.size, blksize):
         nsg = p1 - p0
@@ -272,17 +277,11 @@ def _eval_xc_lebedev(func, rho_tm, deriv, spin_samples,
 
     # Strongly spin-polarized points (rho ~= |m|) can be considered as collinear spins
     if collinear_threshold is not None:
-        rho, s = _project_spin_paxis(rho_tm.reshape(4, nvar, ngrids)[:,0])
-        cs_idx = cp.where(s >= rho * collinear_threshold)[0]
+        rho, s = _project_spin_paxis(rho_tm.reshape(4, nvar, ngrids)[:, :1])
+        cs_idx = cp.where(s[0] >= rho[0] * collinear_threshold)[0]
         if cs_idx.size > 0:
             xc_cs = eval_xc_collinear_spin(func, rho_tm[...,cs_idx], deriv,
                                            collinear_samples)
-            print("debug 1")
-            print("exc_eff", exc_eff.shape)
-            print("cs_idx", cs_idx.shape)
-            print("xc_cs", len(xc_cs))
-            print("xc_cs[0]", xc_cs[0].shape)
-            print("rho_tm", rho_tm.shape)
             exc_eff[...,cs_idx] = xc_cs[0]
             if deriv > 0:
                 vxc_eff[...,cs_idx] = xc_cs[1]
@@ -358,23 +357,21 @@ def _project_spin_paxis(rho_tm, sgridz=None):
     rho = rho_tm[0]
     m = rho_tm[1:]
 
-    s = cp.linalg.norm(m, axis=0)
+    assert rho_tm.ndim == 3
+
+    norm = cp.linalg.norm(m[:, 0], axis=0)
+    axis = m[:, 0] / cp.where(norm == 0, 1, norm)
+    s = cp.einsum('axg,ag->xg', m, axis)
+    s[0] = norm
+
     if sgridz is None:
         rho_ts = cp.stack([rho, s])
     else:
         ngrids = rho.shape[-1]
         nsg = sgridz.shape[0]
-        if rho_tm.ndim == 2:
-            rho_ts = cp.empty((2, ngrids, nsg))
-            rho_ts[0] = rho[:,cp.newaxis]
-            rho_ts[1] = s[:,cp.newaxis] * sgridz
-            rho_ts = rho_ts.reshape(2, ngrids * nsg)
-        else:
-            print('222')
-            nvar = rho_tm.shape[1]
-            rho_ts = cp.empty((2, nvar, ngrids, nsg))
-            rho_ts[0] = rho[:,:,cp.newaxis]
-            rho_ts[1] = s[:,:,cp.newaxis] * sgridz
-            rho_ts = rho_ts.reshape(2, nvar, ngrids * nsg)
+        nvar = rho_tm.shape[1]
+        rho_ts = cp.empty((2, nvar, ngrids, nsg))
+        rho_ts[0] = rho[:,:,cp.newaxis]
+        rho_ts[1] = s[:,:,cp.newaxis] * sgridz
+        rho_ts = rho_ts.reshape(2, nvar, ngrids * nsg)
     return rho_ts
-

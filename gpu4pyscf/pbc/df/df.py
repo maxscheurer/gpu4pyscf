@@ -15,7 +15,7 @@
 '''
 Density fitting
 
-Divide the 3-center Coulomb integrals to two parts.  Compute the local
+Divide the 3-center Coulomb integrals to two parts.  Compute the short-range
 part in real space, long range part in reciprocal space.
 '''
 
@@ -58,9 +58,14 @@ class GDF(lib.StreamObject):
 
     _keys = df_cpu.GDF._keys.union({'is_gamma_point', 'nao', 'kmesh'})
 
+    __getstate__, __setstate__ = lib.generate_pickle_methods(
+        excludes=('_cderi_to_save', '_cderi', '_cderip', '_cderi_idx', '_rsh_df'),
+        reset_state=True)
+
     def __init__(self, cell, kpts=None):
         df_cpu.GDF.__init__(self, cell, kpts)
         self.nao = None
+        self._omega = 0
 
     # Some methods inherited from the molecule code tries to access the .mol attribute
     @property
@@ -91,13 +96,10 @@ class GDF(lib.StreamObject):
             if isinstance(self._kpts, KPoints):
                 self.kpts = reset_kpts(self.kpts, cell)
             self.cell = cell
+            self.auxcell = None
         self._cderi = self._cderip = self._cderi_idx = None
         self._rsh_df = {}
         return self
-
-    __getstate__, __setstate__ = lib.generate_pickle_methods(
-        excludes=('_cderi_to_save', '_cderi', '_cderip', '_cderi_idx', '_rsh_df'),
-        reset_state=True)
 
     auxbasis = df_cpu.GDF.auxbasis
 
@@ -117,6 +119,7 @@ class GDF(lib.StreamObject):
     def build(self, j_only=None, kpts_band=None):
         warnings.warn(
             'PBC.df is currently experimental and subject to significant changes.')
+        self.reset()
         if j_only is not None:
             self._j_only = j_only
         assert kpts_band is None and self.kpts_band is None
@@ -130,6 +133,7 @@ class GDF(lib.StreamObject):
         auxcell = df_cpu.make_auxcell(cell, self.auxbasis, self.exp_to_discard)
         self.auxcell = auxcell
         self.nao = cell.nao
+        self._omega = cell.omega
 
         kpts = self.kpts
         if self.is_gamma_point:
@@ -140,10 +144,9 @@ class GDF(lib.StreamObject):
 
         t1 = (logger.process_clock(), logger.perf_counter())
         self._cderi, self._cderip, self._cderi_idx = rsdf_builder.build_cderi(
-            cell, auxcell, kpts, self.kmesh, j_only=self._j_only,
+            cell, auxcell, kpts, self.kmesh, j_only=self._j_only, omega=self._omega,
             linear_dep_threshold=self.linear_dep_threshold, compress=True)
         ao_pair_mapping, diag_idx = self._cderi_idx
-        self._cderi_idx = asarray(ao_pair_mapping), asarray(diag_idx)
         logger.debug1(self, 'len(cderi)=%d len(ao_pair)=%d len(diag)=%d',
                       len(self._cderi), len(ao_pair_mapping), len(diag_idx))
         t1 = logger.timer_debug1(self, 'j3c', *t1)
@@ -186,7 +189,7 @@ class GDF(lib.StreamObject):
             expLk = fft_matrix(self.kmesh)
             nao = cell.nao
             kk_conserv = k2gamma.double_translation_indices(self.kmesh)
-            conj_mapping = conj_images_in_bvk_cell(self.kmesh)
+            conj_mapping = cp.asarray(conj_images_in_bvk_cell(self.kmesh), dtype=np.int32)
             out_buf = out
 
         cderi_buf = out
@@ -221,6 +224,9 @@ class GDF(lib.StreamObject):
     def get_nuc(self, kpts=None):
         return rsdf_builder.get_nuc(self.cell, kpts)
 
+    def get_j(self, dm, hermi=0, kpts=None, kpts_band=None, verbose=None):
+        return self.get_jk(dm, hermi, kpts, kpts_band, with_k=False)[0]
+
     # Note: Special exxdiv by default should not be used for an arbitrary
     # input density matrix. When the df object was used with the molecular
     # post-HF code, get_jk was often called with an incomplete DM (e.g. the
@@ -234,16 +240,20 @@ class GDF(lib.StreamObject):
                 mydf = AFTDF(cell, self.kpts)
                 ke_cutoff = estimate_ke_cutoff_for_omega(cell, omega)
                 mydf.mesh = cell.cutoff_to_mesh(ke_cutoff)
-            else:
-                mydf = self
-            with mydf.range_coulomb(omega) as rsh_df:
+                return mydf.get_jk(dm, hermi, kpts, kpts_band, with_j, with_k,
+                                   omega=omega, exxdiv=exxdiv)
+
+            with self.range_coulomb(omega) as rsh_df:
+                if rsh_df._cderi is None:
+                    rsh_df.build(j_only=not with_k)
+                assert omega == rsh_df._omega
                 return rsh_df.get_jk(dm, hermi, kpts, kpts_band, with_j, with_k,
                                      omega=None, exxdiv=exxdiv)
 
         if self.is_gamma_point:
             return df_jk_real.get_jk(self, dm, hermi, with_j, with_k, exxdiv)
         else:
-            kpts, is_single_kpt = _check_kpts(kpts, dm)
+            kpts, is_single_kpt = _check_kpts(kpts)
             if is_single_kpt:
                 return df_jk.get_jk(self, dm, hermi, kpts[0], kpts_band, with_j,
                                     with_k, exxdiv)
@@ -285,25 +295,23 @@ class GDF(lib.StreamObject):
             aux_iter = lib.prange(0, naux, blksize)
 
         if unpack:
-            nao = self.nao
-            ao_pair_mapping, diag = self._cderi_idx
-            ao_pair_mapping = asarray(ao_pair_mapping)
-            rows, cols = divmod(ao_pair_mapping, nao)
-            buf_cderi = cp.zeros([blksize,nao,nao])
+            pair_address = cp.asarray(self._cderi_idx[0], dtype=np.int32)
+            expLk = cp.ones((1, 1), dtype=np.complex128)
+            def unpack_block(block):
+                return rsdf_builder._unpack_cderi_v2(
+                    block, pair_address, [0], [0], expLk, self.nao)[0]
 
         out2 = None
         for p0, p1 in aux_iter:
             out = asarray(cderi_sparse[p0:p1])
             if unpack:
-                out2 = buf_cderi[:p1-p0]
-                out2[:,cols,rows] = out2[:,rows,cols] = out
+                out2 = unpack_block(out)
             yield out2, out.T, 1
 
             if p0 == 0 and cell.dimension == 2:
                 out = asarray(self._cderip[0])
                 if unpack:
-                    out2 = buf_cderi[:1]
-                    out2[:,cols,rows] = out2[:,rows,cols] = out
+                    out2 = unpack_block(out)
                 yield out2, out.T, -1
 
     to_gpu = utils.to_gpu

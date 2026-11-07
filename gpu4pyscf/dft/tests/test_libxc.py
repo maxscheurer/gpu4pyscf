@@ -52,9 +52,10 @@ def _diff(dat, ref):
     return np.min((abs(d/(ref+1e-300)), abs(d)), axis=0)
 
 class KnownValues(unittest.TestCase):
-    def _check_xc(self, xc, spin=0, deriv=2, fxc_tol=1e-10, kxc_tol=1e-10):
+    def _check_xc(self, xc, spin=0, deriv=2, fxc_tol=1e-10, kxc_tol=1e-10, omega=None):
         ni_cpu = numint_cpu()
         ni_gpu = numint_gpu()
+        ni_cpu.omega = ni_gpu.omega = omega
         xctype = ni_cpu._xc_type(xc)
 
         if xctype == 'LDA':
@@ -70,14 +71,14 @@ class KnownValues(unittest.TestCase):
         exc_cpu, vxc_cpu, fxc_cpu, kxc_cpu = ni_cpu.eval_xc_eff(xc, rho, deriv=deriv, xctype=xctype)
         exc_gpu, vxc_gpu, fxc_gpu, kxc_gpu = ni_gpu.eval_xc_eff(xc, cupy.array(rho), deriv=deriv, xctype=xctype)
 
-        print(f"{xc} {spin} exc", _diff(exc_gpu[:,0].get(), exc_cpu).max())
+        print(f"{xc} {spin} exc", _diff(exc_gpu.get(), exc_cpu).max())
         print(f"{xc} {spin} vxc", _diff(vxc_gpu.get(), vxc_cpu).max())
         if fxc_gpu is not None:
             print(f"{xc} {spin} fxc", _diff(fxc_gpu.get(), fxc_cpu).max())
         if kxc_gpu is not None:
             print(f"{xc} {spin} kxc", _diff(kxc_gpu.get(), kxc_cpu).max())
 
-        assert _diff(exc_gpu[:,0].get(), exc_cpu).max() < 1e-10
+        assert _diff(exc_gpu.get(), exc_cpu).max() < 1e-10
         assert _diff(vxc_gpu.get(), vxc_cpu).max() < 1e-10
         if fxc_gpu is not None:
             assert _diff(fxc_gpu.get(), fxc_cpu).max() < fxc_tol
@@ -85,7 +86,7 @@ class KnownValues(unittest.TestCase):
             assert _diff(kxc_gpu.get(), kxc_cpu).max() < kxc_tol
 
     def test_LDA(self):
-        whether_use_gpu = os.environ.get('LIBXC_ON_GPU', '0') == '1'
+        whether_use_gpu = True
         if whether_use_gpu:
             deriv = 3
             print("test LDA with deriv 3")
@@ -95,7 +96,7 @@ class KnownValues(unittest.TestCase):
         self._check_xc('LDA_C_VWN', deriv=deriv)
 
     def test_GGA(self):
-        whether_use_gpu = os.environ.get('LIBXC_ON_GPU', '0') == '1'
+        whether_use_gpu = True
         if whether_use_gpu:
             deriv = 3
         else:
@@ -105,7 +106,7 @@ class KnownValues(unittest.TestCase):
         self._check_xc('GGA_C_PBE', fxc_tol=1e-4, deriv=deriv, kxc_tol=3e2)
 
     def test_mGGA(self):
-        whether_use_gpu = os.environ.get('LIBXC_ON_GPU', '0') == '1'
+        whether_use_gpu = True
         if whether_use_gpu:
             deriv = 3
         else:
@@ -126,6 +127,28 @@ class KnownValues(unittest.TestCase):
 
     def test_xc_on_cpu(self):
         self._check_xc('th1', spin=0)
+
+    def test_rsh_omega_in_xc_code(self):
+        # libxc's default for ITYH is omega=0.2
+        self._check_xc('LR_HF(0.3)+ITYH,LYP', deriv=1)
+        self._check_xc('LR_HF(0.3)+ITYH,LYP', spin=1, deriv=1)
+
+    def test_rsh_omega_override(self):
+        # libxc 7.1.2 and libxc 7.0.0 has small differences in XC_LRC_WPBEH
+        if numint_gpu.libxc.__version__[:5] == numint_cpu.libxc.__version__[:5]:
+            # LRC_WPBEH rather than LC_WPBE: LC_WPBE's vxc differs from pyscf by
+            # ~2e-9 even at its default omega
+            self._check_xc('HYB_GGA_XC_LRC_WPBEH', deriv=1, omega=0.1)
+            self._check_xc('HYB_GGA_XC_LRC_WPBEH', spin=1, deriv=1, omega=0.1)
+            # functionals are cached; the override must not leak into the next call
+            self._check_xc('HYB_GGA_XC_LRC_WPBEH', deriv=1)
+        self._check_xc('CAM_B3LYP', deriv=1, omega=0.2)
+        self._check_xc('LR_HF(0.3)+ITYH,LYP', deriv=1, omega=0.175)
+
+    def test_to_cpu_keeps_omega(self):
+        ni = numint_gpu()
+        ni.omega = 0.175
+        assert ni.to_cpu().omega == 0.175
 
 if __name__ == "__main__":
     print("Full Tests for xc fun")

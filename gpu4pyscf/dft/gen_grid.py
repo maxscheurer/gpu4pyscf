@@ -35,6 +35,8 @@ from pyscf import gto
 from pyscf.dft import gen_grid as gen_grid_cpu
 from gpu4pyscf.lib import utils
 from pyscf.gto.eval_gto import BLKSIZE, NBINS, CUTOFF, make_screen_index
+from pyscf.data.elements import _std_symbol_without_ghost
+from pyscf.data.elements import charge as elements_proton
 from pyscf import __config__
 from gpu4pyscf.lib import logger
 from gpu4pyscf.dft import radi
@@ -170,14 +172,15 @@ def treutler_prune(nuc, rads, n_ang, radii=None):
 # Stratmann, Scuseria, Frisch. CPL, 257, 213 (1996), eq.11
 def stratmann(g):
     '''Stratmann, Scuseria, Frisch. CPL, 257, 213 (1996); DOI:10.1016/0009-2614(96)00600-8'''
-    a = .64  # for eq. 14
-    g = numpy.asarray(g)
-    ma = g/a
-    ma2 = ma * ma
-    g1 = numpy.asarray((1/16.)*(ma*(35 + ma2*(-35 + ma2*(21 - 5 *ma2)))))
-    g1[g<=-a] = -1
-    g1[g>= a] =  1
-    return g1
+    # a = .64  # for eq. 14
+    # g = numpy.asarray(g)
+    # ma = g/a
+    # ma2 = ma * ma
+    # g1 = numpy.asarray((1/16.)*(ma*(35 + ma2*(-35 + ma2*(21 - 5 *ma2)))))
+    # g1[g<=-a] = -1
+    # g1[g>= a] =  1
+    # return g1
+    raise RuntimeError("This function should never actually be called")
 
 def original_becke(g):
     '''Becke, JCP 88, 2547 (1988); DOI:10.1063/1.454033'''
@@ -186,7 +189,16 @@ def original_becke(g):
 #    g = (3 - g**2) * g * .5
 #    g = (3 - g**2) * g * .5
 #    return g
-    pass
+    raise RuntimeError("This function should never actually be called")
+
+def get_C_interface_scheme_id(becke_scheme):
+    # Find these ids in lib/gdft/gen_grids.cu :: enum class GridPartitionScheme
+    if becke_scheme == original_becke or becke_scheme == gen_grid_cpu.original_becke:
+        return 100
+    elif becke_scheme == stratmann or becke_scheme == gen_grid_cpu.stratmann:
+        return 101
+    else:
+        raise ValueError(f"becke_scheme = {becke_scheme} not recognized")
 
 def gen_atomic_grids(mol, atom_grid={}, radi_method=radi.gauss_chebyshev,
                      level=3, prune=nwchem_prune, **kwargs):
@@ -200,14 +212,17 @@ def gen_atomic_grids(mol, atom_grid={}, radi_method=radi.gauss_chebyshev,
     if isinstance(atom_grid, (list, tuple)):
         atom_grid = dict([(mol.atom_symbol(ia), atom_grid)
                           for ia in range(mol.natm)])
+
+    default = atom_grid.get('default', None)
     atom_grids_tab = {}
     for ia in range(mol.natm):
         symb = mol.atom_symbol(ia)
 
         if symb not in atom_grids_tab:
-            chg = gto.charge(symb)
-            if symb in atom_grid:
-                n_rad, n_ang = atom_grid[symb]
+            chg = elements_proton(_std_symbol_without_ghost(symb))
+            atom_config = atom_grid.get(symb, default)
+            if atom_config is not None:
+                n_rad, n_ang = atom_config
                 if n_ang not in LEBEDEV_NGRID:
                     if n_ang in LEBEDEV_ORDER:
                         logger.warn(mol, 'n_ang %d for atom %d %s is not '
@@ -262,7 +277,6 @@ def get_partition(mol, atom_grids_tab,
         grid_coord and grid_weight arrays.  grid_coord array has shape (N,3);
         weight 1D array has N elements.
     '''
-    assert becke_scheme is original_becke
     atm_coords = cupy.asarray(mol.atom_coords() , order='F')
     atm_ngrids = numpy.array([atom_grids_tab[mol.atom_symbol(ia)][1].size
                               for ia in range(mol.natm)])
@@ -279,18 +293,26 @@ def get_partition(mol, atom_grids_tab,
         weights[p0:p1] = vol
         atm_idx[p0:p1] = ia
 
-    # support atomic_radii_adjust = None
-    assert radii_adjust == radi.treutler_atomic_radii_adjust
-    a = -radi.get_treutler_fac(mol, atomic_radii)
-    #a = -radi.get_becke_fac(mol, atomic_radii)
+    if radii_adjust is None:
+        # a_factor = cupy.zeros([mol.natm, mol.natm])
+        a_factor_ptr = lib.c_null_ptr()
+    else:
+        assert radii_adjust == radi.treutler_atomic_radii_adjust
+        a_factor = -radi.get_treutler_fac(mol, atomic_radii)
+        a_factor_ptr = ctypes.cast(a_factor.data.ptr, ctypes.c_void_p)
+
+    scheme_id = get_C_interface_scheme_id(becke_scheme)
+
     err = libgdft.GDFTbecke_partition_weights(
         ctypes.cast(weights.data.ptr, ctypes.c_void_p),
         ctypes.cast(coords.data.ptr, ctypes.c_void_p),
         ctypes.cast(atm_coords.data.ptr, ctypes.c_void_p),
-        ctypes.cast(a.data.ptr, ctypes.c_void_p),
+        a_factor_ptr,
         ctypes.cast(atm_idx.data.ptr, ctypes.c_void_p),
         ctypes.c_int(ngrids),
-        ctypes.c_int(mol.natm)
+        ctypes.c_int(mol.natm),
+        ctypes.c_int(scheme_id),
+        ctypes.c_void_p(cupy.cuda.get_current_stream().ptr),
     )
     if err != 0:
         raise RuntimeError('GDFTbecke_partition_weights kernel failed')
@@ -335,7 +357,7 @@ def argsort_group(group_ids, ngroup):
     '''
     groups = []
     for i in range(ngroup):
-        groups.append(cupy.argwhere(group_ids==i)[0])
+        groups.append(cupy.where(group_ids == i)[0])
     return cupy.hstack(groups)
 
 def atomic_group_grids(mol, coords):
@@ -365,12 +387,12 @@ def atomic_group_grids(mol, coords):
     group_ids = cupy.empty([ngrids], dtype=numpy.int32)
     stream = cupy.cuda.get_current_stream()
     err = libgdft.GDFTgroup_grids(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(group_ids.data.ptr, ctypes.c_void_p),
         ctypes.cast(atom_coords.data.ptr, ctypes.c_void_p),
         ctypes.cast(coords.data.ptr, ctypes.c_void_p),
         ctypes.c_int(natm),
-        ctypes.c_int(ngrids)
+        ctypes.c_int(ngrids),
+        ctypes.cast(stream.ptr, ctypes.c_void_p)
     )
     if err != 0:
         raise RuntimeError('CUDA Error')
@@ -408,7 +430,7 @@ def _load_conf(mod, name, default):
     var = getattr(__config__, name, None)
     if var is None:
         var = default
-    elif isinstance(var):
+    elif isinstance(var, str):
         if mod is None:
             mod = sys.modules[__name__]
         var = getattr(mod, var)
@@ -451,7 +473,7 @@ class Grids(lib.StreamObject):
     def size(self):
         return getattr(self.weights, 'size', 0)
 
-    def build(self, mol=None, with_non0tab=False, sort_grids=True, **kwargs):
+    def build(self, mol=None, with_non0tab=False, sort_grids=True, sort_grids_of_each_atom=False, **kwargs):
         if mol is None: mol = self.mol
         if self.verbose >= logger.WARN:
             self.check_sanity()
@@ -474,25 +496,83 @@ class Grids(lib.StreamObject):
         self.quadrature_weights = quadrature_weights
 
         t0 = log.timer_debug1('generating atomic grids', *t0)
-        if self.alignment > 1:
-            padding = _padding_size(self.size, self.alignment)
-            log.debug('Padding %d grids', padding)
-            if padding > 0:
-                # cupy.vstack and cupy.hstack convert numpy array into cupy array first
-                self.coords = cupy.vstack(
-                    [self.coords, cupy.full((padding, 3), 1e-4)])
-                self.weights = cupy.hstack([self.weights, cupy.zeros(padding)])
-                self.quadrature_weights = cupy.hstack([self.quadrature_weights, cupy.zeros(padding)])
-                self.atm_idx = cupy.hstack([self.atm_idx, cupy.full(padding, -1, dtype=numpy.int32)])
 
-        if sort_grids:
-            #idx = arg_group_grids(mol, self.coords)
-            idx = atomic_group_grids(mol, self.coords)
-            self.coords = self.coords[idx]
-            self.weights = self.weights[idx]
-            self.quadrature_weights = self.quadrature_weights[idx]
-            self.atm_idx = self.atm_idx[idx]
-            t0 = log.timer_debug1('sorting grids', *t0)
+        if sort_grids or sort_grids_of_each_atom:
+            assert self.alignment > 1 and self.alignment % 128 == 0
+
+        if sort_grids_of_each_atom:
+            grid_offsets_of_atom = np.zeros((mol.natm + 1), dtype = np.int32)
+            p0 = p1 = 0
+            for i_atom in range(mol.natm):
+                r, vol = atom_grids_tab[mol.atom_symbol(i_atom)]
+                p0, p1 = p1, p1 + vol.size
+                grid_offsets_of_atom[i_atom + 1] = p1
+
+            coords_atom_padded = []
+            weights_atom_padded = []
+            quadrature_weights_atom_padded = []
+            atm_idx_atom_padded = []
+
+            # For each atom we round the number of grid to multiple of block_size, which is 4096 by default.
+            # This guarantees all grids for each atom reside under the same block when determining sparsity.
+            # This can increase the memory usage by 4095*natm at most, which is a huge number for small grids, like SG1.
+            from gpu4pyscf.dft import numint
+            block_size = numint.MIN_BLK_SIZE
+            atomic_alignment = ((block_size + self.alignment - 1) // self.alignment) * self.alignment
+
+            for i_atom in range(mol.natm):
+                g0 = int(grid_offsets_of_atom[i_atom])
+                g1 = int(grid_offsets_of_atom[i_atom + 1])
+
+                atomic_coords = self.coords[g0:g1, :]
+                atomic_weights = self.weights[g0:g1]
+                atomic_quadrature_weights = self.quadrature_weights[g0:g1]
+                assert atomic_coords.shape == (g1-g0, 3)
+
+                n_with_padded = (((g1-g0) + atomic_alignment - 1) // atomic_alignment) * atomic_alignment
+                n_pad = n_with_padded - (g1-g0)
+                atomic_coords = cupy.vstack([atomic_coords, cupy.broadcast_to(self.coords[-1, :], (n_pad, 3))])
+                atomic_weights = cupy.hstack([atomic_weights, cupy.zeros(n_pad)])
+                atomic_quadrature_weights = cupy.hstack([atomic_quadrature_weights, cupy.zeros(n_pad)])
+
+                sorting_idx = atomic_group_grids(mol, atomic_coords)
+
+                atomic_coords = atomic_coords[sorting_idx]
+                atomic_weights = atomic_weights[sorting_idx]
+                atomic_quadrature_weights = atomic_quadrature_weights[sorting_idx]
+
+                atomic_idx = cupy.full(n_with_padded, i_atom, dtype = cupy.int32)
+
+                coords_atom_padded.append(atomic_coords)
+                weights_atom_padded.append(atomic_weights)
+                quadrature_weights_atom_padded.append(atomic_quadrature_weights)
+                atm_idx_atom_padded.append(atomic_idx)
+
+            self.coords = cupy.vstack(coords_atom_padded)
+            self.weights = cupy.hstack(weights_atom_padded)
+            self.quadrature_weights = cupy.hstack(quadrature_weights_atom_padded)
+            self.atm_idx = cupy.hstack(atm_idx_atom_padded)
+
+        else:
+            if self.alignment > 1:
+                padding = _padding_size(self.size, self.alignment)
+                log.debug('Padding %d grids', padding)
+                if padding > 0:
+                    # cupy.vstack and cupy.hstack convert numpy array into cupy array first
+                    self.coords = cupy.vstack(
+                        [self.coords, cupy.full((padding, 3), 1e-4)])
+                    self.weights = cupy.hstack([self.weights, cupy.zeros(padding)])
+                    self.quadrature_weights = cupy.hstack([self.quadrature_weights, cupy.zeros(padding)])
+                    self.atm_idx = cupy.hstack([self.atm_idx, cupy.full(padding, -1, dtype=numpy.int32)])
+
+            if sort_grids:
+                #idx = arg_group_grids(mol, self.coords)
+                idx = atomic_group_grids(mol, self.coords)
+                self.coords = self.coords[idx]
+                self.weights = self.weights[idx]
+                self.quadrature_weights = self.quadrature_weights[idx]
+                self.atm_idx = self.atm_idx[idx]
+                t0 = log.timer_debug1('sorting grids', *t0)
 
         if with_non0tab:
             self.non0tab = self.make_mask(mol, self.coords)
@@ -602,7 +682,6 @@ class Grids(lib.StreamObject):
         _env_gpu = cp.asarray(_sorted_mol._env, dtype=np.float64)
 
         libgdft.GDFTscreen_index(
-            ctypes.cast(stream.ptr, ctypes.c_void_p),
             ctypes.cast(non0shl_mask.data.ptr, ctypes.c_void_p),
             ctypes.c_double(np.log(cutoff)),
             ctypes.cast(coords.data.ptr, ctypes.c_void_p),
@@ -611,7 +690,8 @@ class Grids(lib.StreamObject):
             ctypes.c_int(len(_atm_gpu)),
             ctypes.cast(_bas_gpu.data.ptr, ctypes.c_void_p),
             ctypes.c_int(len(_bas_gpu)),
-            ctypes.cast(_env_gpu.data.ptr, ctypes.c_void_p))
+            ctypes.cast(_env_gpu.data.ptr, ctypes.c_void_p),
+            ctypes.cast(stream.ptr, ctypes.c_void_p))
 
         # offset of contraction pattern, used in eval_ao
         l_ctr_offsets = opt.l_ctr_offsets
@@ -669,7 +749,10 @@ class Grids(lib.StreamObject):
 
     def to_cpu(self):
         grids = gen_grid_cpu.Grids(self.mol)
-        utils.to_cpu(self, out=grids)
+        # non0tab, screen_index might be incompatible with CPU impl. calling
+        # reset() to release them.
+        grids_gpu = self.copy().reset()
+        utils.to_cpu(grids_gpu, out=grids)
         return grids
 
 _default_rad = gen_grid_cpu._default_rad

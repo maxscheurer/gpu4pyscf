@@ -15,22 +15,22 @@
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --ptxas-options=-v")
 
 set(CMAKE_VERBOSE_MAKEFILE ON)
-add_library(gint SHARED
+add_library(gint SHARED 
   g2e.c
   pair_data.c
   bpcache.cu
   constant.cu
-  nr_fill_ao_ints.cu
+  #nr_fill_ao_ints.cu
   nr_fill_ao_int3c1e.cu
   nr_fill_ao_int3c1e_ip.cu
   nr_fill_ao_int3c1e_ipip.cu
   nr_fill_ao_int3c2e.cu
-  nr_fill_ao_int3c2e_ip1.cu
-  nr_fill_ao_int3c2e_ip2.cu
-  nr_fill_ao_int3c2e_ipip1.cu
-  nr_fill_ao_int3c2e_ipip2.cu
-  nr_fill_ao_int3c2e_ip1ip2.cu
-  nr_fill_ao_int3c2e_ipvip1.cu
+  #nr_fill_ao_int3c2e_ip1.cu
+  #nr_fill_ao_int3c2e_ip2.cu
+  #nr_fill_ao_int3c2e_ipip1.cu
+  #nr_fill_ao_int3c2e_ipip2.cu
+  #nr_fill_ao_int3c2e_ip1ip2.cu
+  #nr_fill_ao_int3c2e_ipvip1.cu
   nr_fill_ao_int3c_overlap.cu
   nr_fill_ao_int3c_overlap_ip1.cu
   j_engine_matrix_reorder.c

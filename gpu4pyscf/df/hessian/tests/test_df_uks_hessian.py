@@ -14,12 +14,15 @@
 
 import unittest
 import numpy
+import pyscf
+from pyscf import lib
 from pyscf import gto, dft
+from packaging import version
 
 def setUpModule():
     global mol
     mol = gto.Mole()
-    mol.verbose = 1
+    mol.verbose = 5
     mol.output = '/dev/null'
     mol.atom.extend([
         ["O" , (0. , 0.     , 0.)],
@@ -62,14 +65,16 @@ class KnownValues(unittest.TestCase):
         mf.conv_tol_cpscf = 1e-8
         mf.kernel()
 
-        hessobj = mf.Hessian()
-        hess_cpu = hessobj.kernel()
-
-        mf = mf.to_gpu()
-        hessobj = mf.Hessian()
-        hessobj.auxbasis_response = 1
+        mf_gpu = mf.to_gpu()
+        hessobj = mf_gpu.Hessian()
         hess_gpu = hessobj.kernel()
-        assert numpy.linalg.norm(hess_cpu - hess_gpu) < 1e-5
+        assert abs(lib.fp(hess_gpu) - -1.2463973314907781) < 1e-7
+
+        if version.parse(pyscf.__version__) >= version.parse('2.14.0'):
+            hessobj = mf.Hessian()
+            hessobj.auxbasis_response = 2
+            hess_cpu = hessobj.kernel()
+            assert numpy.linalg.norm(hess_cpu - hess_gpu) < 1e-5
 
     def test_df_gga(self):
         mf = dft.UKS(mol, xc='b3lyp').density_fit()
@@ -78,32 +83,36 @@ class KnownValues(unittest.TestCase):
         mf.conv_tol_cpscf = 1e-8
         mf.kernel()
 
-        hessobj = mf.Hessian()
-        hess_cpu = hessobj.kernel()
-
-        mf = mf.to_gpu()
-        hessobj = mf.Hessian()
-        hessobj.auxbasis_response = 1
+        mf_gpu = mf.to_gpu()
+        hessobj = mf_gpu.Hessian()
         hessobj.base.cphf_grids = hessobj.base.grids
         hess_gpu = hessobj.kernel()
-        assert numpy.linalg.norm(hess_cpu - hess_gpu) < 1e-5
+        assert abs(lib.fp(hess_gpu) - -1.2334161112529511) < 1e-7
 
-    def test_df_mgga(self):
+        if version.parse(pyscf.__version__) >= version.parse('2.14.0'):
+            hessobj = mf.Hessian()
+            hessobj.auxbasis_response = 2
+            hess_cpu = hessobj.kernel()
+            assert numpy.linalg.norm(hess_cpu - hess_gpu) < 1e-5
+
+    def test_df_mgga_high_cost(self):
         mf = dft.UKS(mol, xc='tpss').density_fit()
         mf.conv_tol = 1e-10
         mf.grids.level = 1
         mf.conv_tol_cpscf = 1e-8
         mf.kernel()
 
-        hessobj = mf.Hessian()
-        hess_cpu = hessobj.kernel()
-
-        mf = mf.to_gpu()
-        hessobj = mf.Hessian()
-        hessobj.auxbasis_response = 1
+        mf_gpu = mf.to_gpu()
+        hessobj = mf_gpu.Hessian()
         hessobj.base.cphf_grids = hessobj.base.grids
         hess_gpu = hessobj.kernel()
-        assert numpy.linalg.norm(hess_cpu - hess_gpu) < 1e-5
+        assert abs(lib.fp(hess_gpu) - -1.1875258141432055) < 1e-7
+
+        if version.parse(pyscf.__version__) >= version.parse('2.14.0'):
+            hessobj = mf.Hessian()
+            hessobj.auxbasis_response = 2
+            hess_cpu = hessobj.kernel()
+            assert numpy.linalg.norm(hess_cpu - hess_gpu) < 1e-5
 
 if __name__ == "__main__":
     print("Full Tests for DF UKS Hessian")

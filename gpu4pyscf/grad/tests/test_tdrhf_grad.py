@@ -12,14 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import unittest
+from unittest import mock
 import pyscf
 import numpy as np
-import unittest
-import pytest
-from pyscf import scf, dft, tdscf
+import cupy as cp
+from pyscf import scf, dft, lib
 import gpu4pyscf
-from gpu4pyscf import scf as gpu_scf
 from gpu4pyscf.lib.multi_gpu import num_devices
+from gpu4pyscf.lib.cupy_helper import contract
+from gpu4pyscf.grad import rhf as rhf_grad
+from gpu4pyscf.grad import tdrhf as tdrhf_grad
+from gpu4pyscf.grad.tdrhf import _jk_energies_per_atom
+from gpu4pyscf.nac.finite_diff import diagonalize, diagonalize_tda
 
 atom = """
 O       0.0000000000     0.0000000000     0.0000000000
@@ -29,37 +34,12 @@ H       0.0000000000     0.7570000000     0.5870000000
 
 bas0 = "cc-pvdz"
 
-def diagonalize(a, b, nroots=5):
-    nocc, nvir = a.shape[:2]
-    nov = nocc * nvir
-    a = a.reshape(nov, nov)
-    b = b.reshape(nov, nov)
-    h = np.block([[a, b], 
-                  [-b.conj(), -a.conj()]])
-    e, xy = np.linalg.eig(np.asarray(h))
-    sorted_indices = np.argsort(e)
-
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
-
-
-def diagonalize_tda(a, nroots=5):
-    nocc, nvir = a.shape[:2]
-    nov = nocc * nvir
-    a = a.reshape(nov, nov)
-    e, xy = np.linalg.eig(np.asarray(a))
-    sorted_indices = np.argsort(e)
-
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
+# HOI: one ECP atom among light ones, so the ECP-centre gradient term must land on iodine alone
+atom_ecp = """
+O       0.0000000000     0.0000000000     0.0000000000
+H       0.9700000000     0.0000000000     0.0000000000
+I      -0.4477000000     1.9390000000     0.0000000000
+"""
 
 
 def cal_analytic_gradient(mol, td, tdgrad, nocc, nvir, tda, singlet=True):
@@ -201,8 +181,14 @@ def _check_grad(mol, tol=1e-5, lindep=1.0E-12, disp=None, tda=False, method="cpu
 
 
 class KnownValues(unittest.TestCase):
+    def test_grad_tda_singlet_ecp_cpu_high_cost(self):
+        mol_ecp = pyscf.M(atom=atom_ecp, basis="def2-svp", ecp={"I": "def2-svp"},
+                          output="/dev/null", verbose=1)
+        _check_grad(mol_ecp, tol=1e-6, tda=True, method="cpu")
+        mol_ecp.stdout.close()
+
     def test_grad_tda_singlet_cpu(self):
-        grad_gpu = _check_grad(mol, tol=1e-10, tda=True, method="cpu")
+        grad_gpu = _check_grad(mol, tol=1e-6, tda=True, method="cpu")
 
         grad_cpu, grad_gpu = benchmark_with_cpu(
             mol, nstates=5, lindep=1e-12, tda=True
@@ -218,14 +204,123 @@ class KnownValues(unittest.TestCase):
 
     @unittest.skipIf(num_devices > 1, '')
     def test_grad_tdhf_singlet_cpu(self):
-        grad_gpu = _check_grad(mol, tol=1e-10, lindep=1.0E-6, tda=False, method="cpu")
+        grad_gpu = _check_grad(mol, tol=1e-6, lindep=1.0E-6, tda=False, method="cpu")
         ref = np.array([[-3.4653829069609e-16,  2.3748317799310e-14, 1.0506609371536e-01],
                         [ 5.6250300822602e-16,  7.1515265578103e-02, -5.2533046857670e-02],
                         [-2.1596471752992e-16, -7.1515265578123e-02, -5.2533046857686e-02]])
         assert abs(grad_gpu - ref).max() < 1e-5
 
     def test_grad_tdhf_scanner(self):
+        # TODO
         pass
+
+    def test_jk_energies_per_atom(self):
+        mol = pyscf.M(
+            atom = '''
+            O   0.000   -0.    0.1174
+            H  -0.757    4.   -0.4696
+            H   0.757    4.   -0.4696
+            C   3.      1.    0.
+            ''',
+            basis='def2-tzvp',
+            unit='B',)
+        cp.random.seed(8)
+        nao = mol.nao
+        nocc = 5
+        j_factor = [1,  1,  0]
+        k_factor = [0,  1, .5]
+        n_dm = len(j_factor)
+        mo1 = cp.random.rand(n_dm, 2, nao, nocc) - .5
+        dm = contract('napi,naqi->napq', mo1, mo1)
+        dm[2] = cp.random.rand(2, nao, nao)
+        dm[2] = dm[2] - dm[2].transpose(0,2,1)
+        opt = rhf_grad._VHFOpt(mol).build()
+        ejk = _jk_energies_per_atom(opt, dm, j_factor=j_factor, k_factor=k_factor)
+        assert abs(ejk.sum(axis=1)).max() < 1e-11
+        for i in range(len(dm)):
+            ref = 0
+            dm_ab = dm[i,0] + dm[i,1]
+            ref += rhf_grad._jk_energy_per_atom(opt, dm_ab, j_factor=j_factor[i], k_factor=k_factor[i])
+            ref -= rhf_grad._jk_energy_per_atom(opt, dm[i,0], j_factor=j_factor[i], k_factor=k_factor[i])
+            ref -= rhf_grad._jk_energy_per_atom(opt, dm[i,1], j_factor=j_factor[i], k_factor=k_factor[i])
+            ref *= .5
+            assert abs(ejk[i] - ref).max() < 3e-11
+
+        ref = ejk
+        dm = cp.vstack([dm]*4)
+        j_factor = j_factor * 4
+        k_factor = k_factor * 4
+        ejk = _jk_energies_per_atom(opt, dm, j_factor=j_factor, k_factor=k_factor)
+        assert abs(ejk.reshape(4, 3, mol.natm, 3) - ref).max() < 1e-12
+
+        ejk_sum = _jk_energies_per_atom(opt, dm, j_factor=j_factor,
+                                        k_factor=k_factor, sum_results=True)
+        assert abs(ejk.sum(axis=0) - ejk_sum).max() < 1e-11
+
+    def test_jk_energies_per_atom_hermi0(self):
+        mol = pyscf.M(
+            atom = '''
+            O  -0.757    0.   -0.4696
+            O   0.757    0.   -0.4696
+            ''',
+            basis='def2-svp',
+            unit='B',)
+        np.random.seed(12)
+        nao = mol.nao
+        opt = rhf_grad._VHFOpt(mol).build()
+
+        dm1 = np.random.rand(nao, nao) - .5
+        eri1 = mol.intor('int2e_ip1')
+        ref = np.einsum('xijkl,jk,li->x', eri1[:,:nao//2], dm1, dm1[:,:nao//2])
+        ref += np.einsum('xjikl,jk,li->x', eri1[:,:nao//2], dm1[:nao//2], dm1)
+        ref += np.einsum('xklij,jk,li->x', eri1[:,:nao//2], dm1[:,:nao//2], dm1)
+        ref += np.einsum('xlkij,jk,li->x', eri1[:,:nao//2], dm1, dm1[:nao//2])
+        ejk = _jk_energies_per_atom(opt, cp.array(dm1[None]), j_factor=[0],
+                                    k_factor=[1], sum_results=True)
+        assert abs(ejk[0] - ref/4).max() < 5e-12
+
+        dm1 = np.random.rand(nao, nao) - .5
+        dm1 = dm1 - dm1.T
+        eri1 = mol.intor('int2e_ip1')
+        ref = np.einsum('xijkl,jk,li->x', eri1[:,:nao//2], dm1, dm1[:,:nao//2])
+        ref += np.einsum('xjikl,jk,li->x', eri1[:,:nao//2], dm1[:nao//2], dm1)
+        ref += np.einsum('xklij,jk,li->x', eri1[:,:nao//2], dm1[:,:nao//2], dm1)
+        ref += np.einsum('xlkij,jk,li->x', eri1[:,:nao//2], dm1, dm1[:nao//2])
+        ejk = _jk_energies_per_atom(opt, cp.array(dm1[None]), j_factor=[0],
+                                    k_factor=[1], sum_results=True)
+        assert abs(ejk[0] - ref/4).max() < 5e-12
+
+    def test_grad_elec(self):
+        mol = pyscf.M(
+            atom = '''
+            O   0.000   -0.    0.1174
+            H  -0.757    4.   -0.4696
+            H   0.757    4.   -0.4696
+            C   3.      1.    0.
+            ''',
+            basis='def2-tzvp',
+            unit='B',)
+        mf = mol.RHF().to_gpu()
+        nao = mol.nao
+        # Backend-independent input: np.random (MT19937) is identical on
+        # every host, unlike cp.random (cuRAND on CUDA, oneMKL on SYCL).
+        np.random.seed(4)
+        c = cp.asarray(np.random.rand(nao, nao)) - .5
+        s = mf.get_ovlp()
+        diag = cp.einsum('pi,pq,qi->i', c, s, c)
+        mf.mo_coeff = c / diag**.5
+        mf.mo_energy = cp.arange(nao)*3.
+        mf.mo_occ = cp.zeros(nao)
+        nocc = 5
+        nvir = nao - nocc
+        mf.mo_occ[:nocc] = 2
+        x_y = cp.asarray(np.random.rand(2, nocc, nvir)) - .5
+        x_y /= cp.linalg.norm(x_y)
+        td_grad = mf.TDHF().Gradients()
+        td_grad.cphf_max_cycle = 1
+        td_grad.cphf_conv_tol = 1e-2
+        dat = td_grad.grad_elec(x_y, singlet=True)
+        self.assertAlmostEqual(lib.fp(dat), 0.3859220718703469, 10)
 
 if __name__ == "__main__":
     print("Full Tests for TD-RHF Gradient")

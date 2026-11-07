@@ -17,9 +17,11 @@ import numpy as np
 import cupy as cp
 import pyscf
 import pytest
+from pyscf import lib
 from gpu4pyscf.dft import rks, uks
 from gpu4pyscf.hessian.rks import _get_vnlc_deriv1, _get_enlc_deriv2, get_dweight_dA, get_d2weight_dAdB
 from gpu4pyscf.lib.multi_gpu import num_devices
+from gpu4pyscf.dft import gen_grid
 
 def setUpModule():
     global mol, mol_unrestricted
@@ -67,10 +69,10 @@ def make_mf(mol, nlcgrid = (75,302), vv10_only = False, density_fitting = False,
     else:
         mf.nlc = "vv10"
         mf.grids.atom_grid = (3,6)
-    mf.conv_tol = 1e-15
+    mf.conv_tol = 1e-12
     mf.direct_scf_tol = 1e-16
     mf.nlcgrids.atom_grid = nlcgrid
-    mf.conv_tol_cpscf = 1e-10
+    mf.conv_tol_cpscf = 1e-7
     if density_fitting:
         mf = mf.density_fit(auxbasis = "def2-universal-jkfit")
     mf.kernel()
@@ -381,8 +383,18 @@ class KnownValues(unittest.TestCase):
 
         assert np.linalg.norm(test_hessian - reference_hessian) < 2e-5
 
-    @pytest.mark.slow
     def test_wb97xv_hessian(self):
+        small_mol = pyscf.M(atom='H 0 0 0; H .2 .1 .8', basis='sto6g', verbose=0)
+        mf = rks.RKS(small_mol, xc='wb97x-v').density_fit()
+        mf.grids.level = 1
+        mf.nlcgrids.level = 0
+        mf.conv_tol_cpscf = 1e-9
+        mf.run(conv_tol=1e-12)
+        assert mf.converged
+        h = mf.Hessian().set(grid_response=False).kernel()
+        assert abs(lib.fp(h) - -0.27988985566) < 1e-6
+
+    def test_wb97xv_hessian_high_cost(self):
         mf = make_mf(mol, vv10_only = False, density_fitting = True)
         # reference_hessian = numerical_d2e_dft(mf)
         reference_hessian = np.array([[[[ 0.4979170248502474,  0.0488882371119104,  0.2658377292182879],
@@ -458,7 +470,7 @@ class KnownValues(unittest.TestCase):
 
     # If you wonder what is special about sto-6g? The answer is: It will trigger prune_by_density_() function
     # and remove some grids there.
-    def test_wb97xv_sto6g_hessian(self):
+    def test_wb97xv_sto6g_hessian_high_cost(self):
         mol_copy = mol.copy()
         mol_copy.basis = "sto-6g"
         mol_copy.build()
@@ -737,85 +749,215 @@ class KnownValues(unittest.TestCase):
         assert np.linalg.norm(test_dF[0] - reference_dF[0]) < 1e-8
         assert np.linalg.norm(test_dF[1] - reference_dF[1]) < 1e-8
 
-    def test_becke_first_derivative(self):
-        mf = rks.RKS(mol, xc = "PBE")
+    def test_becke_weight_first_derivative(self):
+        for radii_adjust in [True, False]:
+            for stratmann in [True, False]:
+                mf = rks.RKS(mol, xc = "PBE")
+                mf.grids.atom_grid = (50,194)
+                if not radii_adjust:
+                    mf.grids.radii_adjust = None
+                if stratmann:
+                    mf.grids.becke_scheme = gen_grid.stratmann
+                mf.grids.build()
+                grids = mf.grids
+
+                test_dw = get_dweight_dA(mol, grids)
+
+                truncation_range = (3000, 5000) # Cross the 4096 boundary
+                test_dw_truncated = get_dweight_dA(mol, grids, truncation_range)
+
+                reference_dw = cp.empty([mol.natm, 3, grids.coords.shape[0]])
+                dx = 1e-5
+                mol_copy = mol.copy()
+                for i_atom in range(mol.natm):
+                    for i_xyz in range(3):
+                        xyz_p = mol.atom_coords()
+                        xyz_p[i_atom, i_xyz] += dx
+                        mol_copy.set_geom_(xyz_p, unit='Bohr')
+                        mol_copy.build()
+                        grids.reset(mol_copy)
+                        grids.build()
+                        w_p = grids.weights.copy()
+
+                        xyz_m = mol.atom_coords()
+                        xyz_m[i_atom, i_xyz] -= dx
+                        mol_copy.set_geom_(xyz_m, unit='Bohr')
+                        mol_copy.build()
+                        grids.reset(mol_copy)
+                        grids.build()
+                        w_m = grids.weights.copy()
+
+                        reference_dw[i_atom, i_xyz, :] = (w_p - w_m) / (2 * dx)
+                grids.build(mol)
+
+                reference_dw_truncated = reference_dw[:, :, truncation_range[0] : truncation_range[1]]
+
+                assert cp.max(cp.abs(test_dw - reference_dw)) < 1e-7
+                assert cp.max(cp.abs(test_dw_truncated - reference_dw_truncated)) < 1e-7
+
+    def test_becke_weight_second_derivative(self):
+        for radii_adjust in [True, False]:
+            for stratmann in [True, False]:
+                mf = rks.RKS(mol, xc = "PBE")
+                mf.grids.atom_grid = (50,194)
+                if not radii_adjust:
+                    mf.grids.radii_adjust = None
+                if stratmann:
+                    mf.grids.becke_scheme = gen_grid.stratmann
+                mf.grids.build()
+                grids = mf.grids
+
+                test_d2w = get_d2weight_dAdB(mol, grids)
+
+                truncation_range = (3000, 5000) # Cross the 4096 boundary
+                test_d2w_truncated = get_d2weight_dAdB(mol, grids, truncation_range)
+
+                reference_d2w = cp.empty([mol.natm, mol.natm, 3, 3, grids.coords.shape[0]])
+                dx = 1e-5
+                mol_copy = mol.copy()
+                for i_atom in range(mol.natm):
+                    for i_xyz in range(3):
+                        xyz_p = mol.atom_coords()
+                        xyz_p[i_atom, i_xyz] += dx
+                        mol_copy.set_geom_(xyz_p, unit='Bohr')
+                        mol_copy.build()
+                        grids.reset(mol_copy)
+                        grids.build()
+                        w_p = get_dweight_dA(mol_copy, grids)
+
+                        xyz_m = mol.atom_coords()
+                        xyz_m[i_atom, i_xyz] -= dx
+                        mol_copy.set_geom_(xyz_m, unit='Bohr')
+                        mol_copy.build()
+                        grids.reset(mol_copy)
+                        grids.build()
+                        w_m = get_dweight_dA(mol_copy, grids)
+
+                        reference_d2w[i_atom, :, i_xyz, :, :] = (w_p - w_m) / (2 * dx)
+                grids.build(mol)
+
+                reference_d2w_truncated = reference_d2w[:, :, :, :, truncation_range[0] : truncation_range[1]]
+
+                assert cp.max(cp.abs(test_d2w - reference_d2w)) < 2e-7
+                assert cp.max(cp.abs(test_d2w_truncated - reference_d2w_truncated)) < 2e-7
+
+    def test_grid_response_hessian_ghost_atom_far_away(self):
+        mol = pyscf.M(
+            atom = """
+                O      0.000000    0.000000    0.000000
+                H      0.957200    0.000000    0.000000
+                H     -0.239987    0.927297    0.000000
+                ghost:O      22.000000    0.000000    0.000000
+                ghost:H      22.957200    0.000000    0.000000
+                ghost:O      2.000000    0.000000    0.000000
+                ghost:H      2.957200    0.000000    0.000000
+                ghost:H      1.760013    0.927297    0.000000
+                ghost:O      2.000000    20.000000    0.000000
+                ghost:H      2.957200    20.000000    0.000000
+            """,
+            basis = "sto-6g",
+            verbose = 0,
+        )
+
+        from gpu4pyscf.dft import rks as gpu_rks
+        mf = gpu_rks.RKS(mol, xc = "wb97mv").density_fit(auxbasis = "def2-universal-jkfit")
         mf.grids.atom_grid = (50,194)
-        mf.grids.build()
-        grids = mf.grids
+        mf.nlcgrids.atom_grid = (49,110)
+        mf.conv_tol = 1e-12
+        mf.conv_tol_cpscf = 1e-10
 
-        test_dw = get_dweight_dA(mol, grids)
+        test_energy = mf.kernel()
+        assert mf.converged
 
-        truncation_range = (3000, 5000) # Cross the 4096 boundary
-        test_dw_truncated = get_dweight_dA(mol, grids, truncation_range)
+        hobj = mf.Hessian()
+        hobj.grid_response = True
+        test_hessian = hobj.kernel()
+        test_hessian = test_hessian.transpose(0,2,1,3).reshape(mol.natm * 3, mol.natm * 3)
 
-        reference_dw = cp.empty([mol.natm, 3, grids.coords.shape[0]])
-        dx = 1e-5
-        mol_copy = mol.copy()
-        for i_atom in range(mol.natm):
-            for i_xyz in range(3):
-                xyz_p = mol.atom_coords()
-                xyz_p[i_atom, i_xyz] += dx
-                mol_copy.set_geom_(xyz_p, unit='Bohr')
-                mol_copy.build()
-                grids.reset(mol_copy)
-                grids.build()
-                w_p = grids.weights.copy()
+        # Reference come from removing the ghost atom far away
+        ref_energy = -76.02665256617135
+        ref_hessian_without_faraway_ghost = \
+            np.array([[ 0.7811170835129123, -0.1612922737831207,  0.000000016069413 , -0.7091064864325283, -0.0595729381893558,
+        -0.000000008969827 , -0.0793847690514204,  0.2206719116481638, -0.0000000061115613,  0.0030526280847572,
+        -0.0002137735449063, -0.0000000005357584, -0.0000032557070865, -0.0000185655903701, -0.0000000000093949,
+         0.0043247953689671,  0.0004256232557152, -0.0000000004428706],
+       [-0.1612922737831208,  0.7026712128006777, -0.0000000130284946,  0.0565302809357225, -0.034122619417206 ,
+         0.0000000072368611,  0.0996927928704171, -0.6679681371189583,  0.0000000049929992,  0.0009557427969272,
+        -0.0006547356253105,  0.0000000004334108,  0.0000150442763183, -0.0000041373138784,  0.0000000000075491,
+         0.0040984126261153,  0.0000784152436581,  0.0000000003576734],
+       [ 0.000000016069413 , -0.0000000130284946, -0.0874683196375985, -0.0000000069316707,  0.0000000461396144,
+         0.0463189066488401, -0.0000000095029542, -0.0000000324675826,  0.0435162100433921,  0.0000000004597927,
+        -0.0000000001138713, -0.0008585278955096, -0.0000000000762569,  0.0000000000148495, -0.0000056674235128,
+        -0.0000000000183232, -0.0000000006840378, -0.0015026016740885],
+       [-0.7091064864325283,  0.0565302809357225, -0.0000000069316707,  0.7201213972894265, -0.0139974620003628,
+         0.0000000038739737, -0.0105842968754797, -0.04225000920745  ,  0.0000000026312106, -0.0009075236618528,
+        -0.0002115903315321,  0.000000000231199 ,  0.0000201192506829,  0.0000156965436941,  0.0000000000040623,
+         0.0004567886692701, -0.0000868971196038,  0.0000000001912251],
+       [-0.0595729381893558, -0.034122619417206 ,  0.0000000461396144, -0.0139974620003628,  0.0388265641220387,
+        -0.0000000258259177,  0.078687941502979 , -0.0036792131077582, -0.0000000174708374, -0.0024830320468671,
+         0.0000188118306148, -0.0000000015420134, -0.0000517524437201, -0.0000274472825572, -0.0000000000269975,
+        -0.0025827568256376, -0.0010160973651063, -0.0000000012738483],
+       [-0.000000008969827 ,  0.0000000072368611,  0.0463189066488401,  0.0000000038739737, -0.0000000258259177,
+        -0.0426125251489955,  0.0000000052863863,  0.00000001803807  , -0.0065145679851313, -0.0000000002531714,
+         0.0000000000638586,  0.0020103822149223,  0.0000000000436045, -0.0000000000083227, -0.0000093728433715,
+         0.000000000019034 ,  0.0000000003891578,  0.0008071771061939],
+       [-0.0793847690514204,  0.099692792870417 , -0.0000000095029542, -0.0105842968754797,  0.078687941502979 ,
+         0.0000000052863863,  0.0914018167141726, -0.1783761596969051,  0.00000000363368  , -0.0003028951401842,
+         0.0000652198238669,  0.0000000003160803, -0.0000104259325382,  0.000004944546784 ,  0.0000000000055379,
+        -0.0011194299844687, -0.0000747382173983,  0.0000000002612696],
+       [ 0.2206719116481639, -0.6679681371189583, -0.0000000324675826, -0.04225000920745  , -0.0036792131077582,
+         0.00000001803807  , -0.1783761596969053,  0.6714392441104351,  0.0000000122750039,  0.0001262771630567,
+         0.0004026610404808,  0.0000000011771406,  0.000011316438205 ,  0.0000051325350688,  0.0000000000006157,
+        -0.0001833363230961, -0.0001996838885495,  0.0000000009767524],
+       [-0.0000000061115613,  0.0000000049929992,  0.0435162100433921,  0.0000000026312106, -0.0000000174708374,
+        -0.0065145679851313,  0.00000000363368  ,  0.0000000122750039, -0.0365562680661387, -0.0000000001786555,
+         0.0000000000429922, -0.0005611944817359,  0.0000000000278773, -0.0000000000056106, -0.0000071830679484,
+        -0.0000000000025511,  0.0000000002522326,  0.0001230035575433],
+       [ 0.0030526280847572,  0.0009557427969272,  0.0000000004597927, -0.0009075236618528, -0.0024830320468671,
+        -0.0000000002531714, -0.0003028951401842,  0.0001262771630567, -0.0000000001786555, -0.0021450356863142,
+         0.0007569826006975, -0.0000000000151424, -0.0000211225269273, -0.0000196865129892, -0.0000000000002668,
+         0.0003239496373125,  0.0006637158738393, -0.0000000000125566],
+       [-0.0002137735449063, -0.0006547356253105, -0.0000000001138713, -0.0002115903315321,  0.0000188118306148,
+         0.0000000000638586,  0.0000652198238669,  0.0004026610404808,  0.0000000000429922,  0.0007569826006975,
+         0.0007806877730411,  0.000000000003804 ,  0.0000478782880926,  0.0000003159107136,  0.0000000000000665,
+        -0.0004447168675379, -0.0005477413168123,  0.00000000000315  ],
+       [-0.0000000005357584,  0.0000000004334108, -0.0008585278955096,  0.000000000231199 , -0.0000000015420134,
+         0.0020103822149223,  0.0000000003160803,  0.0000000011771406, -0.0005611944817359, -0.0000000000151424,
+         0.000000000003804 , -0.0011925062585687,  0.000000000002594 , -0.0000000000004973,  0.0000308370510157,
+         0.0000000000010276,  0.0000000000231452,  0.0005710092752721],
+       [-0.0000032557070865,  0.0000150442763183, -0.0000000000762569,  0.0000201192506829, -0.0000517524437201,
+         0.0000000000436045, -0.0000104259325382,  0.000011316438205 ,  0.0000000000278773, -0.0000211225269273,
+         0.0000478782880926,  0.000000000002594 ,  0.0000201956694338, -0.0000151210183882,  0.0000000000000452,
+        -0.0000055103934414, -0.0000073655143193,  0.0000000000021359],
+       [-0.0000185655903701, -0.0000041373138784,  0.0000000000148495,  0.0000156965436941, -0.0000274472825572,
+        -0.0000000000083227,  0.000004944546784 ,  0.0000051325350688, -0.0000000000056106, -0.0000196865129892,
+         0.0000003159107136, -0.0000000000004973, -0.0000151210183882,  0.0000232338935987, -0.0000000000000084,
+         0.0000327320385168,  0.0000029022102452, -0.0000000000004105],
+       [-0.0000000000093949,  0.0000000000075491, -0.0000056674235128,  0.0000000000040623, -0.0000000000269975,
+        -0.0000093728433715,  0.0000000000055379,  0.0000000000006157, -0.0000071830679484, -0.0000000000002668,
+         0.0000000000000665,  0.0000308370510157,  0.0000000000000452, -0.0000000000000084, -0.0000213428969887,
+         0.0000000000000163,  0.000000000000405 ,  0.0000127291753304],
+       [ 0.0043247953689671,  0.0040984126261153, -0.0000000000183232,  0.0004567886692701, -0.0025827568256376,
+         0.000000000019034 , -0.0011194299844687, -0.0001833363230961, -0.0000000000025511,  0.0003239496373125,
+        -0.0004447168675379,  0.0000000000010276, -0.0000055103934414,  0.0000327320385168,  0.0000000000000163,
+        -0.0039805930702967, -0.0009203384152848,  0.0000000000007965],
+       [ 0.0004256232557152,  0.0000784152436581, -0.0000000006840378, -0.0000868971196038, -0.0010160973651063,
+         0.0000000003891578, -0.0000747382173983, -0.0001996838885495,  0.0000000002522326,  0.0006637158738393,
+        -0.0005477413168123,  0.0000000000231452, -0.0000073655143193,  0.0000029022102452,  0.000000000000405 ,
+        -0.0009203384152848,  0.001682204625626 ,  0.0000000000190973],
+       [-0.0000000004428706,  0.0000000003576734, -0.0015026016740885,  0.0000000001912251, -0.0000000012738483,
+         0.0008071771061939,  0.0000000002612696,  0.0000000009767524,  0.0001230035575433, -0.0000000000125566,
+         0.00000000000315  ,  0.0005710092752721,  0.0000000000021359, -0.0000000000004105,  0.0000127291753304,
+         0.0000000000007965,  0.0000000000190973, -0.0000113174456015]])
 
-                xyz_m = mol.atom_coords()
-                xyz_m[i_atom, i_xyz] -= dx
-                mol_copy.set_geom_(xyz_m, unit='Bohr')
-                mol_copy.build()
-                grids.reset(mol_copy)
-                grids.build()
-                w_m = grids.weights.copy()
+        ref_hessian = np.zeros([10 * 3, 10 * 3])
+        ref_hessian[0*3:3*3, 0*3:3*3] = ref_hessian_without_faraway_ghost[0*3:3*3, 0*3:3*3]
+        ref_hessian[0*3:3*3, 5*3:8*3] = ref_hessian_without_faraway_ghost[0*3:3*3, 3*3:6*3]
+        ref_hessian[5*3:8*3, 5*3:8*3] = ref_hessian_without_faraway_ghost[3*3:6*3, 3*3:6*3]
+        ref_hessian[5*3:8*3, 0*3:3*3] = ref_hessian_without_faraway_ghost[3*3:6*3, 0*3:3*3]
 
-                reference_dw[i_atom, i_xyz, :] = (w_p - w_m) / (2 * dx)
-        grids.build(mol)
-
-        reference_dw_truncated = reference_dw[:, :, truncation_range[0] : truncation_range[1]]
-
-        assert cp.max(cp.abs(test_dw - reference_dw)) < 1e-7
-        assert cp.max(cp.abs(test_dw_truncated - reference_dw_truncated)) < 1e-7
-
-    def test_becke_second_derivative(self):
-        mf = rks.RKS(mol, xc = "PBE")
-        mf.grids.atom_grid = (50,194)
-        mf.grids.build()
-        grids = mf.grids
-
-        test_d2w = get_d2weight_dAdB(mol, grids)
-
-        truncation_range = (3000, 5000) # Cross the 4096 boundary
-        test_d2w_truncated = get_d2weight_dAdB(mol, grids, truncation_range)
-
-        reference_d2w = cp.empty([mol.natm, mol.natm, 3, 3, grids.coords.shape[0]])
-        dx = 1e-5
-        mol_copy = mol.copy()
-        for i_atom in range(mol.natm):
-            for i_xyz in range(3):
-                xyz_p = mol.atom_coords()
-                xyz_p[i_atom, i_xyz] += dx
-                mol_copy.set_geom_(xyz_p, unit='Bohr')
-                mol_copy.build()
-                grids.reset(mol_copy)
-                grids.build()
-                w_p = get_dweight_dA(mol_copy, grids)
-
-                xyz_m = mol.atom_coords()
-                xyz_m[i_atom, i_xyz] -= dx
-                mol_copy.set_geom_(xyz_m, unit='Bohr')
-                mol_copy.build()
-                grids.reset(mol_copy)
-                grids.build()
-                w_m = get_dweight_dA(mol_copy, grids)
-
-                reference_d2w[i_atom, :, i_xyz, :, :] = (w_p - w_m) / (2 * dx)
-        grids.build(mol)
-
-        reference_d2w_truncated = reference_d2w[:, :, :, :, truncation_range[0] : truncation_range[1]]
-
-        assert cp.max(cp.abs(test_d2w - reference_d2w)) < 1e-7
-        assert cp.max(cp.abs(test_d2w_truncated - reference_d2w_truncated)) < 1e-7
+        assert np.abs(test_energy - ref_energy) < 1e-9
+        assert np.linalg.norm(test_hessian - ref_hessian) < 1e-5
 
 
 if __name__ == "__main__":

@@ -54,17 +54,17 @@ def _create_tensor_descriptor(a):
 
 def _contract_einsum(pattern, a, b, alpha, beta, out=None, einsum=cupy.einsum):
     if out is None:
-        out = einsum(pattern, a, b)
+        out = cupy.asarray(einsum(pattern, a, b), order='C')
         out *= alpha
     elif beta == 0.:
-        out[:] = einsum(pattern, a, b)
+        out[...] = einsum(pattern, a, b)
         out *= alpha
     else:
-        out *= beta
         tmp = einsum(pattern, a, b)
         tmp *= alpha
+        out *= beta
         out += tmp
-    return cupy.asarray(out, order='C')
+    return out
 
 def contraction(
     pattern, a, b, alpha, beta,

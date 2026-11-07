@@ -17,42 +17,48 @@ jobs:
     runs-on: [self-hosted, Linux, X64, v100]
     timeout-minutes: 360
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v7
 
     - name: Pull CUDA Devel Image
       run: |
-        docker pull pyscf/gpu4pyscf-devel:pyscf-2.8
+        docker pull pyscf/gpu4pyscf-devel:pyscf-2.14
 
     - name: Test with pytest
+      timeout-minutes: 240
       run: |
         docker run --gpus all \
+          --init \
           --rm \
           -e CUPY_CACHE_DIR=/workspace/.cupy_cache \
           -e HTTP_PROXY=$HTTP_PROXY \
           -e HTTPS_PROXY=$HTTPS_PROXY \
+          -e OMP_NUM_THREADS=2 \
           -v $GITHUB_WORKSPACE:/workspace \
           -v ~/.cache/pip:/root/.cache/pip \
-          pyscf/gpu4pyscf-devel:pyscf-2.8 \
-          /bin/bash -c "cd /workspace && pip3 install -r requirements.txt && source build.sh && pytest -m 'not slow and not benchmark' --cov=/workspace --durations=50 && rm -rf .pytest_cache"
+          pyscf/gpu4pyscf-devel:pyscf-2.14 \
+          /bin/bash -c "cd /workspace && pip3 install -r requirements.txt && pip3 install gpu4pyscf-libxc-cuda12x==0.9.0 MCFun==0.2.6 pytest-xdist && source build.sh && pytest -n 4 --dist loadfile -m 'not slow and not benchmark and not special' -k 'not _high_cost' --cov=gpu4pyscf --durations=50 && rm -rf .pytest_cache"
 
   multi-gpu:
     runs-on: [self-hosted, Linux, X64, 2T4]
     timeout-minutes: 360
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v7
 
     - name: Pull CUDA Devel Image
       run: |
-        docker pull pyscf/gpu4pyscf-devel:pyscf-2.8
+        docker pull pyscf/gpu4pyscf-devel:pyscf-2.14
 
     - name: Test with pytest
+      timeout-minutes: 240
       run: |
         docker run --gpus all \
+          --init \
           --rm \
           -e CUPY_CACHE_DIR=/workspace/.cupy_cache \
           -e HTTP_PROXY=$HTTP_PROXY \
           -e HTTPS_PROXY=$HTTPS_PROXY \
+          -e OMP_NUM_THREADS=4 \
           -v $GITHUB_WORKSPACE:/workspace \
           -v ~/.cache/pip:/root/.cache/pip \
-          pyscf/gpu4pyscf-devel:pyscf-2.8 \
-          /bin/bash -c "cd /workspace && pip3 install -r requirements.txt && source build.sh && pytest -m 'not slow and not benchmark' --cov=/workspace --durations=50 && rm -rf .pytest_cache"
+          pyscf/gpu4pyscf-devel:pyscf-2.14 \
+          /bin/bash -c "cd /workspace && pip3 install -r requirements.txt && pip3 install pyscf==2.8 scipy==1.17 gpu4pyscf-libxc-cuda12x==0.8.1 pytest-xdist && source build.sh && pytest -n 4 --dist loadfile -m 'not slow and not benchmark and not special' -k 'not _high_cost' --cov=gpu4pyscf --durations=50 && rm -rf .pytest_cache"

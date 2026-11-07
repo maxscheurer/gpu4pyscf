@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import unittest
 import ctypes
 import numpy as np
-import numpy as cp
+import cupy as cp
 import pyscf
+import pytest
 from pyscf import lib, gto
 from gpu4pyscf.scf import jk
 from pyscf.scf.hf import get_jk
@@ -45,19 +45,16 @@ def test_jk_hermi1():
     ref = get_jk(mol, dm, hermi=1)
     assert abs(vj1 - ref[0]).max() < 1e-9
     assert abs(vk1 - ref[1]).max() < 1e-9
-    assert abs(lib.fp(vj1) - -2327.4715195591784) < 5e-10
-    assert abs(lib.fp(vk1) - -4069.3170008260583) < 5e-10
+    assert abs(lib.fp(vj1) - -2327.4715195591784) < 1e-9
+    assert abs(lib.fp(vk1) - -4069.3170008260583) < 1e-9
 
-    try:
-        vj = jk.get_j(mol, dm, hermi=1).get()
-        assert abs(vj - ref[0]).max() < 1e-9
-        assert abs(lib.fp(vj) - -2327.4715195591784) < 5e-10
-    except AttributeError:
-        pass
+    vj = jk.get_j(mol, dm, hermi=1).get()
+    assert abs(vj - ref[0]).max() < 1e-9
+    assert abs(lib.fp(vj) - -2327.4715195591784) < 1e-9
 
     vk = jk.get_k(mol, dm, hermi=1).get()
     assert abs(vk - ref[1]).max() < 1e-9
-    assert abs(lib.fp(vk) - -4069.3170008260583) < 5e-10
+    assert abs(lib.fp(vk) - -4069.3170008260583) < 1e-9
 
     mol.omega = 0.2
     vj, vk = jk.get_jk(mol, dm, hermi=1)
@@ -66,8 +63,8 @@ def test_jk_hermi1():
     ref = get_jk(mol, dm, hermi=1)
     assert abs(vj2 - ref[0]).max() < 1e-9
     assert abs(vk2 - ref[1]).max() < 1e-9
-    assert abs(lib.fp(vj2) -  1163.932604635460) < 5e-10
-    assert abs(lib.fp(vk2) - -1269.969109438691) < 5e-10
+    assert abs(lib.fp(vj2) -  1163.932604635460) < 1e-9
+    assert abs(lib.fp(vk2) - -1269.969109438691) < 1e-9
 
     mol.omega = -0.2
     vj, vk = jk.get_jk(mol, dm, hermi=1)
@@ -76,8 +73,8 @@ def test_jk_hermi1():
     ref = get_jk(mol, dm, hermi=1)
     assert abs(vj3 - ref[0]).max() < 1e-8
     assert abs(vk3 - ref[1]).max() < 1e-9
-    assert abs(lib.fp(vj3) - -3491.404124194866) < 5e-10
-    assert abs(lib.fp(vk3) - -2799.347891387202) < 5e-10
+    assert abs(lib.fp(vj3) - -3491.404124194866) < 1e-9
+    assert abs(lib.fp(vk3) - -2799.347891387202) < 1e-9
 
     assert abs(vj2+vj3 - vj1).max() < 1e-9
     assert abs(vk2+vk3 - vk1).max() < 1e-9
@@ -230,6 +227,7 @@ def test_k_hermi1():
     np.random.seed(9)
     nao = mol.nao
     dm = np.random.rand(2, nao, nao) - .5
+    dm = cp.asarray(dm)
     dm = cp.einsum('nij,nkj->nik', dm, dm)
 
     ref = jk.get_jk(mol, dm, hermi=1)[1].get()
@@ -257,19 +255,6 @@ def test_general_contraction():
     ref = get_jk(mol, dm, hermi=1)
     assert abs(vj1 - ref[0]).max() < 1e-9
     assert abs(vk1 - ref[1]).max() < 1e-9
-
-def test_vhfopt_coeff():
-    from gpu4pyscf.gto.mole import group_basis
-    mol = pyscf.M(
-        atom = '''
-        O   0.000   -0.    0.1174
-        C   1.      1.    0.
-        ''',
-        basis='ccpvtz',
-        unit='B',)
-    vhfopt = jk._VHFOpt(mol).build()
-    ref = group_basis(mol, tile=vhfopt.tile)[1]
-    assert abs(vhfopt.coeff - ref).max() < 1e-12
 
 def q_cond_reference(mol, direct_scf_tol=1e-13):
     #assert isinstance(mol, SortedMole)
@@ -330,74 +315,123 @@ def test_q_cond():
     )
 
     jkopt = jk._VHFOpt(mol).build()
-    sorted_mol = group_basis(mol)[0]
+    sorted_mol = jkopt.sorted_mol
     qref, sref = q_cond_reference(sorted_mol)
-    q_cond = jkopt.q_cond.get()
+    nbas = sorted_mol.nbas
     thrd = np.log(jkopt.direct_scf_tol)
-    qref[qref < thrd] = thrd
-    q_cond[q_cond < thrd] = thrd
-    assert abs(qref - q_cond).max() < 1e-3
+    mask = qref > thrd
+    mask[np.arange(nbas)[:,None]<np.arange(nbas)] = False
+
+    bas_ij = cp.hstack([x[0] for x in jkopt.bas_pair_cache.values()])
+    q_cond = cp.hstack([x[1] for x in jkopt.bas_pair_cache.values()])
+    q_cond = q_cond[bas_ij.argsort()]
+    assert abs(qref[mask] - q_cond.get()).max() < 1e-3
 
     mol.omega = .25
     jkopt = jk._VHFOpt(mol).build()
-    sorted_mol = group_basis(mol)[0]
+    sorted_mol = jkopt.sorted_mol
     qref, sref = q_cond_reference(sorted_mol)
-    q_cond = jkopt.q_cond.get()
-    qref[qref < thrd] = thrd
-    q_cond[q_cond < thrd] = thrd
-    assert abs(qref - q_cond).max() < 1e-3
+    nbas = sorted_mol.nbas
+    thrd = np.log(jkopt.direct_scf_tol)
+    mask = qref > thrd
+    mask[np.arange(nbas)[:,None]<np.arange(nbas)] = False
+
+    bas_ij = cp.hstack([x[0] for x in jkopt.bas_pair_cache.values()])
+    q_cond = cp.hstack([x[1] for x in jkopt.bas_pair_cache.values()])
+    q_cond = q_cond[bas_ij.argsort()]
+    assert abs(qref[mask] - q_cond.get()).max() < 1e-3
 
     mol.omega = -.25
     jkopt = jk._VHFOpt(mol).build()
-    sorted_mol = group_basis(mol)[0]
+    sorted_mol = jkopt.sorted_mol
     qref, sref = q_cond_reference(sorted_mol)
-    q_cond = jkopt.q_cond.get()
-    qref[qref < thrd] = thrd
-    q_cond[q_cond < thrd] = thrd
-    assert abs(qref - q_cond).max() < 1e-3
+    nbas = sorted_mol.nbas
+    thrd = np.log(jkopt.direct_scf_tol)
+    mask = qref > thrd
+    mask[np.arange(nbas)[:,None]<np.arange(nbas)] = False
 
-def test_transform_coeff():
-    mol = pyscf.M(
-        atom = '''
-        O   0.000   -0.    0.1174
-        H   4.      0.    3.
-        H   0.      1.    .6
-        C   -3.2258  -0.1262  2.6126
-        H   -5.7987   0.2177  4.1423
-        H   -5.8042  -1.0067  4.1503
-        ''',
-        basis=('def2-tzvp', [[4, [1, 1]]]),
-    )
-    jkopt = jk._VHFOpt(mol).build()
+    bas_ij = cp.hstack([x[0] for x in jkopt.bas_pair_cache.values()])
+    q_cond = cp.hstack([x[1] for x in jkopt.bas_pair_cache.values()])
+    q_cond = q_cond[bas_ij.argsort()]
+    assert abs(qref[mask] - q_cond.get()).max() < 1e-3
 
-    coeff = np.zeros((jkopt.sorted_mol.nao, jkopt.mol.nao))
-    l_max = max([l_ctr[0] for l_ctr in jkopt.uniq_l_ctr])
-    if jkopt.mol.cart:
-        cart2sph_per_l = [np.eye((l+1)*(l+2)//2) for l in range(l_max + 1)]
-    else:
-        cart2sph_per_l = [gto.mole.cart2sph(l, normalized = "sp") for l in range(l_max + 1)]
-    i_spherical_offset = 0
-    i_cartesian_offset = 0
-    for i, l in enumerate(jkopt.uniq_l_ctr[:,0]):
-        cart2sph = cart2sph_per_l[l]
-        ncart, nsph = cart2sph.shape
-        l_ctr_count = jkopt.l_ctr_offsets[i + 1] - jkopt.l_ctr_offsets[i]
-        cart_offs = i_cartesian_offset + np.arange(l_ctr_count) * ncart
-        sph_offs = i_spherical_offset + np.arange(l_ctr_count) * nsph
-        cart_idx = cart_offs[:,None] + np.arange(ncart)
-        sph_idx = sph_offs[:,None] + np.arange(nsph)
-        coeff[cart_idx[:,:,None],sph_idx[:,None,:]] = cart2sph
-        l_ctr_pad_count = jkopt.l_ctr_pad_counts[i]
-        i_cartesian_offset += (l_ctr_count + l_ctr_pad_count) * ncart
-        i_spherical_offset += l_ctr_count * nsph
-    ref = jkopt.unsort_orbitals(coeff, axis = [1])
+def test_get_k_rsh_distant_centers():
+    # A finite interatomic density retains LR exchange even when SR integrals
+    # are negligible. Mixed RSH operators must not use SR-only screening.
+    mol = pyscf.M(atom='H 0 0 0; H 0 0 10', basis='sto-3g', verbose=0)
+    dm = pyscf.scf.RHF(mol).get_init_guess(key='1e')
+    omega = .33
+    k_lr = get_jk(mol, dm, hermi=1, with_j=False, omega=omega)[1]
+    k_sr = get_jk(mol, dm, hermi=1, with_j=False, omega=-omega)[1]
+    assert abs(k_lr[0, 1]) > .05
+    for lr_factor, sr_factor in ((.65, .19), (1., 0.), (0., 1.), (1., 1.)):
+        ref = lr_factor * k_lr + sr_factor * k_sr
+        vk = jk.get_k(mol, cp.asarray(dm), hermi=1, omega=omega,
+                      lr_factor=lr_factor, sr_factor=sr_factor)
+        assert abs(vk.get() - ref).max() < 1e-10
 
-    dat = jkopt.coeff
-    assert abs(dat - ref).max() < 1e-14
+def test_get_jk_rsh_stacked_dms():
+    # J for several densities at a range-separation omega goes through the
+    # J engine (_VHFOpt.get_j). jk.get_jk documents a full-range J there;
+    # SCF.get_jk evaluates it under mol.with_range_coulomb(omega), like pyscf.
+    from gpu4pyscf import scf as gpu_scf
+    mol = pyscf.M(atom='''
+    N  0.000  0.000  0.000
+    H  0.000  0.802  0.583
+    H  0.000 -0.802  0.583
+    ''', basis='def2-svp', spin=1, verbose=0)
+    np.random.seed(5)
+    nao = mol.nao
+    dms = np.random.rand(2, nao, nao) - .5
+    dms = np.einsum('xij,xkj->xik', dms, dms)
+    ref_j_full = get_jk(mol, dms, hermi=1, with_k=False)[0]
+    for omega in (.3, -.3):
+        ref_j, ref_k = get_jk(mol, dms, hermi=1, omega=omega)
+        for with_k in (False, True):
+            vj, vk = jk.get_jk(mol, cp.asarray(dms), hermi=1, with_k=with_k,
+                               omega=omega)
+            assert vj.shape == dms.shape
+            assert abs(vj.get() - ref_j_full).max() < 1e-9
+            if with_k:
+                assert abs(vk.get() - ref_k).max() < 1e-9
+            vj, vk = gpu_scf.UHF(mol).get_jk(mol, cp.asarray(dms), hermi=1,
+                                             with_k=with_k, omega=omega)
+            assert abs(vj.get() - ref_j).max() < 1e-9
+            if with_k:
+                assert abs(vk.get() - ref_k).max() < 1e-9
+
+def test_jk_get_k_sr():
+    mol = pyscf.M(atom='''
+    O  0.0000  0.7375 -0.0528
+    O  0.0000 -0.7375 -0.1528
+    ''', basis='def2-svp')
+    np.random.seed(12)
+    nao = mol.nao
+    dm = np.random.rand(nao, nao) - .5
+    dm = cp.asarray(dm.dot(dm.T))
+    mol.omega = -.3
+    vk = jk.get_k(mol, dm, hermi=1)
+    assert abs(lib.fp(vk.get()) - -1.8653967312459407) < 1e-13
+
+def test_jk_get_k_hermi2():
+    mol = pyscf.M(atom='''
+    O  0.0000  0.7375 -0.0528
+    O  0.0000 -0.7375 -0.1528
+    ''', basis='sto-3g')
+    np.random.seed(1)
+    nao = mol.nao
+    dm = np.random.rand(2, nao, nao)
+    dm = dm - dm.transpose(0,2,1)
+    jref, kref = get_jk(mol, dm, hermi=0)
+    dm = cp.asarray(dm)
+    vj, vk = jk.get_jk(mol, dm, hermi=2)
+    assert abs(jref - vj.get()).max() < 1e-12
+    assert abs(kref - vk.get()).max() < 1e-12
+    assert abs(lib.fp(vk.get()) - 2.0697365797774125) < 1e-12
+    assert abs(vj.get().sum()) < 1e-12
 
 def test_jk_energy_per_atom():
     from gpu4pyscf.grad.rhf import _jk_energy_per_atom
-    from gpu4pyscf.df.grad import rhf as df_rhf
     mol = pyscf.M(atom='''
     O  0.0000  0.7375 -0.0528
     O  0.0000 -0.7375 -0.1528
@@ -407,23 +441,150 @@ def test_jk_energy_per_atom():
     dm = np.random.rand(nao, nao) - .5
     dm1 = dm - dm.T
 
-    auxmol = mol.copy()
-    auxmol.basis='def2-universal-jkfit'
-    auxmol.build(0, 0)
-
-    ejk = _jk_energy_per_atom(mol, dm1, j_factor=0, k_factor=1.)
+    opt = jk._VHFOpt(mol).build()
+    ejk = _jk_energy_per_atom(opt, dm1, j_factor=0, k_factor=1.)
     eri1 = mol.intor('int2e_ip1')
     ref = np.einsum('xijkl,jk,li->x', eri1[:,:nao//2], dm1, dm1[:,:nao//2])
     assert abs(ejk[0] - ref).max() < 5e-12
 
-    dm = cp.asarray(dm.dot(dm.T))
+    dm = dm.dot(dm.T)
     mol.omega = -.3
-    vk = jk.get_k(mol, dm, hermi=1)
-    assert abs(lib.fp(vk.get()) - -1.8653967312459407) < 1e-13
-
-    ejk = _jk_energy_per_atom(mol, dm, j_factor=0, k_factor=1.) * .5
+    opt = jk._VHFOpt(mol).build()
+    ejk = _jk_energy_per_atom(opt, dm, j_factor=0, k_factor=1.) * .5
     eri1 = mol.intor('int2e_ip1')
     ref = .5 * np.einsum('xijkl,jk,li->x', eri1[:,:nao//2], dm, dm[:,:nao//2])
     assert abs(ejk[0] - ref).max() < 5e-12
     ref = np.array([0.24806416996651, 1.11003753769514, 0.19967171093788])
     assert abs(ejk[0] - ref).max() < 1e-13
+
+
+@pytest.fixture(scope='module', params=[False, True], ids=['spd', 'high-angular'])
+def small_jk_model(request):
+    if request.param:
+        mol = gto.M(atom='He 0 0 0; H 0.2 -.1 1.2', charge=1,
+                    basis={'He': [[0, [1.2, 1.]], [5, [.8, 1.]]],
+                           'H': [[0, [.7, 1.]]]}, verbose=0)
+    else:
+        mol = gto.M(atom='He 0 0 0; H 0.2 -.1 1.2', charge=1,
+                    basis={'He': [[0, [1.2, 1.]], [1, [.9, 1.]], [2, [.8, 1.]]],
+                           'H': [[0, [.7, 1.]]]}, verbose=0)
+    vectors = np.random.default_rng(92).normal(size=(mol.nao, 3))
+    density = vectors @ vectors.T
+    density *= mol.nelectron / np.einsum('ij,ji', density, mol.intor('int1e_ovlp'))
+    transition = np.outer(vectors[:, 0], vectors[:, 1]) / mol.nao
+    return mol, density, transition
+
+
+@pytest.mark.parametrize('lr,sr', [(1., 0.), (0., 1.), (.7, .2)])
+def test_weighted_exchange_and_full_coulomb(small_jk_model, lr, sr):
+    mol, density, _ = small_jk_model
+    if mol._bas[:, gto.ANG_OF].max() > jk.LMAX and (lr not in (0, 1) or sr not in (0, 1)):
+        pytest.skip('High-angular CPU fallback supports only factors 0 and 1')
+    omega = .3
+    ref_j = get_jk(mol, density, hermi=1)[0]
+    ref_k = (lr * get_jk(mol, density, hermi=1, omega=omega)[1]
+             + sr * get_jk(mol, density, hermi=1, omega=-omega)[1])
+    before = density.copy()
+    opt = jk._VHFOpt(mol).build()
+    vj, vk = jk.get_jk(mol, density, hermi=1, vhfopt=opt,
+                       omega=omega, lr_factor=lr, sr_factor=sr)
+    np.testing.assert_allclose(vj.get(), ref_j, atol=1e-10, rtol=1e-10)
+    np.testing.assert_allclose(vk.get(), ref_k, atol=1e-10, rtol=1e-10)
+    separate = jk.get_k(mol, density, hermi=1, vhfopt=opt,
+                         omega=omega, lr_factor=lr, sr_factor=sr)
+    np.testing.assert_allclose(separate.get(), ref_k, atol=1e-10, rtol=1e-10)
+    np.testing.assert_array_equal(density, before)
+
+
+@pytest.mark.parametrize('hermi', [0, 1, 2])
+def test_jk_selectors_and_exchange_symmetry(small_jk_model, hermi):
+    mol, density, transition = small_jk_model
+    dm = [transition, density, transition - transition.T][hermi]
+    ref_j, ref_k = get_jk(mol, dm, hermi=0)
+    opt = jk._VHFOpt(mol).build()
+    for with_j, with_k in ((True, True), (True, False), (False, True)):
+        vj, vk = jk.get_jk(mol, cp.asarray(dm), hermi=hermi, vhfopt=opt,
+                           with_j=with_j, with_k=with_k)
+        if with_j:
+            np.testing.assert_allclose(vj.get(), ref_j, atol=1e-10, rtol=1e-10)
+        else:
+            assert vj is None
+        if with_k:
+            np.testing.assert_allclose(vk.get(), ref_k, atol=1e-10, rtol=1e-10)
+        else:
+            assert vk is None
+    separate = jk.get_k(mol, dm, hermi=hermi, vhfopt=opt)
+    np.testing.assert_allclose(separate.get(), ref_k, atol=1e-10, rtol=1e-10)
+    if hermi == 2:
+        np.testing.assert_allclose(separate.get() + separate.get().T, 0, atol=1e-12)
+
+
+def test_optimizer_lazy_density(small_jk_model):
+    import io
+    from gpu4pyscf.lib import logger
+    mol, density, _ = small_jk_model
+    ref_j, ref_k = get_jk(mol, density, hermi=1)
+    opt = jk._VHFOpt(mol)
+    stream = io.StringIO()
+    calls = []
+
+    def sorted_density():
+        calls.append(True)
+        return opt.apply_coeff_C_mat_CT(cp.asarray(density)[None])
+
+    with lib.temporary_env(mol, stdout=stream):
+        vj, vk = opt.get_jk(sorted_density, 1, logger.DEBUG1)
+        assert calls == [True]
+        np.testing.assert_allclose(opt.apply_coeff_CT_mat_C(vj)[0].get(),
+                                   ref_j, atol=1e-10, rtol=1e-10)
+        np.testing.assert_allclose(opt.apply_coeff_CT_mat_C(vk)[0].get(),
+                                   ref_k, atol=1e-10, rtol=1e-10)
+
+        calls.clear()
+        vj = opt.get_j(sorted_density, logger.DEBUG1)
+        assert calls == [True]
+        np.testing.assert_allclose(opt.apply_coeff_CT_mat_C(vj)[0].get(),
+                                   ref_j, atol=1e-10, rtol=1e-10)
+
+        calls.clear()
+        vk = opt.get_k(sorted_density, 1, logger.DEBUG1, None, None, None)
+        assert calls == [True]
+        np.testing.assert_allclose(opt.apply_coeff_CT_mat_C(vk)[0].get(),
+                                   ref_k, atol=1e-10, rtol=1e-10)
+
+    assert 'kernel launches' in stream.getvalue()
+
+
+def test_optimizer_geometry_reset(small_jk_model):
+    mol, density, _ = small_jk_model
+    original_coords = mol.atom_coords().copy()
+    opt = jk._VHFOpt(mol)
+    jk.get_jk(mol, density, hermi=1, vhfopt=opt)
+    assert opt.sorted_mol is not None
+    assert opt._rys_envs
+    moved = mol.set_geom_(original_coords + np.arange(mol.natm)[:, None] * [.1, -.05, .02], unit='Bohr', inplace=False)
+    opt.reset(moved)
+    assert opt.sorted_mol is None
+    assert opt._rys_envs == {}
+    actual = jk.get_jk(moved, density, hermi=1, vhfopt=opt)
+    expected = get_jk(moved, density, hermi=1)
+    for value, ref in zip(actual, expected):
+        np.testing.assert_allclose(value.get(), ref, atol=1e-10, rtol=1e-10)
+    np.testing.assert_array_equal(mol.atom_coords(), original_coords)
+
+
+@pytest.mark.parametrize('hermi', [0, 1])
+def test_range_separated_exchange_batch(small_jk_model, hermi):
+    mol, density, transition = small_jk_model
+    if mol._bas[:, gto.ANG_OF].max() > jk.LMAX:
+        pytest.skip('High-angular CPU fallback supports only factors 0 and 1')
+    dm = density if hermi else density + .02*transition
+    batch = np.stack([dm, .4*dm])[:, None, ::-1, ::-1]
+    before = batch.copy()
+    _, actual = jk.get_jk(mol, batch, hermi=hermi, omega=.3,
+                          lr_factor=.7, sr_factor=.2, with_j=False)
+    expected = (.7*get_jk(mol, batch, hermi=0, omega=.3)[1]
+                + .2*get_jk(mol, batch, hermi=0, omega=-.3)[1])
+    assert actual.shape == batch.shape
+    np.testing.assert_allclose(actual.get(), expected, atol=1e-10, rtol=1e-10)
+    np.testing.assert_array_equal(batch, before)

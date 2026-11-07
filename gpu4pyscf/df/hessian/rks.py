@@ -20,15 +20,13 @@ Non-relativistic RKS analytical Hessian
 '''
 
 
-import numpy
-import cupy
+import cupy as cp
 from pyscf import lib
 from gpu4pyscf.grad import rhf as rhf_grad
 from gpu4pyscf.hessian import rhf as rhf_hess
 from gpu4pyscf.hessian import rks as rks_hess
 from gpu4pyscf.hessian.rks import _get_enlc_deriv2, _get_vnlc_deriv1
 from gpu4pyscf.df.hessian import rhf as df_rhf_hess
-from gpu4pyscf.df.hessian.rhf import _get_jk_ip, _partial_hess_ejk
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import contract
 
@@ -42,28 +40,38 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     if mo_energy is None: mo_energy = mf.mo_energy
     if mo_occ is None:    mo_occ = mf.mo_occ
     if mo_coeff is None:  mo_coeff = mf.mo_coeff
-    if atmlst is None: atmlst = range(mol.natm)
 
-    mocc = mo_coeff[:,mo_occ>0]
-    dm0 = numpy.dot(mocc, mocc.T) * 2
+    if mf.with_df.intopt is None:
+        mf.with_df.build(build_cderi=False)
+    intopt = mf.with_df.intopt
+    mf.with_df.reset() # Release GPU memory
 
-    omega, alpha, hyb = mf._numint.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
-    with_k = mf._numint.libxc.is_hybrid_xc(mf.xc)
-    de2, ej, ek = _partial_hess_ejk(hessobj, mo_energy, mo_coeff, mo_occ,
-                                    atmlst, max_memory, verbose,
-                                    with_j=True, with_k=with_k)
-    de2 += ej  # (A,B,dR_A,dR_B)
-    if with_k:
-        de2 -= hyb * ek
+    ni = mf._numint
+    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
+    dm0 = mf.make_rdm1(mo_coeff, mo_occ)
 
-    if abs(omega) > 1e-10 and abs(alpha-hyb) > 1e-10:
-        ek_lr = _partial_hess_ejk(hessobj, mo_energy, mo_coeff, mo_occ,
-                                  atmlst, max_memory, verbose,
-                                  with_j=False, with_k=True, omega=omega)[2]
-        de2 -= (alpha - hyb) * ek_lr
+    if ni.libxc.is_hybrid_xc(mf.xc) and omega != 0:
+        range_separated_mode = getattr(mf, 'range_separated_mode', 'mix_outside_kernel')
+        if range_separated_mode == 'mix_outside_kernel':
+            de2 = df_rhf_hess._jk_energy_per_atom(intopt, dm0, 1., hyb, verbose=log)
+            de2 += df_rhf_hess._jk_energy_per_atom(intopt, dm0, 0., alpha-hyb, omega, verbose=log)
+        elif range_separated_mode == 'mix_inside_kernel':
+            de2 = df_rhf_hess._jk_energy_per_atom(intopt, dm0, 1., 0., verbose=log)
+            de2 += df_rhf_hess._jk_energy_per_atom(intopt, dm0, 0., 1., omega, alpha, hyb, verbose=log)
+        else:
+            raise ValueError(f'range_separated_mode = {range_separated_mode} is not supported')
+    else:
+        de2 = df_rhf_hess._jk_energy_per_atom(intopt, dm0, 1., hyb, verbose=log)
+
+    t1 = log.timer_debug1('computing ej, ek', *t1)
+
+    # Energy weighted density matrix
+    mocc = cp.asarray(mo_coeff[:,mo_occ>0])
+    dme0 = cp.dot(mocc, (mocc * mo_energy[mo_occ>0] * 2).T)
+    de2 += df_rhf_hess._hcore_energy(hessobj, dm0, dme0)
+    log.timer_debug1('hcore contribution', *t1)
 
     max_memory = None
-    t1 = log.timer_debug1('computing ej, ek', *t1)
     de2 += rks_hess._get_exc_deriv2(hessobj, mo_coeff, mo_occ, dm0, max_memory)
     if mf.do_nlc():
         de2 += _get_enlc_deriv2(hessobj, mo_coeff, mo_occ, max_memory)
@@ -76,25 +84,28 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
     natm = mol.natm
     assert atmlst is None or atmlst ==range(natm)
     mf = hessobj.base
+    if mf.with_df.intopt is None:
+        mf.with_df.build(build_cderi=False)
+    intopt = mf.with_df.intopt
+
     ni = mf._numint
     ni.libxc.test_deriv_order(mf.xc, 2, raise_error=True)
     omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
     mem_now = lib.current_memory()[0]
     max_memory = max(2000, mf.max_memory*.9-mem_now)
 
-    with_k = ni.libxc.is_hybrid_xc(mf.xc)
-    vj1, vk1 = _get_jk_ip(hessobj, mo_coeff, mo_occ, chkfile,
-                          atmlst, verbose, with_j=True, with_k=with_k)
-    h1mo = vj1
-    if with_k:
-        h1mo -= .5 * hyb * vk1
-    vj1 = vk1 = None
-
-    if abs(omega) > 1e-10 and abs(alpha-hyb) > 1e-10:
-        _, vk1_lr = _get_jk_ip(hessobj, mo_coeff, mo_occ, chkfile, atmlst,
-                               verbose, with_j=False, with_k=True, omega=omega)
-        h1mo -= .5 * (alpha - hyb) * vk1_lr
-        vk1_lr = None
+    if ni.libxc.is_hybrid_xc(mf.xc) and omega != 0:
+        range_separated_mode = getattr(mf, 'range_separated_mode', 'mix_outside_kernel')
+        if range_separated_mode == 'mix_outside_kernel':
+            h1mo = df_rhf_hess._get_veff(intopt, mo_coeff, mo_occ, 1., hyb)
+            h1mo += df_rhf_hess._get_veff(intopt, mo_coeff, mo_occ, 0., alpha-hyb, omega=omega)
+        elif range_separated_mode == 'mix_inside_kernel':
+            h1mo = df_rhf_hess._get_veff(intopt, mo_coeff, mo_occ, 1., 0.)
+            h1mo += df_rhf_hess._get_veff(intopt, mo_coeff, mo_occ, 0., 1., omega=omega, lr_factor=alpha, sr_factor=hyb)
+        else:
+            raise ValueError(f'range_separated_mode = {range_separated_mode} is not supported')
+    else:
+        h1mo = df_rhf_hess._get_veff(intopt, mo_coeff, mo_occ, 1., hyb)
 
     h1mo += rhf_grad.get_grad_hcore(hessobj.base.nuc_grad_method())
     h1mo += rks_hess._get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory)
@@ -111,3 +122,4 @@ class Hessian(rks_hess.Hessian):
     partial_hess_elec = partial_hess_elec
     make_h1 = make_h1
     get_jk_mo = df_rhf_hess._get_jk_mo
+    to_cpu = df_rhf_hess.Hessian.to_cpu

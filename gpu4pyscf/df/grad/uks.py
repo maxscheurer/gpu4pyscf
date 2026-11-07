@@ -15,25 +15,15 @@
 import numpy as np
 import cupy as cp
 from gpu4pyscf.lib import logger
-from gpu4pyscf.lib.cupy_helper import contract, tag_array
 from gpu4pyscf.grad import uks as uks_grad
-from gpu4pyscf.grad import rks as rks_grad
-from gpu4pyscf.df.grad.uhf import _jk_energy_per_atom
-from gpu4pyscf.df.int3c2e_bdiv import Int3c2eOpt
+from gpu4pyscf.df.grad import uhf as df_uhf_grad
 
 
-def get_veff(ks_grad, mol=None, dm=None, verbose=None):
-    '''
-    First order derivative of DFT effective potential matrix (wrt electron coordinates)
-
-    Args:
-        ks_grad : grad.uhf.Gradients or grad.uks.Gradients object
-    '''
+def energy_ee(ks_grad, mol=None, dm=None, verbose=None):
     if mol is None: mol = ks_grad.mol
     log = logger.new_logger(mol, verbose)
     t0 = log.init_timer()
     mf = ks_grad.base
-    mf.with_df.reset() # Release GPU memory
     if dm is None: dm = mf.make_rdm1()
 
     ni = mf._numint
@@ -50,30 +40,41 @@ def get_veff(ks_grad, mol=None, dm=None, verbose=None):
         log.debug('Compute XC deriviatives with grid response')
         exc, exc1 = uks_grad.get_exc_full_response(
             ni, mol, grids, mf.xc, dm, verbose=log)
-        exc1 += exc/2
+        exc1 *= 2
+        exc1 += exc
     else:
         exc, exc1 = uks_grad.get_exc(ni, mol, grids, mf.xc, dm, verbose=log)
+        exc1 *= 2
     t0 = log.timer('vxc', *t0)
 
     if mf.do_nlc():
         enlc1_per_atom, enlc1_grid = uks_grad._get_denlc(ks_grad, mol, dm)
-        exc1 += enlc1_per_atom
+        exc1 += enlc1_per_atom * 2
         if ks_grad.grid_response:
-            exc1 += enlc1_grid/2
-
-    auxmol = mf.with_df.auxmol
-    int3c2e_opt = Int3c2eOpt(mol, auxmol).build()
-    exc1 += _jk_energy_per_atom(
-        int3c2e_opt, dm, j_factor=1, k_factor=hyb, hermi=1,
-        auxbasis_response=ks_grad.auxbasis_response, verbose=log) * .5
+            exc1 += enlc1_grid
 
     if ni.libxc.is_hybrid_xc(mf.xc) and omega != 0:  # For range separated Coulomb operator
-        with mol.with_range_coulomb(omega), auxmol.with_range_coulomb(omega):
-            int3c2e_opt = Int3c2eOpt(mol, auxmol).build()
-            ek_lr = _jk_energy_per_atom(
-                int3c2e_opt, dm, j_factor=0, k_factor=alpha-hyb, hermi=1,
-                auxbasis_response=ks_grad.auxbasis_response, verbose=log) * .5
+        range_separated_mode = getattr(mf, 'range_separated_mode', 'mix_outside_kernel')
+        if range_separated_mode == 'mix_outside_kernel':
+            exc1 += ks_grad.jk_energy_per_atom(
+                dm, j_factor=1, k_factor=hyb, hermi=1, verbose=log)
+
+            beta = alpha - hyb
+            ek_lr = ks_grad.jk_energy_per_atom(
+                dm, j_factor=0, k_factor=beta, hermi=1, omega=omega, verbose=log)
             exc1 += ek_lr
+        elif range_separated_mode == 'mix_inside_kernel':
+            exc1 += ks_grad.jk_energy_per_atom(
+                dm, j_factor=1, k_factor=0, hermi=1, verbose=log)
+
+            exc1 += ks_grad.jk_energy_per_atom(
+                dm, j_factor=0, k_factor=1, hermi=1, omega=omega, lr_factor=alpha, sr_factor=hyb, verbose=log)
+        else:
+            raise ValueError(f'range_separated_mode = {range_separated_mode} is not supported')
+    else:
+        exc1 += ks_grad.jk_energy_per_atom(
+            dm, j_factor=1, k_factor=hyb, hermi=1, verbose=log)
+
     return exc1
 
 
@@ -86,6 +87,7 @@ class Gradients(uks_grad.Gradients):
 
     auxbasis_response = True
 
-    get_veff = get_veff
+    energy_ee = energy_ee
+    jk_energy_per_atom = df_uhf_grad.Gradients.jk_energy_per_atom
 
 Grad = Gradients

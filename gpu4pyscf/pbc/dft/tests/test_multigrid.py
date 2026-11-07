@@ -29,6 +29,7 @@ else:
 from gpu4pyscf.pbc.dft import multigrid
 from gpu4pyscf.pbc.tools import ifft, fft
 
+
 diamond = '''
 C     0.      0.      0.
 C     0.8917  0.8917  0.8917
@@ -40,7 +41,7 @@ C     0.      1.7834  1.7834
 C     0.8917  2.6751  2.6751'''
 
 def setUpModule():
-    global cell_orth, cell_nonorth
+    global cell_orth, cell_nonorth, cell_cu
     global kpts, dm, dm1
     np.random.seed(2)
     cell_orth = gto.M(
@@ -73,10 +74,20 @@ def setUpModule():
         unit = 'bohr',
         mesh = [13] * 3)
 
+    cell_cu = pyscf.M(
+        atom = [['Cu', [0., 0., 0.]], ['Cu', [1.8, 1.8, 1.8]]],
+        a = np.diag([3.6, 3.6, 3.6]),
+        basis = 'gth-dzvp-molopt-sr',
+        pseudo = 'gth-pbe',
+        verbose = 5,
+    )
+
 def tearDownModule():
     global cell_orth, cell_nonorth
     del cell_orth, cell_nonorth
 
+@unittest.skipIf(multigrid.libmgrid is None,
+                 "legacy multigrid collocation kernels are not compiled")
 class KnownValues(unittest.TestCase):
     def test_get_pp(self):
         ref = MultiGridNumInt_cpu(cell_orth).get_pp()
@@ -87,36 +98,6 @@ class KnownValues(unittest.TestCase):
         ref = MultiGridNumInt_cpu(cell_orth).get_nuc()
         out = multigrid.MultiGridNumInt(cell_orth).get_nuc().get()
         self.assertAlmostEqual(abs(ref-out).max(), 0, 9)
-
-    def test_eval_nucG(self):
-        mesh = cell_orth.mesh
-        SI = cell_orth.get_SI(mesh=mesh)
-        ref = np.einsum('i,ij->j', -cell_orth.atom_charges(), SI)
-        ref *= tools.get_coulG(cell_orth, mesh=mesh)
-        dat = multigrid.eval_nucG(cell_orth, mesh)
-        self.assertAlmostEqual(abs(ref - dat.get()).max(), 0, 12)
-
-        cell = cell_nonorth
-        SI = cell.get_SI(mesh=cell.mesh)
-        ref = np.einsum('i,ij->j', -cell.atom_charges(), SI)
-        ref *= tools.get_coulG(cell, mesh=cell.mesh)
-        dat = multigrid.eval_nucG(cell, cell.mesh)
-        self.assertAlmostEqual(abs(ref - dat.get()).max(), 0, 12)
-
-    def test_eval_vpplocG(self):
-        mesh = cell_orth.mesh
-        Gv = cell_orth.get_Gv(mesh)
-        SI = cell_orth.get_SI(Gv)
-        ref = -np.einsum('ij,ij->j', pseudo.get_vlocG(cell_orth, Gv), SI)
-        dat = multigrid.eval_vpplocG(cell_orth, mesh)
-        self.assertAlmostEqual(abs(ref - dat.get()).max(), 0, 12)
-
-        cell = cell_nonorth
-        Gv = cell.get_Gv()
-        SI = cell.get_SI(Gv)
-        ref = -np.einsum('ij,ij->j', pseudo.get_vlocG(cell, Gv), SI)
-        dat = multigrid.eval_vpplocG(cell, cell.mesh)
-        self.assertAlmostEqual(abs(ref - dat.get()).max(), 0, 12)
 
     @unittest.skip('MultiGrid for kpts not implemented')
     def test_get_nuc_kpts(self):
@@ -356,6 +337,48 @@ class KnownValues(unittest.TestCase):
         ref = cell.RKS().get_rho(dm)
         out = multigrid.MultiGridNumInt(cell).get_rho(dm).get()
         self.assertAlmostEqual(abs(ref-out).max(), 0, 8)
+
+class ReciprocalHelpers(unittest.TestCase):
+    def test_eval_nucG(self):
+        # These are pointwise Fourier coefficients, not a converged grid integral.
+        mesh = np.array([13, 15, 17])
+        SI = cell_orth.get_SI(mesh=mesh)
+        ref = np.einsum('i,ij->j', -cell_orth.atom_charges(), SI)
+        ref *= tools.get_coulG(cell_orth, mesh=mesh)
+        dat = multigrid.eval_nucG(cell_orth, mesh)
+        self.assertAlmostEqual(abs(ref - dat.get()).max(), 0, 12)
+
+        cell = cell_nonorth
+        SI = cell.get_SI(mesh=cell.mesh)
+        ref = np.einsum('i,ij->j', -cell.atom_charges(), SI)
+        ref *= tools.get_coulG(cell, mesh=cell.mesh)
+        dat = multigrid.eval_nucG(cell, cell.mesh)
+        self.assertAlmostEqual(abs(ref - dat.get()).max(), 0, 12)
+
+    def test_eval_vpplocG(self):
+        mesh = np.array([13, 15, 17])
+        Gv = cell_orth.get_Gv(mesh)
+        SI = cell_orth.get_SI(Gv)
+        ref = -np.einsum('ij,ij->j', pseudo.get_vlocG(cell_orth, Gv), SI)
+        dat = multigrid.eval_vpplocG(cell_orth, mesh)
+        self.assertAlmostEqual(abs(ref - dat.get()).max(), 0, 12)
+
+        cell = cell_nonorth
+        Gv = cell.get_Gv()
+        SI = cell.get_SI(Gv)
+        ref = -np.einsum('ij,ij->j', pseudo.get_vlocG(cell, Gv), SI)
+        dat = multigrid.eval_vpplocG(cell, cell.mesh)
+        self.assertAlmostEqual(abs(ref - dat.get()).max(), 0, 12)
+
+    def test_eval_vpplocG_cu(self):
+        mesh = np.array([13, 15, 17])
+        Gv = cell_cu.get_Gv(mesh)
+        SI = cell_cu.get_SI(Gv)
+        ref = -np.einsum('ij,ij->j', pseudo.get_vlocG(cell_cu, Gv), SI)
+        dat = multigrid.eval_vpplocG(cell_cu, mesh)
+        self.assertAlmostEqual(abs(ref - dat.get()).max(), 0, 12)
+
+
 
 if __name__ == '__main__':
     print("Full Tests for multigrid")

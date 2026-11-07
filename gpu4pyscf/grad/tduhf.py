@@ -14,7 +14,8 @@
 
 from functools import reduce
 import cupy as cp
-from pyscf import lib
+import numpy as np
+from pyscf import lib, gto
 from gpu4pyscf.lib import logger
 from gpu4pyscf.grad import rhf as rhf_grad
 from gpu4pyscf.grad import tdrhf
@@ -24,6 +25,7 @@ from gpu4pyscf.scf import ucphf
 from pyscf import __config__
 from gpu4pyscf.lib import utils
 from gpu4pyscf import tdscf
+from gpu4pyscf.scf.jk import _VHFOpt
 
 
 def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO,
@@ -215,10 +217,12 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO,
 
     dh1e_ground = int3c2e.get_dh1e(mol, oo0a + oo0b)  # 1/r like terms
     if len(mol._ecpbas) > 0:
-        dh1e_ground += rhf_grad.get_dh1e_ecp(mol, oo0a + oo0b)  # 1/r like terms
+        ecp_atoms = np.unique(mol._ecpbas[:, gto.ATOM_OF])
+        dh1e_ground[ecp_atoms] += rhf_grad.get_dh1e_ecp(mol, oo0a + oo0b)  # 1/r like terms
     dh1e_td = int3c2e.get_dh1e(mol, (dmz1dooa + dmz1doob) * 0.25 + (dmz1dooa + dmz1doob).T * 0.25)  # 1/r like terms
     if len(mol._ecpbas) > 0:
-        dh1e_td += rhf_grad.get_dh1e_ecp(
+        ecp_atoms = np.unique(mol._ecpbas[:, gto.ATOM_OF])
+        dh1e_td[ecp_atoms] += rhf_grad.get_dh1e_ecp(
             mol, (dmz1dooa + dmz1doob) * 0.25 + (dmz1dooa + dmz1doob).T * 0.25
         )  # 1/r like terms
 
@@ -249,12 +253,68 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO,
     return de
 
 
-class Gradients(tdrhf.Gradients):
+class Gradients(rhf_grad.GradientsBase):
+
+    cphf_max_cycle = tdrhf.Gradients.cphf_max_cycle
+    cphf_conv_tol = tdrhf.Gradients.cphf_conv_tol
+
+    _keys = tdrhf.Gradients._keys
 
     to_cpu = utils.to_cpu
     to_gpu = utils.to_gpu
     device = utils.device
+
+    dump_flags = tdrhf.Gradients.dump_flags
+    kernel = tdrhf.Gradients.kernel
+    grad_nuc = tdrhf.Gradients.grad_nuc
+    _finalize = tdrhf.Gradients._finalize
+    solvent_response = tdrhf.Gradients.solvent_response
+    as_scanner = tdrhf.Gradients.as_scanner
+    from_cpu = tdrhf.Gradients.from_cpu
+
     grad_elec = grad_elec
 
+    def __init__(self, td):
+        super().__init__(td)
+        self.verbose = td.verbose
+        self.stdout = td.stdout
+        self.mol = td.mol
+        self.base = td
+        self.state = 1  # of which the gradients to be computed.
+        self.atmlst = None
+        self.de = None
+
+    def get_veff(self, mol, dm, j_factor=1.0, k_factor=1.0, omega=0.0,
+                 hermi=0, verbose=None):
+        """
+        Computes the first-order derivatives of the energy contributions from
+        Veff per atom.
+
+        NOTE: This function is incompatible to the one implemented in PySCF CPU version.
+        In the CPU version, get_veff returns the first order derivatives of Veff matrix.
+        """
+        if dm is None: dm = self.base.make_rdm1()
+        if hermi == 2:
+            j_factor = 0
+        mf = self.base._scf
+        vhfopt = mf._opt_gpu.get(omega)
+        if vhfopt is None:
+            # For LDA and GGA, only mf._opt_jengine is initialized
+            mol = mf.mol
+            with mol.with_range_coulomb(omega):
+                vhfopt = mf._opt_gpu[omega] = _VHFOpt(
+                    mol, mf.direct_scf_tol).build()
+        return rhf_grad._jk_energy_per_atom(
+            vhfopt, dm, j_factor, k_factor, verbose) * .5
+
+    def jk_energy_per_atom(self, dms, j_factor=None, k_factor=None,
+                           omega=None, lr_factor=None, sr_factor=None,
+                           hermi=0, sum_results=True, verbose=None):
+        raise NotImplementedError
+
+    def jk_energies_per_atom(self, dm_list, j_factor=None, k_factor=None,
+                             omega=None, lr_factor=None, sr_factor=None,
+                             hermi=0, sum_results=False, verbose=None):
+        raise NotImplementedError
 
 Grad = Gradients

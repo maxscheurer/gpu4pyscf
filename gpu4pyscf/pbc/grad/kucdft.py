@@ -120,23 +120,20 @@ class Gradients(kuks_grad.Gradients):
                     sc_sub = SC_k[:, idx_arr]
                     
                     term = cp.einsum('pq, xqi, pi -> x', P_spin, sc1_sub, sc_sub.conj())
-                    dE_c[atm_id] += weight * 2.0 * vc * term.real
+                    dE_c[atm_id] += w_k * 2.0 * vc * term.real
                     
                     constraint_idx += 1
 
         return dE_c.get()
 
-    def get_veff(self, dm=None, kpts=None):
+    def energy_ee(self, dm=None, kpts=None):
         if dm is None: dm = self.base.make_rdm1()
         if kpts is None: kpts = self.base.kpts
-        
-        logger.info(self.base, "Calculating constraint gradient contributions (PBC Minao)...")
-        self._dE_constraint = self._get_constraint_force_kpts(dm, kpts)
-        
-        return super().get_veff(dm, kpts)
 
-    def extra_force(self, atom_id, envs):
-        force = super().extra_force(atom_id, envs)
-        if self._dE_constraint is not None:
-            force += self._dE_constraint[atom_id]
-        return force
+        logger.info(self.base, "Calculating constraint gradient contributions (PBC Minao)...")
+        _dE_constraint = self._get_constraint_force_kpts(dm, kpts)
+
+        dE = super().energy_ee(dm, kpts)
+        dE[:-3] += _dE_constraint
+        dE[-3:] = np.nan
+        return dE

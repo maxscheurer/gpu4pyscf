@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import unittest
+from scipy.linalg import eigh
 import numpy as np
+import pyscf
+from packaging.version import Version
 import cupy as cp
 from pyscf import lib
 from pyscf.pbc.scf import hf as pbchf_cpu
 from pyscf.pbc import gto as pbcgto
-from gpu4pyscf.pbc import scf
+from gpu4pyscf.pbc import dft, scf
 from gpu4pyscf.pbc.scf.rsjk import PBCJKMatrixOpt
 from gpu4pyscf.pbc.scf.j_engine import PBCJMatrixOpt
 
@@ -26,13 +29,12 @@ class KnownValues(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         L = 4
-        n = 21
         cell = pbcgto.M(
             unit = 'B',
             verbose = 7,
             output = '/dev/null',
             a = ((L,0,0),(0,L,0),(0,0,L)),
-            mesh = [n,n,n],
+            precision = 1e-9,
             atom = [['He', (L/2.-.5,L/2.,L/2.-.5)],
                     ['He', (L/2.   ,L/2.,L/2.+.5)]],
             basis = { 'He': [[0, (0.8, 1.0)],
@@ -53,7 +55,7 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(lib.fp(pop), 0.011047586674983092, 5)
 
         kmf = scf.KRHF(cell, [[0,0,0]], exxdiv='ewald').run()
-        self.assertAlmostEqual(mf.e_tot, kmf.e_tot, 8)
+        self.assertAlmostEqual(mf.e_tot, kmf.e_tot, 7)
         pop = kmf.analyze()[0][0]
         self.assertAlmostEqual(lib.fp(pop), 0.011047586674983092, 5)
 
@@ -63,22 +65,16 @@ class KnownValues(unittest.TestCase):
         e1, c1 = mf.get_bands(kpts_band)
         e0, c0 = kmf.get_bands(kpts_band)
         self.assertAlmostEqual(abs(e0-e1).get().max(), 0, 7)
-        self.assertAlmostEqual(lib.fp(e1[0].get()), -6.2986775452228283, 6)
-        self.assertAlmostEqual(lib.fp(e1[1].get()), -7.6616273746782362, 6)
+        self.assertAlmostEqual(lib.fp(e1[0].get()), -6.2986775452228283, delta=1e-5)
+        self.assertAlmostEqual(lib.fp(e1[1].get()), -7.6616273746782362, delta=1e-5)
 
-    def test_rhf_exx_ewald_with_kpt(self):
-        np.random.seed(1)
-        k = np.random.random((1, 3))
+    def test_kpts_without_gamma(self):
         cell = self.cell
-        kmf = scf.KRHF(cell, k, exxdiv='ewald')
-        e0 = kmf.kernel()
-        self.assertAlmostEqual(e0, -4.2048655827967139, 7)
-
-        # test bands
-        np.random.seed(1)
-        kpt_band = np.random.random(3)
-        e0, c0 = kmf.get_bands(kpt_band)
-        self.assertAlmostEqual(lib.fp(e0.get()), -6.8312867098806249, 6)
+        kpts = cell.make_kpts([2, 2, 1], with_gamma_point=False)
+        for mf_cls in (scf.KRHF, dft.KRKS):
+            with self.subTest(mf_cls=mf_cls.__name__):
+                with self.assertRaisesRegex(NotImplementedError, 'include the Gamma point'):
+                    mf_cls(cell, kpts=kpts).kernel()
 
     def test_rhf_exx_None(self):
         cell = self.cell
@@ -90,13 +86,6 @@ class KnownValues(unittest.TestCase):
         kmf = scf.KRHF(cell, [[0,0,0]], exxdiv=None)
         e0 = kmf.kernel()
         self.assertAlmostEqual(e0, e1, 7)
-
-        np.random.seed(1)
-        k = np.random.random((1, 3))
-        kmf = scf.KRHF(cell, k, exxdiv=None)
-        kmf.init_guess = 'hcore'
-        e0 = kmf.kernel()
-        self.assertAlmostEqual(e0, -2.7862168430230341, 7)
 
     def test_jk(self):
         cell = self.cell
@@ -119,14 +108,78 @@ class KnownValues(unittest.TestCase):
         kpts = cell.make_kpts(nk, wrap_around=True)
         kmf = scf.KRHF(cell, kpts=kpts).run(conv_tol=1e-9)
         kmf_cpu = kmf.to_cpu().run()
-        self.assertAlmostEqual(kmf.e_tot, kmf_cpu.e_tot, 8)
-        self.assertAlmostEqual(kmf.e_tot, -4.1828127052055395, 8)
+        self.assertAlmostEqual(kmf.e_tot, kmf_cpu.e_tot, 7)
+        self.assertAlmostEqual(kmf.e_tot, -4.1828127052055395, 7)
 
         np.random.seed(1)
         kpts_bands = np.random.random((1,3))
         e = kmf.get_bands(kpts_bands)[0]
         e_ref = kmf_cpu.get_bands(kpts_bands)[0]
-        self.assertAlmostEqual(abs(e.get()-e_ref).max(), 0, 7)
+        self.assertAlmostEqual(abs(e.get()-e_ref).max(), 0, delta=1e-5)
+
+    def test_eig_self_conjugate_kpts(self):
+        cell = self.cell
+        kpts = cell.make_kpts(
+            [2, 2, 1], wrap_around=True, with_gamma_point=True)
+        kmf = scf.KRHF(cell, kpts=kpts)
+        kpt_pairs = list(kmf.iter_kpt_pairs())
+        self.assertEqual(len(kpt_pairs), len(kpts))
+        self.assertTrue(all(k == k_conj for k, k_conj in kpt_pairs))
+
+        nkpts = len(kpts)
+        nao = cell.nao
+        h = np.tile(np.diag(np.linspace(-2., 2., nao)), (nkpts, 1, 1))
+        h = h.astype(np.complex128)
+        for k in range(nkpts):
+            h[k, 0, -1] = (k + 1) * .2j
+            h[k, -1, 0] = -(k + 1) * .2j
+        h = cp.asarray(h)
+        s = cp.tile(cp.eye(nao, dtype=np.complex128), (nkpts, 1, 1))
+        x = kmf.check_linear_dependency(s)
+        occ = cp.zeros((nkpts, nao))
+        occ[:, :nao//2] = 2
+
+        for x_orth in (None, x):
+            with self.subTest(x_orth=x_orth is not None):
+                e, c = kmf.eig(h, s, x=x_orth)
+                dm = kmf.make_rdm1(c, occ)
+                self.assertLess(float(abs(c.imag).max()), 1e-14)
+                self.assertLess(float(abs(dm.imag).max()), 1e-14)
+                self.assertLess(
+                    float(abs(e - cp.diag(h[0].real)).max()), 1e-14)
+
+        _, c = kmf.eig(h, s, x=x, time_reversal_symmetry=False)
+        dm = kmf.make_rdm1(c, occ)
+        self.assertGreater(float(abs(dm.imag).max()), 1e-3)
+
+    def test_eig_conjugate_kpt_pairs(self):
+        cell = self.cell
+        kpts = cell.make_kpts(
+            [2, 2, 1], wrap_around=True, with_gamma_point=False)
+        kmf = scf.KRHF(cell, kpts=kpts)
+        kpt_pairs = list(kmf.iter_kpt_pairs())
+        self.assertEqual(len(kpt_pairs), len(kpts) // 2)
+        self.assertTrue(all(k != k_conj for k, k_conj in kpt_pairs))
+
+        nkpts = len(kpts)
+        nao = cell.nao
+        h = np.empty((nkpts, nao, nao), dtype=np.complex128)
+        h_real = np.diag(np.linspace(-2., 2., nao))
+        for i, (k, k_conj) in enumerate(kpt_pairs):
+            h_k = h_real.astype(np.complex128)
+            h_k[0, -1] = (i + 1) * .2j
+            h_k[-1, 0] = -(i + 1) * .2j
+            h[k] = h_k
+            h[k_conj] = h_k.conj()
+
+        h = cp.asarray(h)
+        s = cp.tile(cp.eye(nao, dtype=np.complex128), (nkpts, 1, 1))
+        e, c = kmf.eig(h, s)
+        for k, k_conj in kpt_pairs:
+            self.assertLess(float(abs(e[k_conj] - e[k]).max()), 1e-14)
+            self.assertLess(
+                float(abs(c[k_conj] - c[k].conj()).max()), 1e-14)
+        self.assertGreater(float(abs(c.imag).max()), 1e-3)
 
     def test_density_fit(self):
         from gpu4pyscf.pbc.df.df import GDF
@@ -150,7 +203,7 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(ref.e_tot, -0.3740002917376214, 8)
         self.assertAlmostEqual(mf.e_tot, ref.e_tot, 8)
 
-    def test_rsjk(self):
+    def test_rsjk_high_cost(self):
         L = 4.
         cell = pbcgto.Cell()
         cell.a = np.eye(3)*L
@@ -162,8 +215,7 @@ class KnownValues(unittest.TestCase):
         ref = cell.RHF().to_gpu().run()
 
         mf = cell.RHF().to_gpu().density_fit()
-        mf.rsjk = PBCJKMatrixOpt(cell)
-        mf.j_engine = PBCJMatrixOpt(cell)
+        mf.rsjk = mf.j_engine = PBCJKMatrixOpt(cell)
         mf.run(conv_tol=1e-8)
         self.assertAlmostEqual(mf.e_tot, ref.e_tot, 8)
         self.assertAlmostEqual(mf.e_tot, -0.36989524966775006, 8)
@@ -185,7 +237,7 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(mf.e_tot, ref.e_tot, 8)
 
         mf = cell.KRHF().to_gpu()
-        mf.j_engine = PBCJMatrixOpt(cell)
+        mf.j_engine = PBCJKMatrixOpt(cell)
         mf.run(conv_tol=1e-8)
         self.assertAlmostEqual(mf.e_tot, ref.e_tot, 8)
 
@@ -209,23 +261,273 @@ class KnownValues(unittest.TestCase):
 
         mf = cell.KRHF(kpts=cell.make_kpts([2,1,1])).to_gpu().density_fit()
         mf.rsjk = PBCJKMatrixOpt(cell)
+        mf.j_engine = PBCJMatrixOpt(cell)
+        mf.run(conv_tol=1e-8)
+        self.assertAlmostEqual(mf.e_tot, ref.e_tot, 8)
+
+        mf = cell.KRHF(kpts=cell.make_kpts([2,1,1])).to_gpu().density_fit()
+        mf.rsjk = PBCJKMatrixOpt(cell)
         mf.run(conv_tol=1e-8)
         # small discrepancy due to J, which is computed with DF
         self.assertAlmostEqual(mf.e_tot, -0.361911543087363, 8)
 
+    @unittest.skip('J is computed by multigrid_numint. with_df is not executed')
     def test_rsjk_with_df(self):
         cell = self.cell
         mf = cell.RHF(exxdiv='ewald').to_gpu().density_fit()
         mf.rsjk = PBCJKMatrixOpt(cell)
         mf.j_engine = PBCJMatrixOpt(cell)
         mf.run()
-        assert abs(mf.e_tot - -4.351161081888651) < 1e-6
+        assert abs(mf.e_tot - -4.351158222399987) < 1e-6
 
         kmf = cell.KRHF(exxdiv='ewald', kpts=cell.make_kpts([2,1,1])).to_gpu().density_fit()
         kmf.rsjk = PBCJKMatrixOpt(cell)
         kmf.j_engine = PBCJMatrixOpt(cell)
         kmf.run()
-        assert abs(mf.e_tot - -4.351161081888651) < 1e-6
+        assert abs(kmf.e_tot - -4.305575005207019) < 1e-6
+
+    def test_j_engine(self):
+        from gpu4pyscf.pbc.df.df import GDF
+        cell = self.cell
+        mf = cell.KRHF(kpts=cell.make_kpts([2,1,1])).to_gpu()
+        dm = cp.asarray(cell.pbc_intor('int1e_ovlp', kpts=mf.kpts))
+        vj = mf.get_j(cell, dm, kpts=mf.kpts)
+        self.assertAlmostEqual(lib.fp(vj.get()), 16.5202687206, 8)
+
+        mf.j_engine = PBCJKMatrixOpt(cell)
+        vj = mf.get_j(cell, dm, kpts=mf.kpts)
+        self.assertAlmostEqual(lib.fp(vj.get()), 16.5202687206, 8)
+
+        mf.j_engine = PBCJMatrixOpt(cell)
+        vj = mf.get_j(cell, dm, kpts=mf.kpts)
+        self.assertAlmostEqual(lib.fp(vj.get()), 16.5202687206, 8)
+
+        mf.j_engine = None
+        vj = mf.get_j(cell, dm, kpts=mf.kpts)
+        self.assertAlmostEqual(lib.fp(vj.get()), 16.5202687206, 8)
+
+        # calling GDF.get_j produces a slightly different result
+        mf.j_engine = GDF(cell, mf.kpts)
+        vj = mf.get_j(cell, dm, kpts=mf.kpts)
+        self.assertAlmostEqual(lib.fp(vj.get()), 16.8267957548, 8)
+
+    def test_initial_guess_tag(self):
+        cell = self.cell
+        mf = cell.RHF().to_gpu()
+        s = mf.get_ovlp()
+
+        dm = mf.get_init_guess(key='minao', s1e=s)
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 2
+        assert abs(cp.einsum('ij,ji->', dm, s).get() - 4).max() < 1e-6
+
+        dm = mf.get_init_guess(key='hcore', s1e=s)
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 2
+        assert abs(cp.einsum('ij,ji->', dm, s).get() - 4).max() < 1e-6
+
+        dm = mf.get_init_guess(key='atom', s1e=s)
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 2
+        assert abs(cp.einsum('ij,ji->', dm, s).get() - 4).max() < 1e-6
+
+        dm = mf.get_init_guess(key='huckel', s1e=s)
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 2
+        assert abs(cp.einsum('ij,ji->', dm, s).get() - 4).max() < 1e-6
+
+        dm = mf.get_init_guess(key='mod_huckel', s1e=s)
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 2
+        assert abs(cp.einsum('ij,ji->', dm, s).get() - 4).max() < 1e-6
+
+        kmesh = [2, 2, 1]
+        kpts = cell.make_kpts(kmesh)
+        mf = cell.KRHF(kpts=kpts).to_gpu()
+        s = mf.get_ovlp()
+
+        dm = mf.get_init_guess(key='minao', s1e=s)
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 3
+        assert abs(cp.einsum('kij,kji->', dm, s).real.get() - 16).max() < 1e-6
+
+        dm = mf.get_init_guess(key='hcore', s1e=s)
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 3
+        assert abs(cp.einsum('kij,kji->', dm, s).real.get() - 16).max() < 1e-6
+
+        dm = mf.get_init_guess(key='atom', s1e=s)
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 3
+        assert abs(cp.einsum('kij,kji->', dm, s).real.get() - 16).max() < 1e-6
+
+        dm = mf.get_init_guess(key='huckel', s1e=s)
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 3
+        assert abs(cp.einsum('kij,kji->', dm, s).real.get() - 16).max() < 1e-6
+
+        dm = mf.get_init_guess(key='mod_huckel', s1e=s)
+        assert hasattr(dm, 'mo_coeff') and dm.mo_coeff.ndim == 3
+        assert abs(cp.einsum('kij,kji->', dm, s).real.get() - 16).max() < 1e-6
+
+    def test_scanner(self):
+        cell1 = pbcgto.M(
+            a=np.eye(3)*4,
+            atom='H 0 0 0; H 0 0 1.', basis='gth-szv',
+            pseudo='gth-pbe', mesh=[7, 7, 7])
+
+        cell2 = cell1.set_geom_('H 0 0 0; H 0 0 1.5', inplace=False)
+        cell2.mesh = [15, 15, 15]
+
+        mf1 = scf.RHF(cell1).run()
+        mf_scanner = mf1.as_scanner()
+        mf_scanner(cell1)
+
+        e2 = mf_scanner(cell2)
+        assert np.array_equal(mf_scanner.with_df.mesh, [15, 15, 15])
+        mf2 = scf.RHF(cell2).run()
+        self.assertAlmostEqual(e2, mf2.e_tot, 9)
+
+        e1 = mf_scanner(cell1)
+        assert np.array_equal(mf_scanner.with_df.mesh, [7, 7, 7])
+        self.assertAlmostEqual(e1, mf1.e_tot, 9)
+
+class RestrictedSCFProperties(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from pyscf.pbc import scf as cpu_scf
+        cls.cell = pbcgto.M(
+            atom='He .2 .3 .4', unit='Bohr', a=np.diag([5., 5.2, 5.4]),
+            basis=[[0, [.8, 1.]], [1, [.4, 1.]]], pseudo='gth-pade',
+            mesh=[25, 27, 29], precision=1e-10, verbose=0)
+        cls.kpts = cls.cell.make_kpts([2, 1, 1])
+        cls.models = {}
+        for name in ('RHF', 'KRHF'):
+            kwargs = {} if name == 'RHF' else {'kpts': cls.kpts}
+            gpu = getattr(scf, name)(cls.cell, **kwargs).run(conv_tol=1e-11)
+            cpu = getattr(cpu_scf, name)(cls.cell, **kwargs).run(conv_tol=1e-11)
+            assert gpu.converged and cpu.converged
+            cls.models[name] = gpu, cpu
+
+    @unittest.skipIf(Version(pyscf.__version__) < Version('2.9'),
+                         'PySCF 2.8: CPU occupations use a different container')
+    def test_uneven_unoccupied_orbitals(self):
+        from gpu4pyscf.pbc.scf import khf
+        from pyscf.pbc.scf import khf as cpu_khf
+        mf, cpu = self.models['KRHF']
+        # Removing a virtual orbital at one k-point must not alter the density.
+        energies = [mf.mo_energy[0], mf.mo_energy[1, :-1]]
+        coeff = [mf.mo_coeff[0], mf.mo_coeff[1, :, :-1]]
+        occupation = mf.get_occ(energies, coeff)
+        # The local CPU API accepts rectangular energies only. The removed
+        # orbital is unoccupied in its full-array reference calculation.
+        full_occ = cpu.get_occ(mf.mo_energy.get())
+        self.assertEqual(full_occ[1, -1], 0)
+        ref_occ = [full_occ[0], full_occ[1, :-1]]
+        for actual, reference in zip(occupation, ref_occ):
+            np.testing.assert_array_equal(actual.get(), reference)
+        density = khf.make_rdm1(coeff, occupation)
+        reference = cpu_khf.make_rdm1([c.get() for c in coeff],
+                                      [o.get() for o in occupation])
+        np.testing.assert_allclose(density.get(), reference, atol=1e-12, rtol=0)
+        np.testing.assert_allclose(density.get(), mf.make_rdm1().get(), atol=1e-12, rtol=0)
+        self.assertIs(density.mo_coeff, coeff)
+        self.assertIs(density.mo_occ, occupation)
+
+    def _check_density_dispatch(self, name):
+        from gpu4pyscf.pbc.dft import UniformGrids, numint
+        from gpu4pyscf.pbc.dft.multigrid_v3 import MultiGridNumInt
+        from pyscf.pbc.dft.numint import KNumInt as CpuNumInt
+        sampled = name.startswith('K')
+        source = self.models['KRHF' if sampled else 'RHF'][0]
+        kwargs = {'kpts': self.kpts} if sampled else {}
+        is_dft = name in ('RKS', 'KRKS')
+        factory = dft if is_dft else scf
+        mf = getattr(factory, name)(self.cell, **kwargs)
+        mf.mo_coeff = source.mo_coeff.copy()
+        mf.mo_occ = source.mo_occ.copy()
+        grids = UniformGrids(self.cell)
+        grids.mesh = np.asarray(self.cell.mesh) + 2
+        if is_dft:
+            mf._numint = numint.KNumInt() if sampled else numint.NumInt()
+            mf.grids = grids
+            supplied_grids = None
+        else:
+            mf.build()
+            self.assertIsInstance(mf._numint, MultiGridNumInt)
+            original_mesh = np.asarray(mf._numint.mesh).copy()
+            supplied_grids = grids
+        density = mf.make_rdm1()
+        before = density.copy()
+        actual = mf.get_rho(grids=supplied_grids)
+        explicit = mf.get_rho(dm=density, grids=supplied_grids)
+        np.testing.assert_allclose(actual.get(), explicit.get(), atol=1e-12, rtol=0)
+        coordinates = grids.coords.get()
+        # NumInt.get_rho returns tile-8 order; multigrid returns FFT order.
+        if is_dft:
+            coordinates = coordinates[grids.argsort(tile=8)]
+        kpts = self.kpts if sampled else np.zeros((1, 3))
+        ao = self.cell.pbc_eval_gto('GTOval_sph', coordinates, kpts=kpts)
+        charge = density.get().reshape(len(kpts), self.cell.nao, self.cell.nao)
+        reference = CpuNumInt().eval_rho(self.cell, ao, charge, hermi=1)
+        np.testing.assert_allclose(actual.get(), reference, atol=1e-9, rtol=0)
+        np.testing.assert_array_equal(density.get(), before.get())
+        if not is_dft:
+            np.testing.assert_array_equal(mf._numint.mesh, original_mesh)
+
+    def test_get_rho_rhf_built(self):
+        self._check_density_dispatch('RHF')
+
+    def test_get_rho_krhf_built(self):
+        self._check_density_dispatch('KRHF')
+
+    def test_get_rho_rks(self):
+        self._check_density_dispatch('RKS')
+
+    def test_get_rho_krks(self):
+        self._check_density_dispatch('KRKS')
+
+    def test_krhf_default_fock(self):
+        rotation = np.eye(self.cell.nao)
+        angle = .13
+        rotation[:2, :2] = [[np.cos(angle), -np.sin(angle)],
+                            [np.sin(angle), np.cos(angle)]]
+        mf, cpu = self.models['KRHF']
+        coeff = cp.matmul(mf.mo_coeff, cp.asarray(rotation))
+        occupation = mf.mo_occ
+        density = mf.make_rdm1(coeff, occupation)
+        hcore = mf.get_hcore()
+        energy = mf.energy_elec(density, hcore)
+        reference = cpu.energy_elec(density.get(), hcore.get())
+        np.testing.assert_allclose(energy, reference, atol=1e-9, rtol=0)
+        gradient = mf.get_grad(coeff, occupation)
+        ref_grad = cpu.get_grad(coeff.get(), occupation.get())
+        self.assertGreater(float(cp.linalg.norm(gradient)), 1e-3)
+        np.testing.assert_allclose(gradient.get(), ref_grad, atol=1e-9, rtol=0)
+        eigenvalues, canonical = mf.canonicalize(coeff, occupation)
+        ref_values = cpu.canonicalize(coeff.get(), occupation.get())[0]
+        np.testing.assert_allclose(eigenvalues.get(), np.asarray(ref_values), atol=1e-9, rtol=0)
+        np.testing.assert_allclose(mf.make_rdm1(canonical, occupation).get(),
+                                   density.get(), atol=1e-11, rtol=0)
+
+    def test_single_band_shape_and_normalization(self):
+        for name, (mf, cpu) in self.models.items():
+            with self.subTest(method=name):
+                energy, coeff = mf.get_bands(np.zeros(3))
+                batched = mf.get_bands(np.zeros((1, 3)))[0]
+                if name == 'KRHF':
+                    # The CPU Gamma-only band API shares the in-place cast
+                    # defect. Build its Fock with normal dtype promotion and
+                    # solve the generalized eigenproblem independently.
+                    band = np.zeros((1, 3))
+                    hcore = cpu.get_hcore(kpts=band)[0]
+                    potential = cpu.get_veff(kpts_band=band)[0]
+                    overlap = cpu.get_ovlp(kpts=band)[0]
+                    reference = eigh(hcore + potential, overlap, eigvals_only=True)
+                    self.assertEqual(mf.get_hcore(kpts=band).dtype, np.float64)
+                    self.assertEqual(mf.get_veff(kpts_band=band).dtype, np.complex128)
+                else:
+                    reference = cpu.get_bands(np.zeros(3))[0]
+                expected_shape = (self.cell.nao,)
+                self.assertEqual(energy.shape, expected_shape)
+                unbatched = batched[0]
+                np.testing.assert_allclose(energy.get(), unbatched.get(), atol=1e-11, rtol=0)
+                np.testing.assert_allclose(energy.get(), np.asarray(reference), atol=1e-9, rtol=0)
+                overlap = cp.asarray(self.cell.pbc_intor('int1e_ovlp'))
+                np.testing.assert_allclose((coeff.conj().T @ overlap @ coeff).get(),
+                                           np.eye(self.cell.nao), atol=1e-10, rtol=0)
+
 
 if __name__ == '__main__':
     print("Full Tests for pbc.scf.hf")

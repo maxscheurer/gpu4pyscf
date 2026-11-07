@@ -14,13 +14,17 @@
 
 import unittest
 import numpy as np
-import cupy
+import cupy as cp
 import pyscf
 from pyscf import gto, lib
 from pyscf.hessian import rhf as rhf_cpu
 from gpu4pyscf import scf, hessian
 from gpu4pyscf.hessian import rhf as rhf_gpu
 from gpu4pyscf.lib.multi_gpu import num_devices
+try:
+    from gpu4pyscf.dispersion import dftd3, dftd4
+except (ImportError, OSError):
+    dftd3 = dftd4 = None
 
 def setUpModule():
     global mol
@@ -134,6 +138,7 @@ class KnownValues(unittest.TestCase):
         assert abs(vj.get() - refj).max() < 1e-8
         assert abs(vk.get() - refk).max() < 1e-8
 
+    @unittest.skipIf(dftd3 is None, "requires the dftd3 library")
     def test_hessian_rhf_D3(self):
         print('----- testing RHF with D3BJ ------')
         mf = mol.RHF()
@@ -142,7 +147,18 @@ class KnownValues(unittest.TestCase):
         mf.conv_tol_cpscf = 1e-8
         ref = mf.Hessian().kernel()
         e2_gpu = mf.Hessian().to_gpu().kernel()
-        assert abs(ref - e2_gpu).max() < 1e-6
+        assert abs(ref - e2_gpu).max() < 1e-7
+
+    @unittest.skipIf(dftd4 is None, "requires the dftd4 library")
+    def test_hessian_rhf_D4(self):
+        print('----- testing RHF with D4 ------')
+        mf = mol.RHF()
+        mf.disp = 'd4'
+        mf.run()
+        mf.conv_tol_cpscf = 1e-8
+        ref = mf.Hessian().kernel()
+        e2_gpu = mf.Hessian().to_gpu().kernel()
+        assert abs(ref - e2_gpu).max() < 1e-7
 
     def test_jk_mix(self):
         mol1 = pyscf.M(
@@ -182,8 +198,8 @@ class KnownValues(unittest.TestCase):
             ''',
         )
         nao = mol1.nao
-        mo_coeff = cupy.random.rand(nao, nao)
-        mo_occ = cupy.zeros([nao])
+        mo_coeff = cp.random.rand(nao, nao)
+        mo_occ = cp.zeros([nao])
         mo_occ[:3] = 2
         mocc = mo_coeff[:,:3]
         dm = mocc.dot(mocc.T) * 2
@@ -194,11 +210,11 @@ class KnownValues(unittest.TestCase):
         vj, vk = mf.get_jk(mol1, dm, hermi=1)
         vj_cpu = (mo_coeff.T @ vj @ mocc).reshape(1,-1)
         vk_cpu = (mo_coeff.T @ vk @ mocc).reshape(1,-1)
-        assert cupy.linalg.norm(vj_cpu - vj_mo) < 1e-5
-        assert cupy.linalg.norm(vk_cpu - vk_mo) < 1e-5
+        assert cp.linalg.norm(vj_cpu - vj_mo) < 1e-5
+        assert cp.linalg.norm(vk_cpu - vk_mo) < 1e-5
 
     @unittest.skipIf(num_devices > 1, '')
-    def test_ecp_hess(self):
+    def test_ecp_hess_high_cost(self):
         mol = gto.M(atom='H 0 0 1.5; Cu 0 0 0', basis='lanl2dz',
                     ecp={'Cu':'lanl2dz'}, 
                     verbose=0,
@@ -212,6 +228,33 @@ class KnownValues(unittest.TestCase):
         e2 = mfs(mol.set_geom_('H 0 0 1.5; Cu 0 0 -0.001'))[1]
         mol.stdout.close()
         self.assertAlmostEqual(abs(hess[1,:,2] - (e1-e2)/0.002*lib.param.BOHR).max(), 0, 5)
+
+class SmallECP(unittest.TestCase):
+    @unittest.skipIf(num_devices > 1, '')
+    def test_ecp_hess(self):
+        # NaH has two explicit electrons with LANL2DZ, versus 20 in CuH.
+        mol = gto.M(atom='H 0 0 1.9; Na 0 0 0', basis='lanl2dz',
+                    ecp={'Na': 'lanl2dz'}, verbose=0)
+        mf = scf.RHF(mol).run(conv_tol=1e-14)
+        assert mf.converged
+        hess = hessian.RHF(mf).kernel()
+        reference = np.array([[[[-0.001100661116,  0.            ,  0.            ],
+           [ 0.            , -0.001100661116,  0.            ],
+           [ 0.            ,  0.            ,  0.060304624602]],
+
+          [[ 0.001100661116,  0.            ,  0.            ],
+           [ 0.            ,  0.001100661116,  0.            ],
+           [ 0.            ,  0.            , -0.060304624602]]],
+
+         [[[ 0.001100661116,  0.            ,  0.            ],
+           [ 0.            ,  0.001100661116,  0.            ],
+           [ 0.            ,  0.            , -0.060304624602]],
+
+          [[-0.001100661116,  0.            ,  0.            ],
+           [ 0.            , -0.001100661116,  0.            ],
+           [ 0.            ,  0.            ,  0.060304624602]]]])
+        self.assertAlmostEqual(abs(hess - reference).max(), 0, 5)
+
 
 if __name__ == "__main__":
     print("Full Tests for RHF Hessian")

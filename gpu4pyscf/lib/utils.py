@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import platform
+import ctypes
 import h5py
 import functools
 import cupy
@@ -28,12 +29,22 @@ from pyscf.lib import parameters as param
 __all__ = ['load_library', 'format_sys_info', 'to_cpu']
 
 @functools.lru_cache
-def load_library(libname):
-    try:
-        _loaderpath = os.path.dirname(__file__)
-        return numpy.ctypeslib.load_library(libname, _loaderpath)
-    except OSError:
-        raise
+def load_library(libname, path=None):
+    if path is None:
+        loaderpath = os.path.dirname(__file__)
+        return numpy.ctypeslib.load_library(libname, loaderpath)
+    elif os.path.isabs(path):
+        return numpy.ctypeslib.load_library(libname, path)
+    else:
+        for directory in sys.path:
+            directory = os.path.join(directory, path)
+            if not os.path.isdir(directory):
+                continue
+            try:
+                return numpy.ctypeslib.load_library(libname, directory)
+            except OSError:
+                pass
+    raise OSError(f'Unable to load {libname}')
 
 class _OmniObject:
     '''Class with default attributes. When accessing an attribute that is not
@@ -77,6 +88,8 @@ def to_cpu(method, out=None):
         out.__dict__.pop(k, None)
 
     for key, val in method.__dict__.items():
+        if key in discards:
+            continue
         # Convert only the keys that are defined in the corresponding GPU class
         if key in cls_keys:
             if hasattr(val, 'to_cpu'):
@@ -157,6 +170,9 @@ def splits_by_blocksize(cum, block_size):
     Returns:
         splits: split points in cum, starting with 0 and ending with len(cum)-1.
     '''
+    if len(cum) == 1:
+        return [0]
+
     bound = block_size
     tot = cum[-1]
     splits = [0]
@@ -165,5 +181,50 @@ def splits_by_blocksize(cum, block_size):
         i += max(numpy.searchsorted(cum[i:], bound, side='right') - 1, 1)
         splits.append(i)
         bound = cum[i] + block_size
-    splits.append(len(cum) - 1)
+    if splits[-1] != len(cum) - 1:
+        splits.append(len(cum) - 1)
     return splits
+
+def nearest_power2(n, return_leq=True):
+    '''nearest 2**x that is leq or geq than n.
+
+    Kwargs:
+        return_leq specifies that the return is less or equal than n.
+        Otherwise, the return is greater or equal than n.
+    '''
+    if isinstance(n, numpy.ndarray):
+        n = numpy.where(n > 1, n, 1)
+        if return_leq:
+            return 2 ** numpy.log2(n).astype(int)
+        else:
+            return 2 ** numpy.ceil(numpy.log2(n)).astype(int)
+
+    assert n > 0
+    n = max(int(n), 1)
+    if return_leq:
+        return 1 << (n.bit_length() - 1)
+    else:
+        return 1 << ((n-1).bit_length())
+
+def indices_within_groups(counts):
+    '''
+    Generate zero-based indices within groups of specified sizes.
+
+    Parameters
+    ----------
+    counts : array_like of int
+        Number of elements in each group.
+
+    Returns
+    -------
+    numpy.ndarray
+        One-dimensional array containing consecutive zero-based indices
+        for each group.
+
+    Examples
+    --------
+    >>> indices_within_groups([3, 2, 4])
+    array([0, 1, 2, 0, 1, 0, 1, 2, 3])
+    '''
+    offsets = numpy.append(0, numpy.cumsum(counts))
+    return numpy.arange(offsets[-1]) - numpy.repeat(offsets[:-1], counts)

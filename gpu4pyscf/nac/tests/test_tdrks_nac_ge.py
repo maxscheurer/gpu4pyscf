@@ -20,6 +20,7 @@ from pyscf import lib, gto, scf, dft
 from gpu4pyscf import tdscf, nac
 import gpu4pyscf
 import pytest
+from gpu4pyscf.grad.tests.test_tdrhf_grad import diagonalize_tda
 
 atom = """
 O       0.0000000000     0.0000000000     0.0000000000
@@ -39,21 +40,6 @@ def tearDownModule():
     global mol
     mol.stdout.close()
     del mol
-
-
-def diagonalize_tda(a, nroots=5):
-    nocc, nvir = a.shape[:2]
-    nov = nocc * nvir
-    a = a.reshape(nov, nov)
-    e, xy = np.linalg.eig(np.asarray(a))
-    sorted_indices = np.argsort(e)
-
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
 
 
 class KnownValues(unittest.TestCase):
@@ -279,6 +265,62 @@ class KnownValues(unittest.TestCase):
         assert abs(np.abs(nac1.de_scaled) - np.abs(ref)).max() < 1e-4
         assert abs(np.abs(nac1.de_etf) - np.abs(ref_etf)).max() < 1e-4
         assert abs(np.abs(nac1.de_etf_scaled) - np.abs(ref_etf_scaled)).max() < 1e-4
+
+    def test_nac_b3lyp_tddft_singlet_ris_zvector_solver(self):
+        mf = dft.rks.RKS(mol, xc="b3lyp").to_gpu()
+        mf.grids.atom_grid = (99,590)
+        mf.kernel()
+        td = mf.TDDFT().set(nstates=5)
+        td.kernel()
+        nac1 = gpu4pyscf.nac.tdrks.NAC(td)
+        nac1.states=(1,0)
+        nac1.ris_zvector_solver = True
+        nac1.kernel()
+
+        nac2 = gpu4pyscf.nac.tdrks.NAC(td)
+        nac2.states=(1,0)
+        nac2.ris_zvector_solver = False
+        nac2.kernel()
+
+        ref = np.array([[-0.0514899033, -0.0000000000,  0.0000000000],
+                        [ 0.1381116282, -0.0000000000,  0.0000000000],
+                        [ 0.1381116282, -0.0000000000, -0.0000000000]])
+        ref_etf_scaled = np.array([[-0.4838423827,  0.000000,  0.000000],
+                                   [ 0.2419209956, -0.000000, -0.000000],
+                                   [ 0.2419209956,  0.000000, -0.000000]])
+        ref_etf = np.array([[-0.1352921875,  0.000000,  0.000000],
+                            [ 0.0676460390, -0.000000, -0.000000],
+                            [ 0.0676460390,  0.000000, -0.000000]])
+        assert abs(np.abs(nac1.de/td.e[0]) - np.abs(ref)).max() < 1e-4
+        assert abs(np.abs(nac1.de_scaled) - np.abs(ref)).max() < 1e-4
+        assert abs(np.abs(nac1.de_etf) - np.abs(ref_etf)).max() < 1e-4
+        assert abs(np.abs(nac1.de_etf_scaled) - np.abs(ref_etf_scaled)).max() < 1e-4
+        assert abs(np.abs(nac1.de) - np.abs(nac2.de)).max() < 1e-1
+
+        nac1 = gpu4pyscf.nac.tdrks.NAC(td)
+        nac1.ris_zvector_solver = True
+        nac1.states=(2,0)
+        nac1.kernel()
+
+        nac2 = gpu4pyscf.nac.tdrks.NAC(td)
+        nac2.ris_zvector_solver = False
+        nac2.states=(2,0)
+        nac2.kernel()
+
+        ref = np.array([[-0.0000000000,  0.000000,  0.000000],
+                        [-0.1139932016, -0.000000, -0.000000],
+                        [ 0.1139932016,  0.000000, -0.000000]])
+        ref_etf_scaled = np.array([[-0.0000000000,  0.000000,  0.000000],
+                                   [-0.2745815258, -0.000000, -0.000000],
+                                   [ 0.2745815258,  0.000000, -0.000000]])
+        ref_etf = np.array([[-0.0000000000,  0.000000,  0.000000],
+                            [-0.0955865372, -0.000000, -0.000000],
+                            [ 0.0955865372,  0.000000, -0.000000]])
+        assert abs(np.abs(nac1.de/td.e[1]) - np.abs(ref)).max() < 1e-4
+        assert abs(np.abs(nac1.de_scaled) - np.abs(ref)).max() < 1e-4
+        assert abs(np.abs(nac1.de_etf) - np.abs(ref_etf)).max() < 1e-4
+        assert abs(np.abs(nac1.de_etf_scaled) - np.abs(ref_etf_scaled)).max() < 1e-4
+        assert abs(np.abs(nac1.de) - np.abs(nac2.de)).max() < 1e-2
 
 if __name__ == "__main__":
     print("Full Tests for TD-RKS nonadiabatic coupling vectors between ground and excited state.")

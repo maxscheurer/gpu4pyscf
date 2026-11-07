@@ -1,3 +1,296 @@
+v1.9.1 (2026-11-03)
+-------------------
+* New Features
+  - Geometric direct minimization for SCF calculations. (#978)
+  - GPU SAP and VSAP initial guesses. (#997)
+  - GPU internal stability analysis for RHF, RKS, UHF and UKS, and external stability analysis for RHF, RKS and UHF. (#1005)
+* Fixes
+  - GPU OOM in density-fitted Hessian calculations. (#973, #992)
+  - Numerical instability in density-fitted RHF and UHF gradients with nearly linearly dependent auxiliary bases. (#1019)
+  - Spurious magnetic-moment warnings in SAD and AUTOSAD initial guesses. (#1020)
+  - Range-separated Coulomb matrices with multiple density matrices. (#990)
+  - Multigrid v3 synchronization bug, affecting Coulomb and XC matrices and stress tensors. (#986)
+  - Multigrid v2 pair-list indexing and synchronization bug. (#995)
+  - Multigrid screening arguments and meta-GGA kinetic energy density screening radii. (#995)
+  - Races in periodic AFT integrals and short-range density-fitting Coulomb contractions. (#995)
+  - Short-range integral screening races in molecular and periodic J/K builders. (#995)
+  - Uninitialized screened integrals affecting MP2 and in-core CCSD. (#995)
+  - DFT grid grouping races for systems with more than 128 atoms. (#995)
+  - CUDA stream and launch configuration bugs in one-electron integrals. (#1003)
+  - Spurious LR-PCM transition-density contributions to restricted triplet TDA/TDDFT gradients. (#1013)
+  - Generalized-spin J/K assembly and pure GKS Coulomb energies. (#1004)
+  - DFT quadrature with non-Hermitian densities. (#1004)
+  - Fix DFT grid grouping bug caused by incorrect atom sorting. (#1004)
+  - Krylov initial guesses. (#1004)
+  - cuSOLVER error handling and single-device task keyword arguments. (#1004)
+  - MP2 initialization with frozen or supplied orbitals, density-fitting integral layouts and density reconstruction without stored amplitudes. (#1004)
+  - Periodic GHF initial-guess normalization. (#1004)
+  - Molecular and periodic QM/MM cache invalidation. (#1004)
+  - Frozen-solvent initialization and response. (#1004)
+  - TD response eigensolver linearly dependent corrections. (#1004)
+  - Non-adiabatic coupling scanner convergence indices. (#1004)
+  - CPU/GPU conversion for Hessian settings, CCSD state, SMD and smeared SCF objects. (#1004)
+* API Updates
+  - Deprecate eval_rho3 in favor of eval_rho4. (#1004)
+  - Reject unsupported full-range lr_factor and SAP breaksym arguments instead of silently ignoring them. (#1004)
+
+
+v1.9.0 (2026-10-07)
+-------------------
+* New Features (PBC systems)
+  - Stress tensor calculations using Gaussian density fitting at the Gamma point and with k-point sampling. (#896)
+  - Nuclear gradients and stress tensors with Becke grid response. (#887, #906, #921)
+  - All-electron core Hamiltonian nuclear and strain derivatives using GDF. (#916)
+  - Atom-resolved magnetic moment initial guesses. (#892)
+  - Experimental numerical Gamma-point Hessian and phonon modes using phonopy, without non-analytic corrections. (#860)
+  - GHF and collinear GKS at the Gamma point and with k-point sampling; GKS currently supports semilocal functionals with Becke grids. (#942, #965)
+  - Berry (Zak) phases, hybrid Wannier centers, and electronic and ionic polarization for closed-shell insulators. (#917)
+* New Features (molecular systems)
+  - MBIS and Hirshfeld atomic charges and multipoles. (#902, #911)
+  - Support cuEST v0.2.0, including density-fitted MO integrals and range-separated hybrid energies and gradients. (#859)
+  - GPU density-fitted CASCI and diagonal-Hessian CASSCF with a GPU direct-spin1 FCI solver (experimental). (#869)
+  - COACH functional, combining VV10 with an ATM-only D4 correction.
+  - SCF conversions between restricted, unrestricted and generalized HF/KS references. (#937)
+  - SAD initial guesses, including Q-Chem-style guesses and selectable high-spin or spin-averaged atomic densities; high-spin SAD also supports periodic SCF. (#950, #975)
+  - Mulliken population analysis, including generalized HF references. (#963)
+  - Named solvents in PCM, with solvent-specific static and optical dielectric constants and explicit overrides shared with SMD. (#962)
+* Improvements
+  - Multigrid v3 with optimized density evaluation, analytical Fourier transform kernels, and reduced memory usage. (#865, #891)
+  - Optimize PBC GDF short-range integrals and reduce memory usage in GDF gradients. (#924, #928)
+  - Optimize molecular density-fitting gradient and Hessian kernels. (#934)
+  - Combine short- and long-range exchange inside density-fitting kernels for energies, gradients, and Hessians. (#859)
+  - Unify PBC nuclear gradient and stress tensor evaluation. (#910)
+  - Analytical Ewald stress tensor and AFT exchange-divergence corrections. (#913)
+  - Optimize nonlocal pseudopotential integrals and stress tensors. (#883, #912)
+  - Cache QM/MM nuclear Coulomb energy across SCF cycles. (#914)
+  - Upgrade LibXC to 7.1.2 while retaining compatibility with the 7.0.0 fork. (#935)
+  - Add a tutorial for hybrid PySCF/GPU4PySCF workflows. (#882)
+  - Improve density-fitting task granularity and batch auxiliary groups for integral builds, gradients and Hessians; reduce gradient workspace and improve TD gradient numerical stability. (#967, #970)
+  - Batch AO pairs and reciprocal-space vectors to bound memory usage in PBC GDF diffuse integrals.
+  - Update four-center integral CUDA kernels and the in-core CCSD integral driver. (#936)
+  - Reduce host/device transfers in gradients and Hessians, and batch TDDFT-ris tensor uploads. (#972)
+  - Refactor FSSH trajectory storage, checkpoint/restart handling and Wigner sampling. (#899)
+  - Align CPHF linear-dependency thresholds with solver tolerances, including Hessian response calculations. (#951)
+  - Support custom shared-library search paths. (#957)
+  - Support standard CMake CUDA architecture settings. (#952)
+* Fixes
+  - Multigrid v3 integrals, densities, nuclear gradients and stress tensors for skewed lattices, and integral screening. (#976, #979)
+  - Complex-valued PBC second-order SCF and time-reversal symmetry enforcement. (#964, #974)
+  - Molecular and periodic GHF spin-block handling used by GKS calculations. (#965)
+  - Incorrect ECP-center contributions in TDDFT gradients and non-adiabatic couplings for systems mixing ECP and all-electron atoms. (#971)
+  - Incorrect range-separated exchange matrix construction. (#947)
+  - Contracted basis dimensions in the PBC J engine. (#945)
+  - PBC GDF initialization when switching from Coulomb-only to exchange calculations. (#960)
+  - Frozen orbitals in in-core CCSD. (#961)
+  - MO dimension handling in the vovo AO-to-MO integral transformation.
+  - TDDFT-ris integral buffer sizing under limited GPU memory. (#967)
+  - Non-contiguous weighted-density arrays in UKS Hessians. (#958)
+  - SCF damping ignored with PCM and SMD solvents. (#949)
+  - Respect custom range-separation omega in GPU LibXC functionals and grid-response Hessian terms. (#923, #929)
+  - Incorrect screening for mixed range-separated exchange in unrolled K kernels. (#909)
+  - GPU OOM in density-fitted TDHF gradients and PBC GDF and RSJK derivatives. (#885, #907)
+  - Insufficient workspace for molecular J/K gradient kernels. (#879)
+  - Illegal memory access in large PBC RSDF calculations on multiple GPUs. (#862)
+  - CUDA indexing, integer overflow, and CUTLASS stream handling issues. (#863, #868)
+  - Race condition in DFT grid screening. (#925)
+  - Incorrect periodic g-orbital values, second derivatives, and strain derivatives.
+  - Incorrect int1e_r2_origi integrals and one-electron integral accuracy. (#857)
+  - Incorrect k-point weights in constrained DFT gradients. (#856)
+  - Multigrid v2 stress spikes and single-precision collocation kernels. (#855, #874)
+  - Inconsistent orthogonal lattice checks in analytical Fourier transforms. (#918)
+  - Mesh consistency in PBC geometry optimization, numerical Hessians, and FFTDF/AFTDF SCF scanners. (#889, #932, #933)
+  - Stress units and center-of-mass constraints in ASE geometry optimization. (#878, #889)
+  - UHF logging for systems with zero beta electrons. (#853)
+* API Updates
+  - Multigrid v3 replaces multigrid v2 as the default multigrid integrator.
+  - Add lr_factor and sr_factor parameters to the 2c2e and 3c2e integral APIs. (#861)
+  - Remove deprecated dft_driver, opt_driver, and opt_3c_driver modules. (#858)
+
+
+v1.8.1 (2026-08-09)
+-------------------
+* Fixes
+  - Support ghost atom for PCM
+  - GPU OOM because of incorrect DF workspace size estimation
+  - Remove a redundant DF get_k for RSH functionals
+  - contract_2e bug for FCI solver
+  - np.log underflow in extract_pgto_params
+  - multigrid OOM due to the overhead in cp.einsum
+
+
+v1.8.0 (2026-07-23)
+-------------------
+* New Features
+  - geometry optimization for PM6.
+  - spin_square methods for the RHF and GHF classes
+  - X2C1e support and density fitting for GHF/GKS
+  - Spin-free X2C1e for PBC calculations
+  - Second-order SCF for PBC DFT
+  - Time-reversal symmetry support for k-point sampling calculations
+  - Stress tensor using the multigrid integrator
+* Improvements
+  - Refactor the VV10 Hessian implementation to improve performance.
+  - Eigenvalue decomposition is now used by default to handle the auxiliary basis linear dependency in PBC GDF.
+  - Refactor the molecular J/K matrix construction, improving K-matrix performance for range-separated hybrid functionals.
+  - Optimize int3c2e and auxvec contraction using the MD J-engine algorithm.
+  - Optimize multigrid density kernel (`evaluate_density_kernel`).
+  - Improve the stability of Hessian calculations for very large systems. (#783)
+  - Improve the stability of gradient calculations: changing DF gradient routine full-/short-range j2c inversion algorithm to CD. (#803)
+  - Refactor the density fitting generation code to reduce memory usage, improve density fitting initialization time.
+  - Optimize density fitting integral evaluation for generally contracted basis sets.
+  - Improve the memory efficiency of loading and decompressing the cderi tensor.
+  - Refactor the density fitting Hessian implementation to reduce memory usage, support larger systems, and enable multi-GPU execution.
+  - Optimize density-fitting Coulomb matrix computation (the get_j function)
+  - Optimize one-electron integral derivatives for Gradients and Hessians
+  - Enhance scf_summary to include the energy gap, Ecoul, and Exc.
+  - Reduce memory usage and Optimize memory allocation efficiency in numint.eval_xc_eff (#787)
+  - Reduce memory footprint and increase the speed for C-PCM on large molecule (#809)
+* Fixes
+  - Host memory limit checks and early termination when allocating large mapped memory. (#781)
+  - OOM error in get_j computation for all-electron KHF (#782)
+  - Incorrect gout_pattern in molecular JK build kernel (#791)
+  - pseudopotential gradient when nexp parameter is zero (#795)
+  - Avoid int32 overflow in multigrid v2 kernel
+  - OOM issue caused by low ke_cutoff. (#804)
+  - Setting per-device shared memory attributes on each GPU, fixing shared memory configuration for kernels running on multiple GPUs.
+  - Fix a bug when ghost atom has no grid with significant density, vv10 grid response gradient/hessian fails
+* API Updates
+  - Function numint.eval_xc_eff now returns exc as a vector with shape (N,) instead of an array with shape (N, 1).
+
+
+v1.7.6 (2026-07-14)
+-------------------
+* Fixes
+  - Excessive memory usage in TDDFT caused by cupy.einsum
+  - Fix the bad atomic radii assigned to ghost atom, which causes a bad Becke partition and a negative BSSE (#814)
+
+
+v1.7.5 (2026-07-10)
+-------------------
+* Improvements
+  - Update dispersion parser for wb97x-d4 backward compatibility (resolve to d4:wb97x-2008)
+
+
+v1.7.4 (2026-06-23)
+-------------------
+* Improvements
+  - Check host memory limits before allocating large mapped memory
+
+
+v1.7.3 (2026-06-17)
+-------------------
+* Fixes
+  - Restore the grids_response_cc and grids_noresponse_cc APIs that were removed in 1.7.1
+
+
+v1.7.2 (2026-06-15)
+-------------------
+* Improvements
+  - A dedicated SCF class to handle one-electron systems
+  - Add spin_square methods for all SCF classes
+  - Add HF1e (#785)
+* Fixes
+  - Attempt to improve the stability of Hessian calculation on a very big system (#783)
+
+
+v1.7.1 (2026-05-28)
+-------------------
+* New Features
+  - SCF and analytical gradients for the PM6 semi-empirical method
+  - Density matrix purification methods for PM6
+  - Analytic gradient and NACV for spin-flip TDDFT/TDA
+  - qmmm.pbc for UKS
+* Improvements
+  - Accelerated vv10 energy calculation (#751)
+  - Optimized vv10 grid response gradient performance (#749)
+  - Optimized XC gradient performance with grid response (#755)
+  - Applied sparsity to XC Hessian (#766)
+  - GPU-accelerated vppnl_nuc_grad for GTH pseudopotentials (#740)
+  - SCF initial guess to include MO coefficients to accelerate the first Fock build
+* Fixes
+  - SG1 grid radius for ghost atoms
+  - Convergence threshold checks in the UCDFT second-order solver
+
+
+v1.7.0 (2026-04-15)
+-------------------
+* New Features
+  - Enabling integration with Nvidia cuEST for more efficient evaluation of density fitting J and K matrices.
+  - Support Stratmann-impoved Becke grid partition scheme (#702)
+* Improvements
+  - TDDFT Gradient and NACV batched calculations for FSSH MD
+  - Support 'default' key in Grids.atom_grid assignment
+  - Support explicit dispersion and nonlocal correlation specification in EDA interface (#719)
+  - In TDDFT-FSSH, use x/y and z-vector from the previous step as initial guess (#716)
+  - Print HOMO-LUMO gap in SCF iteration (#714)
+* Fixes
+  - DF-UKS grid pruning
+  - Compatable with _smearing_optimize in newest pyscf version
+  - Fix insufficient memory issue for DF gradients when handling multiple density matrices (#709)
+  - Fix FFTDF divergence for f/g-orbital elements: cp.empty -> cp.zeros
+  - Fix int32 overflow in PBC CUDA kernel pointer arithmetic
+  - Fix a bug when computing vv10 gradient with grid response and natm == 1 (#734)
+  - TagArray bug and workaround in damping and level shift code(#732)
+  - fix multigrid vpplocG bug
+* API updates
+  - Disable density-based grid pruning by default (#715)
+  - Disable the MAX_SPACE_INC parameter in TDDFT diagonalization routine (#704)
+  - Changed storage of TDDFT XY amplitudes from NumPy arrays to CuPy arrays
+
+
+v1.6.1 (2026-03-20)
+-------------------
+* New Features
+  - Support PCM ISWIG surface discretization method
+* Improvements
+  - Optimize memory usage for TDDFT gradients and NACV
+  - Change the default solvent to water for SMD model
+* Fixes
+  - Bug in batch processing for density fitting deriviatives
+  - Wrong sign for external field
+  - NLC dimension error for TDUKS 
+  - PCM finds wrong radius of ECP atoms
+  - Fix int3c2e J-engine due to an inplace overwritten bug
+  - Fix to_cpu interface for SMD solvent model
+
+
+v1.6.0 (2026-03-10)
+-------------------
+* New Features (PBC systems)
+  - Analytical nuclear gradients for periodic density-fitting methods.
+  - Constrained DFT (CDFT) SCF and nuclear gradient support.
+* New Features (molecular systems)
+  - C6 coefficient calculation via Casimir-Polder integration (#619)
+  - Unrestricted KS vv10 gradient and hessian (#640)
+  - Constrained DFT (CDFT) SCF and nuclear gradients
+  - Function to compute grid density with density gradient and tau (#659)
+  - Density-Fitting MP2 (#662)
+  - Fewest-switches surface hopping (FSSH) non-adiabatic dynamics with TDDFT.
+* Improvements (PBC systems)
+  - Performance optimizations for 2c2e integrals and their derivatives.
+  - The default numerical precision for one-center overlap and kinetic integrals under PBC.
+  - Accelerated Becke weight evaluation.
+  - Added support for disabling radii adjustment in Becke derivative kernels.
+  - Support for Becke grid derivatives under PBC.
+  - PySCF `Mole` and `Cell` class counterparts, with a new `from_cpu` method for CPU to GPU conversion.
+  - `multigrid_v2` is now the default integrator (#656).
+* Improvements (molecular systems)
+  - Refactored derivative integrals of the J and K terms in density-fitting methods, improving performance.
+  - Improved efficiency of derivative integral evaluation for TDDFT gradients and NACVs.
+  - Optimized CUDA kernels for derivative integrals (#627).
+  - Refactored the libxc interface and removed rarely used XC functionals (#635).
+  - Upgraded pyscf/dispersion and made gpu4pyscf self-contained with respect to dispersion implementations (#657).
+  - Canonical orthogonalization added to the SCF eigenvalue solver.
+  - Basis-set linear dependency detection and removal enabled by default.
+* Fixes
+  - Fixed an issue where the `lebedev_order` attribute in the SMD module was not recognized.
+  - Handle zero strides for cutensor (fix #614)
+  - Fix grid dimension overflow bug in ft_ao in fftdf pseudopotential evaluation (#626)
+  - Fix a bug that `get_rho()` provides wrong result if dm has no attached mo_coeff fields (#654)
+* API updates
+  - Removed the `get_veff` method from gradient classes.
+
+
 v1.5.2 (2025-12-29)
 -------------------
 * Improvements
@@ -8,6 +301,7 @@ v1.5.2 (2025-12-29)
 * Fixes
   - int32 overflow error for empty_mapped function
   - Internal state gets overwritten during int3c2e batch evaluation
+
 
 v1.5.1 (2025-12-17)
 -------------------
@@ -21,6 +315,7 @@ v1.5.1 (2025-12-17)
   - Illegal memory addresses in 3c2e generator caused by integer overflow
   - PCM hessian bug caused by atoms without PCM grids
   - Fix UHF.eigh bug caused by overwriting overlap matrix
+
 
 v1.5.0 (2025-11-24)
 -------------------
@@ -66,6 +361,7 @@ v1.5.0 (2025-11-24)
 * API updates
   - Fix to_gpu/to_cpu interface in SMD, TDDFT, and PCM-TDDFT
   - Added from_cpu hook on the GPU side, allowing pyscf to invoke this hook in its to_gpu method.
+
 
 v1.4.3 (2025-08-20)
 -------------------

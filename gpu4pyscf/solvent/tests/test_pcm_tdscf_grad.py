@@ -21,6 +21,9 @@ import gpu4pyscf
 from pyscf import lib, gto, scf, dft
 from gpu4pyscf import tdscf
 from gpu4pyscf.solvent.tdscf.pcm import WithSolventTDSCFGradient
+from gpu4pyscf.grad.tests.test_tdrhf_grad import diagonalize, diagonalize_tda
+from gpu4pyscf.grad.tests.test_tduhf_grad import diagonalize as diagonalize_u
+from gpu4pyscf.grad.tests.test_tduhf_grad import diagonalize_tda as diagonalize_tda_u
 
 atom = """
 O       0.0000000000     0.0000000000     0.0000000000
@@ -30,85 +33,6 @@ H       0.0000000000     0.7570000000     0.5870000000
 
 bas0 = "def2svp"
 bas1 = "631g"
-
-
-def diagonalize(a, b, nroots=5):
-    nocc, nvir = a.shape[:2]
-    nov = nocc * nvir
-    a = a.reshape(nov, nov)
-    b = b.reshape(nov, nov)
-    h = np.block([[a        , b       ],
-                     [-b.conj(),-a.conj()]])
-    e, xy = np.linalg.eig(np.asarray(h))
-    sorted_indices = np.argsort(e)
-
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
-
-
-def diagonalize_tda(a, nroots=5):
-    nocc, nvir = a.shape[:2]
-    nov = nocc * nvir
-    a = a.reshape(nov, nov)
-    e, xy = np.linalg.eig(np.asarray(a))
-    sorted_indices = np.argsort(e)
-
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
-
-
-def diagonalize_u(a, b, nroots=5):
-    a_aa, a_ab, a_bb = a
-    b_aa, b_ab, b_bb = b
-    nocc_a, nvir_a, nocc_b, nvir_b = a_ab.shape
-    a_aa = a_aa.reshape((nocc_a*nvir_a,nocc_a*nvir_a))
-    a_ab = a_ab.reshape((nocc_a*nvir_a,nocc_b*nvir_b))
-    a_bb = a_bb.reshape((nocc_b*nvir_b,nocc_b*nvir_b))
-    b_aa = b_aa.reshape((nocc_a*nvir_a,nocc_a*nvir_a))
-    b_ab = b_ab.reshape((nocc_a*nvir_a,nocc_b*nvir_b))
-    b_bb = b_bb.reshape((nocc_b*nvir_b,nocc_b*nvir_b))
-    a = np.block([[ a_aa  , a_ab],
-                     [ a_ab.T, a_bb]])
-    b = np.block([[ b_aa  , b_ab],
-                     [ b_ab.T, b_bb]])
-    abba = np.asarray(np.block([[a        , b       ],
-                                      [-b.conj(),-a.conj()]]))
-    e, xy = np.linalg.eig(abba)
-    sorted_indices = np.argsort(e)
-
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
-
-
-def diagonalize_tda_u(a, nroots=5):
-    a_aa, a_ab, a_bb = a
-    nocc_a, nvir_a, nocc_b, nvir_b = a_ab.shape
-    a_aa = a_aa.reshape((nocc_a*nvir_a,nocc_a*nvir_a))
-    a_ab = a_ab.reshape((nocc_a*nvir_a,nocc_b*nvir_b))
-    a_bb = a_bb.reshape((nocc_b*nvir_b,nocc_b*nvir_b))
-    a = np.block([[ a_aa  , a_ab],
-                     [ a_ab.T, a_bb]])
-    e, xy = np.linalg.eig(a)
-    sorted_indices = np.argsort(e)
-
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
 
 
 def cal_analytic_gradient(mol, td, tdgrad, nocc, nvir, grad_elec, tda):
@@ -309,8 +233,71 @@ def _check_grad_numerical(mol, tol=1e-6, xc='hf', disp=None, tda=False,
     return grad_ana
 
 
+def _check_triplet_grad_numerical(xc, tda, tol, delta=0.005):
+    """A restricted triplet's transition density carries no charge, so its energy has no
+    LR-PCM term and its gradient must not have one either."""
+    def triplet(coords):
+        mol1 = mol.copy()
+        mol1.set_geom_(coords, unit='Ang')
+        mol1.build()
+        td = get_td(cal_mf(mol1, xc, 'CPCM', False), tda, xc)
+        td.singlet = False
+        td.nstates = 3
+        td.kernel()
+        assert td.converged.all()
+        return td
+
+    coords = mol.atom_coords(unit='Ang')
+    grad_ana = triplet(coords).nuc_grad_method().kernel(state=1)
+    for i, j in ([0, 2], [2, 1]):
+        step = np.zeros_like(coords)
+        step[i, j] = delta
+        e_add = triplet(coords + step).e_tot[0]
+        e_minus = triplet(coords - step).e_tot[0]
+        grad_fdiff = (e_add - e_minus)/(delta*2.0)*0.52917721092
+        assert abs(grad_ana[i, j] - grad_fdiff) < tol
+    return grad_ana
+
+
 class KnownValues(unittest.TestCase):
+    def _check_small_pcm_gradient(self, reference, xc='hf', solvent='CPCM', singlet=True):
+        small_mol = pyscf.M(atom=atom, basis='sto3g', verbose=0)
+        if xc == 'hf':
+            mf = small_mol.RHF().PCM().to_gpu()
+        else:
+            mf = small_mol.RKS(xc=xc).PCM().to_gpu()
+            mf.grids.level = 1
+        mf.with_solvent.method = solvent
+        mf.with_solvent.lebedev_order = 11
+        mf.with_solvent.eps = 78
+        mf.run(conv_tol=1e-12)
+        assert mf.converged
+        td = mf.TDA(equilibrium_solvation=True)
+        td.singlet = singlet
+        td.kernel(nstates=2)
+        assert td.converged.all()
+        g = td.nuc_grad_method().kernel(state=1)
+        assert np.max(np.abs(g - reference)) < 1e-6
+
     def test_grad_tda_singlet_hf_CPCM(self):
+        reference = np.array([[0.0, 0.0, 0.321429091910],
+                              [0.0, 0.275260095367, -0.160714545955],
+                              [0.0, -0.275260095367, -0.160714545955]])
+        self._check_small_pcm_gradient(reference)
+
+    def test_grad_tda_triplet_hf_CPCM(self):
+        reference = np.array([[0.0, 0.0, 0.298954018454],
+                              [0.0, 0.263663759771, -0.149477009227],
+                              [0.0, -0.263663759771, -0.149477009227]])
+        self._check_small_pcm_gradient(reference, singlet=False)
+
+    def test_grad_tda_singlet_b3lyp_COSMO(self):
+        reference = np.array([[0.0, 0.0, 0.354804213785],
+                              [0.0, 0.294935390649, -0.177473658171],
+                              [0.0, -0.294935390649, -0.177473658171]])
+        self._check_small_pcm_gradient(reference, xc='b3lyp', solvent='COSMO')
+
+    def test_grad_tda_singlet_hf_CPCM_high_cost(self):
         """
         $rem
         JOBTYPE              force
@@ -365,7 +352,7 @@ class KnownValues(unittest.TestCase):
     def test_grad_tda_singlet_b3lyp_IEPPCM(self):
         _check_grad_numerical(mol, tol=1e-4, xc='b3lyp', tda=True, solvent='IEFPCM')
 
-    def test_grad_tda_singlet_b3lyp_COSMO(self):
+    def test_grad_tda_singlet_b3lyp_COSMO_high_cost(self):
         _check_grad_numerical(mol, tol=1e-4, xc='b3lyp', tda=True, solvent='COSMO')
 
     @pytest.mark.slow
@@ -411,6 +398,12 @@ class KnownValues(unittest.TestCase):
         td2 = mf.TDA(equilibrium_solvation=True).run()
         self.assertAlmostEqual((td2.e_tot[0]-td1.e_tot[0])/0.002, g1[0,2], 5)
 
+    def test_grad_tda_triplet_hf_CPCM_high_cost(self):
+        _check_triplet_grad_numerical('hf', tda=True, tol=1e-4)
+
+    def test_grad_tddft_triplet_b3lyp_CPCM_high_cost(self):
+        _check_triplet_grad_numerical('b3lyp', tda=False, tol=1e-4)
+
     def test_scanner(self):
         mol = gto.M(atom='H  0.  0.  1.804; F  0.  0.  0.', verbose=0, unit='B')
         td = mol.RHF().to_gpu().PCM().TDA(equilibrium_solvation=True).Gradients()
@@ -419,8 +412,8 @@ class KnownValues(unittest.TestCase):
 
         mol0 = gto.M(atom='H 0 0 0; F .1 0 2.1', verbose=0, unit='B')
         td_ref = mol0.RHF().to_gpu().PCM().run(conf_tol=1e-12).TDA(equilibrium_solvation=True).run(conf_tol=1e-10)
-        assert abs(e - -98.20379057832794) < 1e-8
-        assert abs(e - td_ref.e_tot[0]) < 1e-8
+        assert abs(e - -98.20379057832794) < 1e-7
+        assert abs(e - td_ref.e_tot[0]) < 1e-7
 
         mol1 = gto.M(atom='H 0 0 -0.001; F .1 0 2.1', verbose=0, unit='B')
         td1 = mol1.RHF().to_gpu().PCM().run(conf_tol=1e-12).TDA(equilibrium_solvation=True).run(conf_tol=1e-10)

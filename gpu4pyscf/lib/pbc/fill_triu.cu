@@ -6,6 +6,35 @@
 
 #define BLOCK_SIZE      16
 
+// Add the exchanged tensor in place. ki_idx is an involution: exchanging
+// twice returns to the original momentum. A NULL map leaves momentum fixed.
+// naux counts doubles, so complex data uses twice the auxiliary dimension.
+__global__ static
+void symmetrize_cderi_kernel(double *out, const int *ki_idx,
+                             int nkpts, int nao, int naux)
+{
+    int i = blockIdx.x;
+    int j = blockIdx.y;
+    if (i < j) return;
+    // One block owns both (i,j) and (j,i), across every momentum and aux.
+    size_t size = (size_t)nkpts * naux;
+    size_t k_stride = (size_t)nao * nao * naux;
+    size_t ij = ((size_t)i * nao + j) * naux;
+    size_t ji = ((size_t)j * nao + i) * naux;
+    for (size_t ka = threadIdx.x; ka < size; ka += blockDim.x) {
+        int k = ka / naux;
+        int aux = ka % naux;
+        int partner_k = ki_idx == NULL ? k : ki_idx[k];
+        // On an AO diagonal, the two momentum orientations share this block.
+        if (i == j && k > partner_k) continue;
+        size_t p = k * k_stride + ij + aux;
+        size_t partner = partner_k * k_stride + ji + aux;
+        double sum = out[p] + out[partner];
+        out[p] = sum;
+        if (p != partner) out[partner] = sum;
+    }
+}
+
 __global__ static
 void fill_indexed_triu_kernel(double *out, int *tril_idx, int *ki_idx,
                               int npairs, int nao, int naux)
@@ -84,12 +113,27 @@ void fill_bvk_triu_axis0_kernel(double *out, int *conj_mapping, int bvk_ncells, 
 }
 
 extern "C" {
+int symmetrize_cderi(double *out, const int *ki_idx,
+                     int nkpts, int nao, int naux, cudaStream_t stream)
+{
+    if (nkpts == 0 || nao == 0 || naux == 0) return 0;
+    dim3 blocks(nao, nao);
+    symmetrize_cderi_kernel<<<blocks, 256, 0, stream>>>(
+        out, ki_idx, nkpts, nao, naux);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in symmetrize_cderi: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
 int fill_indexed_triu(double *out, int *tril_idx, int *ki_idx,
-                      int npairs, int nkpts, int nao, int naux)
+                      int npairs, int nkpts, int nao, int naux, cudaStream_t stream)
 {
     dim3 threads(32, BLOCK_SIZE);
     dim3 blocks((npairs+BLOCK_SIZE-1)/BLOCK_SIZE, nkpts);
-    fill_indexed_triu_kernel<<<blocks, threads>>>(
+    fill_indexed_triu_kernel<<<blocks, threads, 0, stream>>>(
         out, tril_idx, ki_idx, npairs, nao, naux);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -100,14 +144,14 @@ int fill_indexed_triu(double *out, int *tril_idx, int *ki_idx,
 }
 
 int fill_bvk_triu(double *out, int *pair_address, int *conj_mapping,
-                  int npairs, int bvk_ncells, int nao, int naux)
+                  int npairs, int bvk_ncells, int nao, int naux, cudaStream_t stream)
 {
     if (naux == 1) {
         dim3 blocks((npairs+255)/256);
-        fill_bvk_triu_naux1_kernel<<<blocks, 256>>>(
+        fill_bvk_triu_naux1_kernel<<<blocks, 256, 0, stream>>>(
             out, pair_address, conj_mapping, npairs, bvk_ncells, nao);
     } else {
-        fill_bvk_triu_kernel<<<npairs, 256>>>(
+        fill_bvk_triu_kernel<<<npairs, 256, 0, stream>>>(
             out, pair_address, conj_mapping, bvk_ncells, nao, naux);
     }
     cudaError_t err = cudaGetLastError();
@@ -118,12 +162,12 @@ int fill_bvk_triu(double *out, int *pair_address, int *conj_mapping,
     return 0;
 }
 
-int fill_bvk_triu_axis0(double *out, int *conj_mapping, int nao, int bvk_ncells)
+int fill_bvk_triu_axis0(double *out, int *conj_mapping, int nao, int bvk_ncells, cudaStream_t stream)
 {
     dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
     int nao_b = (nao + BLOCK_SIZE-1) / BLOCK_SIZE;
     dim3 blocks(nao_b, nao_b);
-    fill_bvk_triu_axis0_kernel<<<blocks, threads>>>(out, conj_mapping, bvk_ncells, nao);
+    fill_bvk_triu_axis0_kernel<<<blocks, threads, 0, stream>>>(out, conj_mapping, bvk_ncells, nao);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in fill_bvk_triu_axis0: %s\n", cudaGetErrorString(err));

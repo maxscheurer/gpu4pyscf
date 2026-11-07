@@ -38,10 +38,11 @@ def tearDownModule():
 
 class KnownValues(unittest.TestCase):
     def test_get_pp(self):
-        #kpt = cell.make_kpts([9,6,5])[107]
-        #ref = df_cpu.GDF(cell, kpt).get_pp()
-        #v1 = GDF(cell, kpt).get_pp().get()
-        #assert abs(v1 - ref).max() < 1e-8
+        kpt = cell.make_kpts([9,6,5])[107]
+        ref = df_cpu.GDF(cell, kpt).get_pp(kpts=kpt)
+        v1 = GDF(cell, kpt).get_pp(kpts=kpt).get()
+        assert v1.shape == ref.shape
+        assert abs(v1 - ref).max() < 1e-8
 
         ref = df_cpu.GDF(cell).get_pp()
         v1 = GDF(cell).get_pp().get()
@@ -56,7 +57,8 @@ class KnownValues(unittest.TestCase):
         L = 5.
         n = 11
         cell1 = pgto.Cell()
-        cell1.a = np.eye(3) * L
+        np.random.seed(9)
+        cell1.a = np.eye(3) * L + np.random.rand(3,3) - .5
         cell1.mesh = [n] * 3
         cell1.atom = '''C    3.    2.       3.
                         C    1.    1.       1.'''
@@ -276,6 +278,20 @@ class KnownValues(unittest.TestCase):
         kref = mydf0.get_jk(dm, hermi=1, kpts=kpts, with_j=False)[1]
         vk = mydf.get_jk(dm, hermi=1, kpts=kpts, with_j=False)[1]
         assert abs(vk.get() - kref).max() < 1e-8
+
+    def test_range_separated_j_only_then_k(self):
+        cell = pgto.M(atom='He 0 0 0', basis='sto3g', a=np.eye(3)*4)
+        kpts = cell.make_kpts([2, 1, 1])
+        dm = np.ones((2, 1, 1))
+        omega = -0.3
+        mydf = GDF(cell, kpts)
+
+        # A J-only cache lacks the off-diagonal k-point pairs needed for K.
+        vj, _ = mydf.get_jk(dm, kpts=kpts, omega=omega, with_k=False)
+        _, vk = mydf.get_jk(dm, kpts=kpts, omega=omega, with_j=False)
+        jref, kref = mydf.reset(cell).get_jk(dm, kpts=kpts, omega=omega)
+        assert abs(vj-jref).max().get() < 1e-12
+        assert abs(vk-kref).max().get() < 1e-12
 
 if __name__ == '__main__':
     print("Full Tests for PBC DF")

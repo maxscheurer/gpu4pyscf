@@ -20,17 +20,36 @@ Gradient of PCM family solvent model
 import numpy
 import cupy
 import ctypes
-from cupyx import scipy
+from cupyx.scipy.special import erf
 from pyscf import lib
 from pyscf import gto
 from pyscf.grad import rhf as rhf_grad
+from pyscf.data.elements import is_ghost_atom
 from gpu4pyscf.gto import int3c1e
-from gpu4pyscf.solvent.pcm import PI, switch_h, libsolvent, left_multiply_S, left_multiply_D
+from gpu4pyscf.solvent.pcm import (PI, switch_h, libsolvent, left_multiply_S, left_multiply_D,
+                                   atom_coords_without_ghost, atom_charges_without_ghost, natm_without_ghost)
 from gpu4pyscf.gto.int3c1e_ip import int1e_grids_ip1, int1e_grids_ip2
 from gpu4pyscf.lib.cupy_helper import contract
 from gpu4pyscf.lib import logger
 from gpu4pyscf.grad.rhf import GradientsBase
 from pyscf import lib as pyscf_lib
+
+def gradient_nonghost_to_all(mol, grad):
+    natm = grad.shape[0]
+    if mol.natm == natm:
+        return grad
+
+    natm_nonghost = natm_without_ghost(mol)
+    assert grad.shape == (natm_nonghost, 3)
+
+    if isinstance(grad, cupy.ndarray):
+        grad_full = cupy.zeros((mol.natm, 3))
+    else:
+        assert isinstance(grad, numpy.ndarray)
+        grad_full = numpy.zeros((mol.natm, 3))
+    nonghost_mask = [not is_ghost_atom(element) for element in mol.elements]
+    grad_full[nonghost_mask, :] = grad
+    return grad_full
 
 def grad_switch_h(x):
     ''' first derivative of h(x)'''
@@ -39,7 +58,7 @@ def grad_switch_h(x):
     dy[x>1] = 0.0
     return dy
 
-def get_dF_dA(surface, with_dA = True):
+def get_dF_dA(surface, with_dA = True, surface_discretization_method = "SWIG"):
     '''
     J. Chem. Phys. 133, 244111 (2010), Appendix C
     '''
@@ -47,8 +66,12 @@ def get_dF_dA(surface, with_dA = True):
     grid_coords = surface['grid_coords']
     switch_fun  = surface['switch_fun']
     area        = surface['area']
-    R_in_J      = surface['R_in_J']
-    R_sw_J      = surface['R_sw_J']
+    if surface_discretization_method.upper() == "SWIG":
+        R_in_J = surface['R_in_J']
+        R_sw_J = surface['R_sw_J']
+    elif surface_discretization_method.upper() == "ISWIG":
+        charge_exp = surface['charge_exp']
+        R_J = surface['R_J']
 
     ngrids = grid_coords.shape[0]
     natom = atom_coords.shape[0]
@@ -63,15 +86,31 @@ def get_dF_dA(surface, with_dA = True):
         coords = grid_coords[p0:p1]
         ri_rJ = cupy.expand_dims(coords, axis=1) - atom_coords
         riJ = cupy.linalg.norm(ri_rJ, axis=-1)
-        diJ = (riJ - R_in_J) / R_sw_J
-        diJ[:,ia] = 1.0
-        diJ[diJ < 1e-8] = 0.0
         ri_rJ[:,ia,:] = 0.0
-        ri_rJ[diJ < 1e-8] = 0.0
 
-        fiJ = switch_h(diJ)
-        dfiJ = grad_switch_h(diJ) / (fiJ * riJ * R_sw_J)
-        dfiJ = cupy.expand_dims(dfiJ, axis=-1) * ri_rJ
+        if surface_discretization_method.upper() == "SWIG":
+            diJ = (riJ - R_in_J) / R_sw_J
+            diJ[:,ia] = 1.0
+            diJ[diJ < 1e-8] = 0.0
+            ri_rJ[diJ < 1e-8] = 0.0
+
+            fiJ = switch_h(diJ)
+            dfiJ = grad_switch_h(diJ) / (fiJ * riJ * R_sw_J)
+            dfiJ = cupy.expand_dims(dfiJ, axis=-1) * ri_rJ
+        elif surface_discretization_method.upper() == "ISWIG":
+            xi = charge_exp[p0:p1]
+            erf_input_p = xi[:, None] * (R_J[None, :] + riJ)
+            erf_input_m = xi[:, None] * (R_J[None, :] - riJ)
+            fiJ = 1 - 0.5 * (erf(erf_input_m) + erf(erf_input_p))
+            fiJ[:,ia] = 1.0
+
+            dfiJ = 1/numpy.sqrt(numpy.pi) * xi[:, None] * \
+                   (cupy.exp(-erf_input_m**2) - cupy.exp(-erf_input_p**2)) / (fiJ * riJ)
+            dfiJ = cupy.expand_dims(dfiJ, axis=-1) * ri_rJ
+
+            dfiJ[:, ia, :] = -cupy.sum(dfiJ, axis=1) # Translation invariance for diagonal terms
+        else:
+            raise NotImplementedError(f"surface_discretization_method = {surface_discretization_method} not recognized")
 
         Fi = switch_fun[p0:p1]
         if with_dA:
@@ -114,7 +153,7 @@ def get_dD_dS_slow(surface, with_S=True, with_D=False):
     cupy.fill_diagonal(rij, 1)
     xi_i = xi_j = None
 
-    dS_dr = -(scipy.special.erf(xi_r_ij) - 2.0*xi_r_ij/PI**0.5*cupy.exp(-xi_r_ij**2))/rij**2
+    dS_dr = -(erf(xi_r_ij) - 2.0*xi_r_ij/PI**0.5*cupy.exp(-xi_r_ij**2))/rij**2
     cupy.fill_diagonal(dS_dr, 0)
 
     dS_dr= cupy.expand_dims(dS_dr, axis=-1)
@@ -155,12 +194,12 @@ def get_dD_dS(surface, with_S=True, with_D=False, stream=None):
     if stream is None:
         stream = cupy.cuda.get_current_stream()
     err = libsolvent.pcm_dd_ds(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         dD_ptr, dS_ptr,
         ctypes.cast(grid_coords.data.ptr, ctypes.c_void_p),
         ctypes.cast(norm_vec.data.ptr, ctypes.c_void_p),
         ctypes.cast(charge_exp.data.ptr, ctypes.c_void_p),
-        ctypes.c_int(n)
+        ctypes.c_int(n),
+        ctypes.cast(stream.ptr, ctypes.c_void_p)
     )
     if err != 0:
         raise RuntimeError('Failed in generating PCM dD and dS matrices.')
@@ -175,12 +214,12 @@ def left_multiply_dS_offdiagonal(surface, right_vector, transpose = False, strea
     if stream is None:
         stream = cupy.cuda.get_current_stream()
     err = libsolvent.pcm_left_multiply_ds(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(output.data.ptr, ctypes.c_void_p),
         ctypes.cast(right_vector.data.ptr, ctypes.c_void_p),
         ctypes.cast(grid_coords.data.ptr, ctypes.c_void_p),
         ctypes.cast(charge_exp.data.ptr, ctypes.c_void_p),
-        ctypes.c_int(n)
+        ctypes.c_int(n),
+        ctypes.cast(stream.ptr, ctypes.c_void_p)
     )
     if err != 0:
         raise RuntimeError('Failed in left_multiply_dS_offdiagonal')
@@ -200,7 +239,6 @@ def left_multiply_dD(surface, right_vector, transpose = False, stream = None):
     if stream is None:
         stream = cupy.cuda.get_current_stream()
     err = libsolvent.pcm_left_multiply_dd(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         ctypes.cast(output.data.ptr, ctypes.c_void_p),
         ctypes.cast(right_vector.data.ptr, ctypes.c_void_p),
         ctypes.cast(grid_coords.data.ptr, ctypes.c_void_p),
@@ -208,6 +246,7 @@ def left_multiply_dD(surface, right_vector, transpose = False, stream = None):
         ctypes.cast(norm_vec.data.ptr, ctypes.c_void_p),
         ctypes.c_int(n),
         ctypes.c_bool(transpose),
+        ctypes.cast(stream.ptr, ctypes.c_void_p),
     )
     if err != 0:
         raise RuntimeError('Failed in left_multiply_dD')
@@ -222,7 +261,7 @@ def get_dSii(surface, dF):
     dSii = dSii_dF[:,None] * dF
     return dSii
 
-def contract_dSii(surface, contract_vector):
+def contract_dSii(surface, contract_vector, surface_discretization_method = "SWIG"):
     '''
         Returns contract('g,dgA->Ad', contract_vector, dSii)
         The main purpose of this function is to save memory, as dSii requires 3*natm*ngrids storage.
@@ -238,8 +277,12 @@ def contract_dSii(surface, contract_vector):
 
     atom_coords = surface['atom_coords']
     grid_coords = surface['grid_coords']
-    R_in_J      = surface['R_in_J']
-    R_sw_J      = surface['R_sw_J']
+    if surface_discretization_method.upper() == "SWIG":
+        R_in_J = surface['R_in_J']
+        R_sw_J = surface['R_sw_J']
+    elif surface_discretization_method.upper() == "ISWIG":
+        charge_exp = surface['charge_exp']
+        R_J = surface['R_J']
 
     natom = atom_coords.shape[0]
     de_dSii_term = cupy.zeros([natom, 3])
@@ -249,15 +292,31 @@ def contract_dSii(surface, contract_vector):
         coords = grid_coords[p0:p1]
         ri_rJ = cupy.expand_dims(coords, axis=1) - atom_coords
         riJ = cupy.linalg.norm(ri_rJ, axis=-1)
-        diJ = (riJ - R_in_J) / R_sw_J
-        diJ[:,ia] = 1.0
-        diJ[diJ < 1e-8] = 0.0
         ri_rJ[:,ia,:] = 0.0
-        ri_rJ[diJ < 1e-8] = 0.0
 
-        fiJ = switch_h(diJ)
-        dfiJ = grad_switch_h(diJ) / (fiJ * riJ * R_sw_J)
-        dfiJ = cupy.expand_dims(dfiJ, axis=-1) * ri_rJ
+        if surface_discretization_method.upper() == "SWIG":
+            diJ = (riJ - R_in_J) / R_sw_J
+            diJ[:,ia] = 1.0
+            diJ[diJ < 1e-8] = 0.0
+            ri_rJ[diJ < 1e-8] = 0.0
+
+            fiJ = switch_h(diJ)
+            dfiJ = grad_switch_h(diJ) / (fiJ * riJ * R_sw_J)
+            dfiJ = cupy.expand_dims(dfiJ, axis=-1) * ri_rJ
+        elif surface_discretization_method.upper() == "ISWIG":
+            xi = charge_exp[p0:p1]
+            erf_input_p = xi[:, None] * (R_J[None, :] + riJ)
+            erf_input_m = xi[:, None] * (R_J[None, :] - riJ)
+            fiJ = 1 - 0.5 * (erf(erf_input_m) + erf(erf_input_p))
+            fiJ[:,ia] = 1.0
+
+            dfiJ = 1/numpy.sqrt(numpy.pi) * xi[:, None] * \
+                   (cupy.exp(-erf_input_m**2) - cupy.exp(-erf_input_p**2)) / (fiJ * riJ)
+            dfiJ = cupy.expand_dims(dfiJ, axis=-1) * ri_rJ
+
+            dfiJ[:, ia, :] = -cupy.sum(dfiJ, axis=1) # Translation invariance for diagonal terms
+        else:
+            raise NotImplementedError(f"surface_discretization_method = {surface_discretization_method} not recognized")
 
         Fi = switch_fun[p0:p1]
 
@@ -274,7 +333,7 @@ def contract_dSii(surface, contract_vector):
 
     return de_dSii_term
 
-def contract_dA(surface, contract_vector):
+def contract_dA(surface, contract_vector, surface_discretization_method = "SWIG"):
     '''
         Returns contract('g,dgA->Ad', contract_vector, dA)
         The main purpose of this function is to save memory, as dA requires 3*natm*ngrids storage.
@@ -286,9 +345,13 @@ def contract_dA(surface, contract_vector):
 
     atom_coords = surface['atom_coords']
     grid_coords = surface['grid_coords']
-    R_in_J      = surface['R_in_J']
-    R_sw_J      = surface['R_sw_J']
     area        = surface['area']
+    if surface_discretization_method.upper() == "SWIG":
+        R_in_J = surface['R_in_J']
+        R_sw_J = surface['R_sw_J']
+    elif surface_discretization_method.upper() == "ISWIG":
+        charge_exp = surface['charge_exp']
+        R_J = surface['R_J']
 
     natom = atom_coords.shape[0]
     de_dA_term = cupy.zeros([natom, 3])
@@ -298,15 +361,31 @@ def contract_dA(surface, contract_vector):
         coords = grid_coords[p0:p1]
         ri_rJ = cupy.expand_dims(coords, axis=1) - atom_coords
         riJ = cupy.linalg.norm(ri_rJ, axis=-1)
-        diJ = (riJ - R_in_J) / R_sw_J
-        diJ[:,ia] = 1.0
-        diJ[diJ < 1e-8] = 0.0
         ri_rJ[:,ia,:] = 0.0
-        ri_rJ[diJ < 1e-8] = 0.0
 
-        fiJ = switch_h(diJ)
-        dfiJ = grad_switch_h(diJ) / (fiJ * riJ * R_sw_J)
-        dfiJ = cupy.expand_dims(dfiJ, axis=-1) * ri_rJ
+        if surface_discretization_method.upper() == "SWIG":
+            diJ = (riJ - R_in_J) / R_sw_J
+            diJ[:,ia] = 1.0
+            diJ[diJ < 1e-8] = 0.0
+            ri_rJ[diJ < 1e-8] = 0.0
+
+            fiJ = switch_h(diJ)
+            dfiJ = grad_switch_h(diJ) / (fiJ * riJ * R_sw_J)
+            dfiJ = cupy.expand_dims(dfiJ, axis=-1) * ri_rJ
+        elif surface_discretization_method.upper() == "ISWIG":
+            xi = charge_exp[p0:p1]
+            erf_input_p = xi[:, None] * (R_J[None, :] + riJ)
+            erf_input_m = xi[:, None] * (R_J[None, :] - riJ)
+            fiJ = 1 - 0.5 * (erf(erf_input_m) + erf(erf_input_p))
+            fiJ[:,ia] = 1.0
+
+            dfiJ = 1/numpy.sqrt(numpy.pi) * xi[:, None] * \
+                   (cupy.exp(-erf_input_m**2) - cupy.exp(-erf_input_p**2)) / (fiJ * riJ)
+            dfiJ = cupy.expand_dims(dfiJ, axis=-1) * ri_rJ
+
+            dfiJ[:, ia, :] = -cupy.sum(dfiJ, axis=1) # Translation invariance for diagonal terms
+        else:
+            raise NotImplementedError(f"surface_discretization_method = {surface_discretization_method} not recognized")
 
         Ai = area[p0:p1]
 
@@ -349,8 +428,8 @@ def grad_nuc(pcmobj, dm, q_sym = None):
         q_sym_left = q_sym_left.get()
         q_sym += q_sym_left
 
-    atom_coords = mol.atom_coords(unit='B')
-    atom_charges = numpy.asarray(mol.atom_charges(), dtype=numpy.float64)
+    atom_coords = atom_coords_without_ghost(mol)
+    atom_charges = numpy.asarray(atom_charges_without_ghost(mol), dtype=numpy.float64)
     fakemol_nuc = gto.fakemol_for_charges(atom_coords)
     fakemol = gto.fakemol_for_charges(grid_coords, expnt=exponents**2)
 
@@ -367,6 +446,7 @@ def grad_nuc(pcmobj, dm, q_sym = None):
     dv_g = numpy.einsum('gx,g->gx', dv_g, q_sym)
 
     de -= numpy.asarray([numpy.sum(dv_g[p0:p1], axis=0) for p0,p1 in gridslice])
+    de = gradient_nonghost_to_all(mol, de)
     t1 = log.timer_debug1('grad nuc', *t1)
     return de
 
@@ -414,6 +494,7 @@ def grad_qv(pcmobj, dm, q_sym = None):
     aoslice = mol.aoslice_by_atom()
     dvj = 2.0 * cupy.asarray([cupy.sum(dvj[:,p0:p1], axis=1) for p0,p1 in aoslice[:,2:]])
     dq = cupy.asarray([cupy.sum(dq[:,p0:p1], axis=1) for p0,p1 in gridslice])
+    dq = gradient_nonghost_to_all(mol, dq)
     de = dq + dvj
     t1 = log.timer_debug1('grad qv', *t1)
     return de.get()
@@ -475,14 +556,15 @@ def grad_solver(pcmobj, dm, v_grids = None, v_grids_l = None, q = None):
         tmp = B.dot(c)
         return (a*tmp).T
 
-    de = cupy.zeros([pcmobj.mol.natm,3])
+    natm = natm_without_ghost(pcmobj.mol)
+    de = cupy.zeros([natm, 3])
     if pcmobj.method.upper() in ['C-PCM', 'CPCM', 'COSMO']:
         # dR = 0, dK = dS
         de_dS  = 0.5 * vK_1.reshape(-1, 1) * left_multiply_dS_offdiagonal(pcmobj.surface, q, stream = None)
         de_dS -= 0.5 * q.reshape(-1, 1) * left_multiply_dS_offdiagonal(pcmobj.surface, vK_1, transpose = True, stream = None)
         de -= cupy.asarray([cupy.sum(de_dS[p0:p1], axis=0) for p0,p1 in gridslice])
 
-        de -= 0.5 * contract_dSii(pcmobj.surface, vK_1 * q)
+        de -= 0.5 * contract_dSii(pcmobj.surface, vK_1 * q, pcmobj.surface_discretization_method)
 
     elif pcmobj.method.upper() in ['IEF-PCM', 'IEFPCM', 'SMD']:
         # dR = f_eps/(2*pi) * (dD*A + D*dA),
@@ -490,7 +572,7 @@ def grad_solver(pcmobj, dm, v_grids = None, v_grids_l = None, q = None):
         fac = f_epsilon/(2.0*PI)
 
         if not lowmem_mode:
-            dF, dA = get_dF_dA(pcmobj.surface)
+            dF, dA = get_dF_dA(pcmobj.surface, surface_discretization_method = pcmobj.surface_discretization_method)
             dSii = get_dSii(pcmobj.surface, dF)
             dF = None
 
@@ -554,10 +636,11 @@ def grad_solver(pcmobj, dm, v_grids = None, v_grids_l = None, q = None):
             de_dD  = cupy.asarray([cupy.sum(de_dD[p0:p1], axis=0) for p0,p1 in gridslice])
 
             de_dK = de_dS0 - fac * (de_dD + de_dS1)
-            de_dK += 0.5 * contract_dSii(pcmobj.surface, vK_1 * q - fac * vK_1_DA * q)
+            de_dK += 0.5 * contract_dSii(pcmobj.surface, vK_1 * q - fac * vK_1_DA * q, pcmobj.surface_discretization_method)
 
             de += de_dR - de_dK
-            de += 0.5*fac * contract_dA(pcmobj.surface, vK_1_D * v_grids + vK_1_D * Sq) # First term from de_dR, second from de_dK
+            de += 0.5*fac * contract_dA(pcmobj.surface, vK_1_D * v_grids + vK_1_D * Sq,
+                                        pcmobj.surface_discretization_method) # First term from de_dR, second from de_dK
 
     elif pcmobj.method.upper() in [ 'SS(V)PE' ]:
         # dR = f_eps/(2*pi) * (dD*A + D*dA),
@@ -565,7 +648,7 @@ def grad_solver(pcmobj, dm, v_grids = None, v_grids_l = None, q = None):
         fac = f_epsilon/(2.0*PI)
 
         if not lowmem_mode:
-            dF, dA = get_dF_dA(pcmobj.surface)
+            dF, dA = get_dF_dA(pcmobj.surface, surface_discretization_method = pcmobj.surface_discretization_method)
             dSii = get_dSii(pcmobj.surface, dF)
             dF = None
 
@@ -657,10 +740,11 @@ def grad_solver(pcmobj, dm, v_grids = None, v_grids_l = None, q = None):
             de_dD_T  = cupy.asarray([cupy.sum(de_dD_T[p0:p1], axis=0) for p0,p1 in gridslice])
 
             de_dK = de_dS0 - 0.5*fac * (de_dD + de_dS1 + de_dD_T + de_dS1_T)
-            de_dK += 0.5 * contract_dSii(pcmobj.surface, vK_1 * q - 0.5*fac * (vK_1_DA * q + vK_1 * ADT_q))
+            de_dK += 0.5 * contract_dSii(pcmobj.surface, vK_1 * q - 0.5*fac * (vK_1_DA * q + vK_1 * ADT_q), pcmobj.surface_discretization_method)
 
             de += de_dR - de_dK
-            de += 0.5*fac * contract_dA(pcmobj.surface, vK_1_D * v_grids + 0.5 * (vK_1_D * Sq + vK_1_S * DT_q)) # First term from de_dR, second from de_dK
+            de += 0.5*fac * contract_dA(pcmobj.surface, vK_1_D * v_grids + 0.5 * (vK_1_D * Sq + vK_1_S * DT_q),
+                                        pcmobj.surface_discretization_method) # First term from de_dR, second from de_dK
 
     else:
         raise RuntimeError(f"Unknown implicit solvent model: {pcmobj.method}")
@@ -668,6 +752,8 @@ def grad_solver(pcmobj, dm, v_grids = None, v_grids_l = None, q = None):
     if pcmobj.frozen_dm0_for_finite_difference_without_response is not None:
         # Refer to the comments in gpu4pyscf/solvent/pcm.py::_get_vind()
         de *= 2
+
+    de = gradient_nonghost_to_all(mol, de)
 
     t1 = log.timer_debug1('grad solver', *t1)
     return de.get()
@@ -720,6 +806,7 @@ class WithSolventGrad:
         return self.base.to_cpu().PCM().Gradients()
 
     def kernel(self, *args, dm=None, atmlst=None, **kwargs):
+        assert atmlst is None or len(atmlst) == self.mol.natm
         if dm is None:
             dm = self.base.make_rdm1()
         if dm.ndim == 3:

@@ -13,18 +13,21 @@
 # limitations under the License.
 
 
+import itertools
 import numpy as np
 import cupy as cp
 from pyscf import lib, gto
+from pyscf.pbc.gto import Cell
 from pyscf import ao2mo
 from pyscf.tdscf import rhf as tdhf_cpu
 from gpu4pyscf.tdscf._lr_eig import eigh as lr_eigh, real_eig
 from gpu4pyscf import scf
-from gpu4pyscf.lib.cupy_helper import contract, tag_array
+from gpu4pyscf.lib.cupy_helper import contract, tag_array, asarray
 from gpu4pyscf.lib import utils
 from gpu4pyscf.lib import logger
 from gpu4pyscf.gto.int3c1e import int1e_grids
 from gpu4pyscf.scf import _response_functions # noqa
+from gpu4pyscf.df.df_jk import _make_factorized_dm
 from pyscf import __config__
 
 REAL_EIG_THRESHOLD = tdhf_cpu.REAL_EIG_THRESHOLD
@@ -102,7 +105,7 @@ def get_ab(td, mf, mo_energy=None, mo_coeff=None, mo_occ=None, singlet=True):
         Q = Kinv @ R
         Qs = 0.5*(Q+Q.T)
         
-        q_sym = cp.einsum('gh,hkl->gkl', Qs, vmat)
+        q_sym = contract('gh,hkl->gkl', Qs, vmat)
         kEao = contract('gij,gkl->ijkl', vmat, q_sym)
         kEmo = contract('pjkl,pi->ijkl', kEao, orbo.conj())
         kEmo = contract('ipkl,pj->ijkl', kEmo, mo)
@@ -203,10 +206,10 @@ def get_ab(td, mf, mo_energy=None, mo_coeff=None, mo_occ=None, singlet=True):
                 rho = ni.eval_rho2(_sorted_mol, ao, mo_coeff_mask,
                                     mo_occ, mask, xctype, with_lapl=False)
                 if singlet or singlet is None:
-                    fxc = ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype)[2]
+                    fxc = ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype, spin=0)[2]
                     wfxc = fxc[0,0] * weight
                 else:
-                    fxc = ni.eval_xc_eff(mf.xc, cp.stack((rho, rho)) * 0.5, deriv=2, xctype=xctype)[2]
+                    fxc = ni.eval_xc_eff(mf.xc, cp.stack((rho, rho)) * 0.5, deriv=2, xctype=xctype, spin=1)[2]
                     wfxc = (fxc[0, 0, 0, 0] - fxc[1, 0, 0, 0]) * 0.5 * weight
                 orbo_mask = orbo[mask]
                 orbv_mask = orbv[mask]
@@ -226,10 +229,10 @@ def get_ab(td, mf, mo_energy=None, mo_coeff=None, mo_occ=None, singlet=True):
                 rho = ni.eval_rho2(_sorted_mol, ao, mo_coeff_mask,
                                    mo_occ, mask, xctype, with_lapl=False)
                 if singlet or singlet is None:
-                    fxc = ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype)[2]
+                    fxc = ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype, spin=0)[2]
                     wfxc = fxc * weight
                 else:
-                    fxc = ni.eval_xc_eff(mf.xc, cp.stack((rho, rho)) * 0.5, deriv=2, xctype=xctype)[2]
+                    fxc = ni.eval_xc_eff(mf.xc, cp.stack((rho, rho)) * 0.5, deriv=2, xctype=xctype, spin=1)[2]
                     wfxc = (fxc[0, :, 0, :] - fxc[1, :, 0, :]) * 0.5 * weight
                 orbo_mask = orbo[mask]
                 orbv_mask = orbv[mask]
@@ -256,10 +259,10 @@ def get_ab(td, mf, mo_energy=None, mo_coeff=None, mo_occ=None, singlet=True):
                 rho = ni.eval_rho2(_sorted_mol, ao, mo_coeff_mask,
                                    mo_occ, mask, xctype, with_lapl=False)
                 if singlet or singlet is None:
-                    fxc = ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype)[2]
+                    fxc = ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype, spin=0)[2]
                     wfxc = fxc * weight
                 else:
-                    fxc = ni.eval_xc_eff(mf.xc, cp.stack((rho, rho))*0.5, deriv=2, xctype=xctype)[2]
+                    fxc = ni.eval_xc_eff(mf.xc, cp.stack((rho, rho))*0.5, deriv=2, xctype=xctype, spin=1)[2]
                     wfxc = (fxc[0, :, 0, :] - fxc[1, :, 0, :]) * 0.5 * weight
                 orbo_mask = orbo[mask]
                 orbv_mask = orbv[mask]
@@ -314,8 +317,8 @@ def gen_tda_operation(td, mf, fock_ao=None, singlet=True, wfnsym=None):
     def vind(zs):
         zs = cp.asarray(zs).reshape(-1,nocc,nvir)
         mo1 = contract('xov,pv->xpo', zs, orbv)
-        dms = contract('xpo,qo->xpq', mo1, orbo2.conj())
-        dms = tag_array(dms, mo1=mo1, occ_coeff=orbo)
+        #:dms = contract('xpo,qo->xpq', mo1, orbo2.conj())
+        dms = _make_factorized_dm(mo1, orbo2, symmetrize=0)
         v1ao = vresp(dms)
         v1mo = contract('xpq,qo->xpo', v1ao, orbo)
         v1mo = contract('xpo,pv->xov', v1mo, orbv.conj())
@@ -338,6 +341,9 @@ class TD_Scanner(lib.SinglePointScanner):
     def __init__(self, td):
         self.__dict__.update(td.__dict__)
         self._scf = td._scf.as_scanner()
+        # A simple fingerprint for the initial basis set. To rapidly test
+        # whether basis set is changed in __call__
+        self._basis_fp = np.hstack(td.mol.bas_exps())
 
     def __call__(self, mol_or_geom, **kwargs):
         assert self.device == 'gpu'
@@ -349,10 +355,24 @@ class TD_Scanner(lib.SinglePointScanner):
         self.reset(mol)
 
         mf_scanner = self._scf
-        mf_e = mf_scanner(mol)
-        self.kernel(**kwargs)
-        return mf_e + self.e
+        mo_prev = mf_scanner.mo_coeff
+        occ_prev = mf_scanner.mo_occ
 
+        mf_e = mf_scanner(mol)
+
+        # Reuse the previous step for initial guess.
+        x0 = self.xy
+        if x0 is not None:
+            if np.array_equal(self._basis_fp, np.hstack(mol.bas_exps())):
+                logger.info(self, 'Use cashed TDDFT guess (AO projected)')
+                x0 = self._transfer_initial_guess(x0, mo_prev, occ_prev)
+            else:
+                # When the basis set is changed, clear self.xy to avoid using xy
+                # from the previous step as initial guess.
+                x0 = self.xy = None
+
+        self.kernel(x0=x0, **kwargs)
+        return mf_e + self.e
 
 class TDBase(lib.StreamObject):
     to_gpu = utils.to_gpu
@@ -372,7 +392,7 @@ class TDBase(lib.StreamObject):
     # Avoid computing NLC response in TDDFT
     exclude_nlc = True
 
-    _keys = tdhf_cpu.TDBase._keys
+    _keys = {'cphf_grids'}.union(tdhf_cpu.TDBase._keys)
 
     __init__ = tdhf_cpu.TDBase.__init__
 
@@ -400,17 +420,17 @@ class TDBase(lib.StreamObject):
         return get_ab(self, mf, singlet=self.singlet)
 
     def get_precond(self, hdiag):
-        threshold_t=1.0e-4
-        def precond(x, e, *args):
-            n_states = x.shape[0]
-            diagd = cp.repeat(hdiag.reshape(1,-1), n_states, axis=0)
-            e = e.reshape(-1,1)
-            diagd = hdiag - (e-self.level_shift)
-            diagd = cp.where(abs(diagd) < threshold_t, cp.sign(diagd)*threshold_t, diagd)
-            a_size = x.shape[1]//2
-            diagd[:,a_size:] = diagd[:,a_size:]*(-1)
-            return x/diagd
-        return precond
+        raise NotImplementedError
+
+    def _transfer_initial_guess(self, xy, mo_coeff, mo_occ):
+        '''Transform TDDFT (X, Y) amplitudes from a given MO basis to a new MO
+        basis defined by the current self._scf instance.
+
+        This function is primarily intended for the scanner mode, where (X, Y)
+        amplitudes from a previous calculation are projected to form the initial
+        guess at the current geometry.
+        '''
+        return None
 
     def Gradients(self):
         raise NotImplementedError
@@ -423,6 +443,50 @@ class TDBase(lib.StreamObject):
 
     def nac_method(self):
         return self.NAC()
+
+    def nac_gradient_method(self):
+        return self.NACGradients()
+
+    def force_and_nacv(self, grad_state, nac_pairs=None,
+                       td_grad=None, td_nac=None):
+        '''
+        Compute the force (-gradients) for a given excited state and the NACVs for
+        multiple state pairs in a single evaluation. They are evaluated together to
+        avoid redundant computation of certain intermediates.
+
+        Parameters:
+            grad_state : int
+                State Id (ground state = 0) for which the force is computed.
+            nac_pairs : a list of tuple(int, int)
+                State index pairs for which NACVs are computed. If not specified,
+                all state pairs are evaluated.
+            td_grad, td_nac : TDDFT gradient and NAC instances.
+                If these objects are specified, they are used to pass
+                configuration settings to the current function.
+
+        Returns
+            force : ndarray
+                Force for the specified excited state.
+            nacvs : dict
+                Each key of this dict is one state pair. Values are the scaled
+                NACVs and the scaled ETF (electronic translation factor)
+                corrected NACVs.
+        '''
+        if td_grad is None:
+            td_grad = self.Gradients()
+        grad = td_grad.kernel(state=grad_state)
+        force = -grad
+
+        if td_nac is None:
+            td_nac = self.NAC()
+        nstates = self.nstates + 1 # +1 to include ground state
+        if nac_pairs is None:
+            nac_pairs = [(i, j) for i in range(nstates-1) for j in range(i+1, nstates)]
+        nacvs = {}  # Unit: 1/bohr
+        for i, j in nac_pairs:
+            de, de_scaled, de_etf, de_etf_scaled = td_nac.kernel(states=(i, j))
+            nacvs[i, j] = (de_scaled, de_etf_scaled)
+        return force, nacvs
 
     as_scanner = as_scanner
 
@@ -462,23 +526,24 @@ class TDBase(lib.StreamObject):
         if not tdobj.singlet:
             return np.zeros((nstates,) + pol_shape)
 
+        ints = asarray(ints)
         mo_coeff = tdobj._scf.mo_coeff
         mo_occ = tdobj._scf.mo_occ
         orbo = mo_coeff[:,mo_occ==2]
         orbv = mo_coeff[:,mo_occ==0]
-        if isinstance(orbo, cp.ndarray):
-            orbo = orbo.get()
-            orbv = orbv.get()
 
         #Incompatible to old np version
         #ints = np.einsum('...pq,pi,qj->...ij', ints, orbo.conj(), orbv)
-        ints = lib.einsum('xpq,pi,qj->xij', ints.reshape(-1,nao,nao), orbo.conj(), orbv)
-        pol = np.array([np.einsum('xij,ij->x', ints, x) * 2 for x,y in xy])
-        if isinstance(xy[0][1], np.ndarray):
+        ints = contract('xpq,pi->xiq', ints.reshape(-1,nao,nao), orbo.conj())
+        ints = contract('xiq,qj->xij', ints, orbv)
+        xs = cp.asarray([x for x,y in xy])
+        pol = contract('xij,nij->nx', ints, xs).get() * 2
+        if isinstance(xy[0][1], (np.ndarray, cp.ndarray)):
+            ys = cp.asarray([y for x,y in xy])
             if hermi:
-                pol += [np.einsum('xij,ij->x', ints, y) * 2 for x,y in xy]
+                pol += contract('xij,nij->nx', ints, ys).get() * 2
             else:  # anti-Hermitian
-                pol -= [np.einsum('xij,ij->x', ints, y) * 2 for x,y in xy]
+                pol -= contract('xij,nij->nx', ints, ys).get() * 2
         pol = pol.reshape((nstates,)+pol_shape)
         return pol
 
@@ -517,9 +582,6 @@ class TDA(TDBase):
 
         mo_energy = mf.mo_energy
         mo_occ = mf.mo_occ
-        if isinstance(mo_energy, cp.ndarray):
-            mo_energy = mo_energy.get()
-            mo_occ = mo_occ.get()
         occidx = mo_occ == 2
         viridx = mo_occ == 0
         e_ia = (mo_energy[viridx] - mo_energy[occidx,None]).ravel()
@@ -527,14 +589,36 @@ class TDA(TDBase):
         nstates = min(nstates, nov)
 
         # Find the nstates-th lowest energy gap
-        e_threshold = float(np.partition(e_ia, nstates-1)[nstates-1])
+        e_threshold = float(cp.partition(e_ia, nstates-1)[nstates-1])
         e_threshold += self.deg_eia_thresh
 
-        idx = np.where(e_ia <= e_threshold)[0]
-        x0 = np.zeros((idx.size, nov))
-        for i, j in enumerate(idx):
-            x0[i, j] = 1  # Koopmans' excitations
+        idx = cp.where(e_ia <= e_threshold)[0]
+        x0 = cp.zeros((idx.size, nov))
+        x0[cp.arange(len(idx)), idx] = 1  # Koopmans' excitations
+        return x0
 
+    def _transfer_initial_guess(self, xy, mo_coeff, mo_occ):
+        mf = self._scf
+        S = mf.get_ovlp()
+        nstates = len(xy)
+        orbo1 = mo_coeff[:, mo_occ==2]
+        orbv1 = mo_coeff[:, mo_occ==0]
+        orbo2 = mf.mo_coeff[:, mf.mo_occ==2]
+        orbv2 = mf.mo_coeff[:, mf.mo_occ==0]
+        S_occ = orbo2.T.dot(S).dot(orbo1)
+        S_vir = orbv2.T.dot(S).dot(orbv1)
+
+        X_mo = cp.stack([asarray(x) for x, y in xy])
+        tmp = contract('ui,nij->nuj', S_occ, X_mo)
+        X_mo = contract('nuj,vj->nuv', tmp, S_vir)
+        Y_mo = xy[0][1]
+        if not isinstance(Y_mo, (np.ndarray, cp.ndarray)):
+            return X_mo.reshape(nstates, -1)
+
+        Y_mo = cp.stack([asarray(y) for x, y in xy])
+        tmp = contract('ui,nij->nuj', S_occ, Y_mo)
+        Y_mo = contract('nuj,vj->nuv', tmp, S_vir)
+        x0 = cp.hstack((X_mo.reshape(nstates, -1), Y_mo.reshape(nstates, -1)))
         return x0
 
     def kernel(self, x0=None, nstates=None):
@@ -542,6 +626,10 @@ class TDA(TDBase):
         '''
         log = logger.new_logger(self)
         cpu0 = log.init_timer()
+        mf = self._scf
+        if mf.mo_energy is None:
+            mf.run()
+
         self.check_sanity()
         self.dump_flags()
         if nstates is None:
@@ -550,7 +638,7 @@ class TDA(TDBase):
             self.nstates = nstates
         mol = self.mol
 
-        vind, hdiag = self.gen_vind(self._scf)
+        vind, hdiag = self.gen_vind(mf)
         precond = self.get_precond(hdiag)
 
         def pickeig(w, v, nroots, envs):
@@ -559,7 +647,14 @@ class TDA(TDBase):
 
         x0sym = None
         if x0 is None:
-            x0 = self.init_guess()
+            if self.xy is None:
+                x0 = self.init_guess()
+            else: # Reuse the previous step for initial guess 
+                x0 = self.xy
+
+        if isinstance(x0, list):
+            # Convert the self.xy storage to the initial guess format
+            x0 = cp.stack([x.ravel() for x, y in x0])
 
         self.converged, self.e, x1 = lr_eigh(
             vind, x0, precond, tol_residual=self.conv_tol, lindep=self.lindep,
@@ -567,10 +662,11 @@ class TDA(TDBase):
             max_memory=self.max_memory, verbose=log)
 
         nocc = mol.nelectron // 2
-        nmo = self._scf.mo_occ.size
+        nmo = mf.mo_occ.size
         nvir = nmo - nocc
         # 1/sqrt(2) because self.x is for alpha excitation and 2(X^+*X) = 1
         self.xy = [(xi.reshape(nocc,nvir) * .5**.5, 0) for xi in x1]
+
         log.timer('TDA', *cpu0)
         self._finalize()
         return self.e, self.xy
@@ -590,6 +686,15 @@ class TDA(TDBase):
         else:
             from gpu4pyscf.nac import tdrhf
             return tdrhf.NAC(self)
+
+
+    def NACGradients(self):
+        if getattr(self._scf, 'with_df', None):
+            from gpu4pyscf.df.nac import tdrhf_grad_nacv
+            return tdrhf_grad_nacv.NAC_multistates(self)
+        else:
+            from gpu4pyscf.nac import tdrhf_grad_nacv
+            return tdrhf_grad_nacv.NAC_multistates(self)
 
     def to_cpu(self):
         out = utils.to_cpu(self)
@@ -654,6 +759,19 @@ def gen_tdhf_operation(td, mf, fock_ao=None, singlet=True, wfnsym=None):
 class TDHF(TDBase):
     __doc__ = tdhf_cpu.TDHF.__doc__
 
+    def get_precond(self, hdiag):
+        threshold_t=1.0e-4
+        def precond(x, e, *args):
+            n_states = x.shape[0]
+            diagd = cp.repeat(hdiag.reshape(1,-1), n_states, axis=0)
+            e = e.reshape(-1,1)
+            diagd = hdiag - (e-self.level_shift)
+            diagd = cp.where(abs(diagd) < threshold_t, cp.sign(diagd)*threshold_t, diagd)
+            a_size = x.shape[1]//2
+            diagd[:,a_size:] = diagd[:,a_size:]*(-1)
+            return x/diagd
+        return precond
+
     @lib.with_doc(gen_tdhf_operation.__doc__)
     def gen_vind(self, mf=None):
         if mf is None:
@@ -663,14 +781,20 @@ class TDHF(TDBase):
     def init_guess(self, mf=None, nstates=None, wfnsym=None, return_symmetry=False):
         assert not return_symmetry
         x0 = TDA.init_guess(self, mf, nstates, wfnsym, return_symmetry)
-        y0 = np.zeros_like(x0)
-        return np.hstack([x0, y0])
+        y0 = cp.zeros_like(x0)
+        return cp.hstack([x0, y0])
+
+    _transfer_initial_guess = TDA._transfer_initial_guess
 
     def kernel(self, x0=None, nstates=None):
         '''TDHF diagonalization with non-Hermitian eigenvalue solver
         '''
         log = logger.new_logger(self)
         cpu0 = log.init_timer()
+        mf = self._scf
+        if mf.mo_energy is None:
+            mf.run()
+
         self.check_sanity()
         self.dump_flags()
         if nstates is None:
@@ -679,18 +803,26 @@ class TDHF(TDBase):
             self.nstates = nstates
         mol = self.mol
 
-        vind, hdiag = self.gen_vind(self._scf)
+        vind, hdiag = self.gen_vind(mf)
         precond = self.get_precond(hdiag)
         pickeig = None
 
         # handle single kpt PBC SCF
-        if getattr(self._scf, 'kpt', None) is not None:
+        if isinstance(mol, Cell):
             from pyscf.pbc.lib.kpts_helper import gamma_point
-            assert gamma_point(self._scf.kpt)
+            assert gamma_point(mf.kpt)
 
         x0sym = None
         if x0 is None:
-            x0 = self.init_guess()
+            if self.xy is None:
+                x0 = self.init_guess()
+            else: # Reuse the previous step for initial guess 
+                x0 = self.xy
+
+        if isinstance(x0, list):
+            # Convert the self.xy storage to the initial guess format
+            x0 = [(x.ravel(), y.ravel()) for x, y in x0]
+            x0 = cp.hstack(list(itertools.chain(*x0))).reshape(len(x0), -1)
 
         self.converged, self.e, x1 = real_eig(
             vind, x0, precond, tol_residual=self.conv_tol, lindep=self.lindep,
@@ -698,11 +830,11 @@ class TDHF(TDBase):
             max_memory=self.max_memory, verbose=log)
 
         nocc = mol.nelectron // 2
-        nmo = self._scf.mo_occ.size
+        nmo = mf.mo_occ.size
         nvir = nmo - nocc
         def norm_xy(z):
             x, y = z.reshape(2, -1)
-            norm = lib.norm(x)**2 - lib.norm(y)**2
+            norm = cp.linalg.norm(x)**2 - cp.linalg.norm(y)**2
             if norm < 0:
                 log.warn('TDDFT amplitudes |X| smaller than |Y|')
             norm = abs(.5/norm)**.5  # normalize to 0.5 for alpha spin
@@ -715,6 +847,7 @@ class TDHF(TDBase):
 
     Gradients = TDA.Gradients
     NAC = TDA.NAC
+    NACGradients = TDA.NACGradients
 
     def to_cpu(self):
         out = utils.to_cpu(self)

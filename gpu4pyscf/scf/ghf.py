@@ -17,19 +17,114 @@ import cupy as cp
 from cupyx.scipy.linalg import block_diag
 from pyscf.lib import PauliMatrices
 from pyscf.scf import ghf as ghf_cpu
-from gpu4pyscf.scf import hf
+from pyscf.data.nist import HARTREE2EV
+from gpu4pyscf.scf import hf, uhf
 from gpu4pyscf.lib import logger
-from gpu4pyscf.lib.cupy_helper import asarray, return_cupy_array
+from gpu4pyscf.lib.cupy_helper import asarray, return_cupy_array, tag_array
 from gpu4pyscf.lib import utils
 
-def _from_rhf_init_dm(dma, breaksym=True):
+def _from_rhf_init_dm(dma, breaksym=False):
+    mo_coeff = getattr(dma, 'mo_coeff', None)
+    mo_occ = getattr(dma, 'mo_occ', None)
     dma = dma * .5
     dm = block_diag(dma, dma)
-    if breaksym:
-        nao = dma.shape[0]
-        idx, idy = cp.diag_indices(nao)
-        dm[idx+nao,idy] = dm[idx,idy+nao] = dma.diagonal() * .05
+    assert not breaksym
+    if mo_coeff is not None and mo_occ is not None:
+        dm = tag_array(dm, mo_coeff=block_diag(mo_coeff, mo_coeff),
+                       mo_occ=cp.hstack([mo_occ, mo_occ]) * .5)
     return dm
+
+
+def _get_jk(mf, mol, dm, hermi=0, with_j=True, with_k=True, jkbuild=None,
+            omega=None, lr_factor=None, sr_factor=None):
+    '''
+    GHF J/K adapter function.
+    It takes a GHF DM, splits it into blocks, calls the 'jkbuild' strategy,
+    and then reassembles the result into GHF matrices.
+    
+    The 'jkbuild' function is expected to compute J and K for
+    a stack of density matrices.
+    '''
+    if jkbuild is None:
+        raise ValueError("jkbuild (J/K build strategy) must be provided.")
+
+    if mol is None: mol = mf.mol
+    if dm is None: dm = mf.make_rdm1()
+
+    dm = asarray(dm)
+    dm_shape = dm.shape
+    nso = dm.shape[-1]
+    nao = nso // 2
+    dms = dm.reshape(-1, nso, nso)
+    n_dm = dms.shape[0]
+    
+    dmaa = dms[:, :nao, :nao]
+    dmab = dms[:, :nao, nao:]
+    dmba = dms[:, nao:, :nao]
+    dmbb = dms[:, nao:, nao:]
+
+    vj = vk = None # Initialize
+
+    if dm.dtype == cp.complex128:
+        if with_j:
+            # --- Prepare DMs ---
+            dm_j = cp.vstack((dmaa.real + dmbb.real,
+                              dmaa.imag + dmbb.imag))
+            jtmp = jkbuild(mf, mol, dm_j, hermi=0, with_k=False)[0]
+            jtmp = jtmp[:n_dm] + 1j * jtmp[n_dm:]
+            vj = cp.zeros((n_dm, nso, nso), dtype=dm.dtype)
+            vj[:, :nao, :nao] = vj[:, nao:, nao:] = jtmp
+            vj = vj.reshape(dm_shape)
+
+        if with_k:
+            dm_k = cp.stack((
+                dmaa.real, dmbb.real, dmab.real, dmba.real,
+                dmaa.imag, dmbb.imag, dmab.imag, dmba.imag))
+            ktmp = jkbuild(mf, mol, dm_k, hermi=0, with_j=False, omega=omega,
+                           lr_factor=lr_factor, sr_factor=sr_factor)[1]
+            ktmp_r, ktmp_i = ktmp.reshape(2, 4, n_dm, nao, nao)
+            vk = cp.zeros((n_dm, nso, nso), dtype=dm.dtype)
+            vk[:, :nao, :nao] = ktmp_r[0] + 1j * ktmp_i[0]
+            vk[:, nao:, nao:] = ktmp_r[1] + 1j * ktmp_i[1]
+            vk[:, :nao, nao:] = ktmp_r[2] + 1j * ktmp_i[2]
+            vk[:, nao:, :nao] = ktmp_r[3] + 1j * ktmp_i[3]
+            vk = vk.reshape(dm_shape)
+
+    else: # Real DM
+        if with_j:
+            dm_j = (dmaa + dmbb)
+            jtmp = jkbuild(mf, mol, dm_j, hermi, with_k=False)[0]
+            vj = cp.zeros((n_dm, nso, nso), dtype=dm.dtype)
+            vj[:, :nao, :nao] = vj[:, nao:, nao:] = jtmp
+            vj = vj.reshape(dm_shape)
+
+        if with_k:
+            dm_k = cp.stack((dmaa, dmbb, dmab, dmba))
+            ktmp = jkbuild(mf, mol, dm_k, hermi=0, with_j=False, omega=omega,
+                           lr_factor=lr_factor, sr_factor=sr_factor)[1]
+            ktmp = ktmp.reshape(4, n_dm, nao, nao)
+            vk = cp.zeros((n_dm, nso, nso), dtype=dm.dtype)
+            # K from the last 4 DMs
+            vk[:, :nao, :nao] = ktmp[0]
+            vk[:, nao:, nao:] = ktmp[1]
+            vk[:, :nao, nao:] = ktmp[2]
+            vk[:, nao:, :nao] = ktmp[3]
+            vk = vk.reshape(dm_shape)
+
+    return vj, vk
+
+def _get_jk_spin_free(mf, mol, dm, hermi, with_j=True, with_k=True,
+                      omega=None, lr_factor=None, sr_factor=None):
+    # The base class get_jk expects (n_dm, nao, nao)
+    nao = mol.nao
+    dm = dm.reshape(-1, nao, nao)
+    vj = vk = None
+    if with_j:
+        vj = hf.SCF.get_j(mf, mol, dm, hermi)
+    if with_k:
+        vk = hf.SCF.get_k(mf, mol, dm, hermi, omega, lr_factor, sr_factor)
+    return vj, vk
+
 
 class GHF(hf.SCF):
     to_gpu = utils.to_gpu
@@ -41,36 +136,61 @@ class GHF(hf.SCF):
     scf = kernel = hf.RHF.kernel
     make_rdm2 = NotImplemented
     newton = NotImplemented
-    x2c = x2c1e = sfx2c1e = NotImplemented
-    to_rhf = NotImplemented
-    to_uhf = NotImplemented
-    to_ghf = NotImplemented
-    to_rks = NotImplemented
-    to_uks = NotImplemented
-    to_gks = NotImplemented
-    to_ks = NotImplemented
     canonicalize = NotImplemented
+    density_fit             = hf.RHF.density_fit
     # TODO: Enable followings after testing
     analyze = NotImplemented
     stability = NotImplemented
-    mulliken_pop = NotImplemented
     mulliken_meta = NotImplemented
-    spin_square = NotImplemented
-    #TODO: uhf._finalize depends on spin_square function
-    #_finalize = ghf_cpu.GHF._finalize
 
     get_grad = return_cupy_array(ghf_cpu.GHF.get_grad)
     energy_elec = hf.energy_elec
 
+    def PCM(self, *args, **kwargs):
+        '''
+        Solvent models are not yet implemented for GHF.
+        '''
+        raise NotImplementedError('Solvent models are not implemented for GHF.')
+
+    def init_guess_by_minao(self, mol=None, high_spin=False):
+        dm = hf.SCF.init_guess_by_minao(self, mol, high_spin=high_spin)
+        if high_spin:
+            return tag_array(block_diag(dm[0], dm[1]),
+                             mo_coeff=block_diag(*dm.mo_coeff),
+                             mo_occ=cp.hstack(dm.mo_occ))
+        return _from_rhf_init_dm(dm)
+
+    def init_guess_by_atom(self, mol=None, high_spin=False):
+        dm = hf.SCF.init_guess_by_atom(self, mol, high_spin=high_spin)
+        if high_spin:
+            return tag_array(block_diag(dm[0], dm[1]),
+                             mo_coeff=block_diag(*dm.mo_coeff),
+                             mo_occ=cp.hstack(dm.mo_occ))
+        return _from_rhf_init_dm(dm)
+
     def get_init_guess(self, mol=None, key='minao', **kwargs):
-        dma = hf.RHF.get_init_guess(self, mol, key, **kwargs)
-        return _from_rhf_init_dm(dma)
+        if not isinstance(key, str):
+            return key
+        if mol is None:
+            mol = self.mol
+        key = key.lower()
+        dm = hf.SCF.get_init_guess(self, mol, key, **kwargs)
+        nao = mol.nao
+        if dm.shape == (nao, nao):
+            dm = _from_rhf_init_dm(dm)
+        elif dm.shape == (2, nao, nao):
+            dm = tag_array(block_diag(dm[0], dm[1]),
+                           mo_coeff=block_diag(*dm.mo_coeff),
+                           mo_occ=cp.hstack(dm.mo_occ))
+        return dm
 
     def get_hcore(self, mol=None):
         if mol is None: mol = self.mol
         htmp = hf.get_hcore(mol)
         hcore = block_diag(htmp, htmp)
 
+        if self.with_soc and mol._pseudo:
+            raise NotImplementedError('GTH SOC requires periodic GHF/GKS')
         if self.with_soc and mol.has_ecp_soc():
             # The ECP SOC contribution = <|1j * s * U_SOC|>
             s = .5 * PauliMatrices
@@ -85,94 +205,131 @@ class GHF(hf.SCF):
         return block_diag(stmp, stmp)
 
     def get_jk(self, mol=None, dm=None, hermi=0, with_j=True, with_k=True,
-               omega=None):
-        vj = vk = None
-        if with_j:
-            vj = self.get_j(mol, dm, hermi, omega)
-        if with_k:
-            vk = self.get_k(mol, dm, hermi, omega)
-        return vj, vk
+               omega=None, lr_factor=None, sr_factor=None):
+        return _get_jk(self, mol, dm, hermi, with_j, with_k,
+                       jkbuild=_get_jk_spin_free, omega=omega,
+                       lr_factor=lr_factor, sr_factor=sr_factor)
 
     def get_j(self, mol=None, dm=None, hermi=1, omega=None):
-        assert hermi == 1, 'hermi must be 1'
-        dm = asarray(dm)
-        dm_shape = dm.shape
-        nso = dm.shape[-1]
-        nao = nso // 2
-        dm = dm.reshape(-1,nso,nso)
-        n_dm = dm.shape[0]
-        dm = dm[:,:nao,:nao] + dm[:,nao:,nao:]
-        jtmp = hf.SCF.get_j(self, mol, dm.real, hermi, omega)
-        vj = cp.zeros((n_dm,nso,nso), dtype=dm.dtype)
-        vj[:,:nao,:nao] = vj[:,nao:,nao:] = jtmp
-        return vj.reshape(dm_shape)
+        vj, _ = self.get_jk(mol, dm, hermi, with_j=True, with_k=False, omega=omega)
+        return vj
 
-    def get_k(self, mol=None, dm=None, hermi=1, omega=None):
-        dm = asarray(dm)
-        dm_shape = dm.shape
-        nso = dm.shape[-1]
-        nao = nso // 2
-        dm = dm.reshape(-1,nso,nso)
-        n_dm = dm.shape[0]
-        dmaa = dm[:,:nao,:nao]
-        dmbb = dm[:,nao:,nao:]
-        dmab = dm[:,:nao,nao:]
-        dmba = dm[:,nao:,:nao]
-        if dm.dtype == cp.complex128:
-            dm_real = cp.vstack((dmaa.real, dmbb.real, dmab.real, dmba.real))
-            ktmp_real = super().get_k(mol, dm_real, hermi=0, omega=omega)
-            ktmp_real = ktmp_real.reshape(4,n_dm,nao,nao)
-            dm_imag = cp.vstack((dmaa.imag, dmbb.imag, dmab.imag, dmba.imag))
-            ktmp_imag = super().get_k(mol, dm_imag, hermi=0, omega=omega)
-            ktmp_imag = ktmp_imag.reshape(4,n_dm,nao,nao)
-            vk = cp.zeros((n_dm,nso,nso), dm.dtype)
-            vk[:,:nao,:nao] = ktmp_real[0] + 1j*ktmp_imag[0]
-            vk[:,nao:,nao:] = ktmp_real[1] + 1j*ktmp_imag[1]
-            vk[:,:nao,nao:] = ktmp_real[2] + 1j*ktmp_imag[2]
-            vk[:,nao:,:nao] = ktmp_real[3] + 1j*ktmp_imag[3]
+    def get_k(self, mol=None, dm=None, hermi=1,
+              omega=None, lr_factor=None, sr_factor=None):
+        _, vk = self.get_jk(mol, dm, hermi, with_j=False, with_k=True,
+                            omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
+        return vk
+
+    def get_veff(self, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
+        if dm is None: dm = self.make_rdm1()
+        if dm_last is not None and self.direct_scf:
+            assert vhf_last is not None
+            dm_last = cp.asarray(dm_last)
+            dm = cp.asarray(dm) - dm_last
         else:
-            dm = cp.vstack((dmaa, dmbb, dmab, dmba))
-            ktmp = super().get_k(mol, dm, hermi=0, omega=omega)
-            ktmp = ktmp.reshape(4,n_dm,nao,nao)
-            vk = cp.zeros((n_dm,nso,nso), dm.dtype)
-            vk[:,:nao,:nao] = ktmp[0]
-            vk[:,nao:,nao:] = ktmp[1]
-            vk[:,:nao,nao:] = ktmp[2]
-            vk[:,nao:,:nao] = ktmp[3]
-        return vk.reshape(dm_shape)
+            dm_last = None
 
-    def get_veff(mf, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
-        if dm is None: dm = mf.make_rdm1()
-        if dm_last is not None and mf.direct_scf:
-            dm = asarray(dm) - asarray(dm_last)
-        vhf = mf.get_j(mol, dm, hermi)
-        vk = mf.get_k(mol, dm, hermi)
-        vhf -= vk
-        if vhf_last is not None:
-            vhf += asarray(vhf_last)
+        vj, vk = self.get_jk(mol, dm, hermi)
+        vhf = vj - vk
+
+        ecoul = hf._trace_ecoul(vj, dm, dm_last, vhf_last)
+        if dm_last is not None:
+            vhf += cp.asarray(vhf_last)
+        if ecoul is not None:
+            vhf = tag_array(vhf, ecoul=ecoul)
         return vhf
 
-    def get_occ(mf, mo_energy=None, mo_coeff=None):
-        if mo_energy is None: mo_energy = mf.mo_energy
+    def get_occ(self, mo_energy=None, mo_coeff=None):
+        if mo_energy is None: mo_energy = self.mo_energy
         e_idx = cp.argsort(mo_energy.round(9))
         nmo = mo_energy.size
         mo_occ = cp.zeros_like(mo_energy)
-        nocc = mf.mol.nelectron
+        nocc = self.mol.nelectron
+        if nocc > nmo:
+            raise RuntimeError(f'Failed to assign mo_occ. Nocc ({nocc}) > Nmo ({nmo})')
+
         mo_occ[e_idx[:nocc]] = 1
-        if mf.verbose >= logger.INFO and nocc < nmo:
-            homo = float(mo_energy[e_idx[nocc-1]])
-            lumo = float(mo_energy[e_idx[nocc]])
+        if self.verbose >= logger.INFO and nocc < nmo:
+            homo, lumo = mo_energy[e_idx[nocc-1:nocc+1]].get()
             if homo+1e-3 > lumo:
-                logger.warn(mf, 'HOMO %.15g == LUMO %.15g', homo, lumo)
+                logger.warn(self, 'HOMO %.15g == LUMO %.15g', homo, lumo)
             else:
-                logger.info(mf, '  HOMO = %.15g  LUMO = %.15g', homo, lumo)
-        # TODO: depends on spin_square implmentation
-        #if mo_coeff is not None and mf.verbose >= logger.DEBUG:
-        #    ss, s = mf.spin_square(mo_coeff[:,mo_occ>0], mf.get_ovlp())
-        #    logger.debug(mf, 'multiplicity <S^2> = %.8g  2S+1 = %.8g', ss, s)
+                logger.info(self, '  HOMO = %.15g  LUMO = %.15g  gap = %.5f eV',
+                            homo, lumo, (lumo-homo)*HARTREE2EV)
+
+        if mo_coeff is not None and self.verbose >= logger.DEBUG:
+            ss, s = self.spin_square(mo_coeff[:,mo_occ>0], self.get_ovlp())
+            logger.debug(self, 'multiplicity <S^2> = %.8g  2S+1 = %.8g', ss, s)
         return mo_occ
+
+    def spin_square(self, mo_coeff=None, s=None):
+        if mo_coeff is None:
+            mo_coeff = self.mo_coeff[:,self.mo_occ>0]
+        if s is None:
+            s = self.get_ovlp()
+        mo = cp.asarray(mo_coeff)
+        nao = mo.shape[0] // 2
+        s = cp.asarray(s[:nao,:nao])
+        mo_a = mo[:nao]
+        mo_b = mo[nao:]
+        saa = mo_a.conj().T.dot(s).dot(mo_a)
+        sbb = mo_b.conj().T.dot(s).dot(mo_b)
+        sab = mo_a.conj().T.dot(s).dot(mo_b)
+        sba = sab.conj().T
+        nocc_a = saa.trace().real
+        nocc_b = sbb.trace().real
+        ssxy = (nocc_a+nocc_b) * .5
+        ssxy+= (sba.trace() * sab.trace() - cp.einsum('ij,ji->', sba, sab)).real
+        ssz  = (nocc_a+nocc_b) * .25
+        ssz += (nocc_a-nocc_b)**2 * .25
+        tmp  = saa - sbb
+        ssz -= cp.einsum('ij,ji->', tmp, tmp).real * .25
+        ss = float(ssxy.get()) + ssz
+        s = (ss+.25)**.5 - .5
+        return ss, s*2+1
+
+    def dip_moment(self, mol=None, dm=None, unit='Debye', origin=None,
+                   verbose=logger.NOTE):
+        if mol is None: mol = self.mol
+        if dm is None: dm = self.make_rdm1()
+        nao = mol.nao_nr()
+        dm = dm[:nao,:nao] + dm[nao:,nao:]
+        return hf.SCF.dip_moment(self, mol, dm, unit, origin, verbose)
+
+    def quad_moment(self, mol=None, dm=None, unit='DebyeAngstrom', origin=None,
+                    verbose=logger.NOTE):
+        if mol is None: mol = self.mol
+        if dm is None: dm = self.make_rdm1()
+        nao = mol.nao_nr()
+        dm = dm[:nao,:nao] + dm[nao:,nao:]
+        return hf.SCF.quad_moment(self, mol, dm, unit, origin, verbose)
+
+    def mulliken_pop(self, mol=None, dm=None, s=None, verbose=logger.DEBUG):
+        '''Mulliken population analysis
+        '''
+        if mol is None: mol = self.mol
+        if dm is None: dm = self.make_rdm1()
+        if s is None: s = self.get_ovlp()
+        assert s.shape == dm.shape
+        nao = s.shape[0] // 2
+        s = s[:nao,:nao]
+        dma = dm[:nao,:nao]
+        dmb = dm[nao:,nao:]
+        return uhf.UHF.mulliken_pop(self, mol, np.stack((dma,dmb)), s, verbose)
 
     def to_cpu(self):
         mf = ghf_cpu.GHF(self.mol)
         utils.to_cpu(self, out=mf)
         return mf
+
+    def x2c1e(self):
+        from gpu4pyscf.x2c.x2c import x2c1e_ghf
+        return x2c1e_ghf(self)
+    x2c = x2c1e
+    sfx2c1e = NotImplemented
+
+    def to_ks(self, xc='HF'):
+        '''Convert to UKS object.
+        '''
+        from gpu4pyscf import dft
+        return self._transfer_attrs_(dft.GKS(self.mol, xc=xc))

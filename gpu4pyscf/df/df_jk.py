@@ -1,4 +1,4 @@
-# Copyright 2021-2024 The PySCF Developers. All Rights Reserved.
+# Copyright 2021-2026 The PySCF Developers. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,23 +20,21 @@ from concurrent.futures import ThreadPoolExecutor
 import cupy
 import numpy
 import cupy as cp
-from pyscf import lib, __config__
+from cupyx.scipy.linalg import solve_triangular
+from pyscf import lib
 from pyscf.scf import dhf
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import (
-    contract, transpose_sum, reduce_to_device, tag_array)
-from gpu4pyscf.dft import rks, uks, numint
+    contract, transpose_sum, tag_array, CPArrayWithTag, cholesky)
+from gpu4pyscf.dft import rks, uks, numint, gks
 from gpu4pyscf.scf import hf, uhf, rohf
-from gpu4pyscf.df import df, int3c2e
-from gpu4pyscf.__config__ import num_devices
+from gpu4pyscf.scf.jk import _check_rsh_factors
+from gpu4pyscf.scf import ghf
+from gpu4pyscf.lib.cupy_helper import asarray, ndarray, get_avail_mem
+from gpu4pyscf.lib import multi_gpu
+num_devices = multi_gpu.num_devices
 
-def _pin_memory(array):
-    mem = cupy.cuda.alloc_pinned_memory(array.nbytes)
-    ret = numpy.frombuffer(mem, array.dtype, array.size).reshape(array.shape)
-    ret[...] = array
-    return ret
-
-def _density_fit(mf, auxbasis=None, with_df=None, only_dfj=False):
+def density_fit(mf, auxbasis=None, with_df=None, only_dfj=False):
     '''For the given SCF object, update the J, K matrix constructor with
     corresponding density fitting integrals.
     Args:
@@ -54,7 +52,7 @@ def _density_fit(mf, auxbasis=None, with_df=None, only_dfj=False):
         fitting integrals to compute J and K
     Examples:
     '''
-
+    from gpu4pyscf.df import df
     assert isinstance(mf, hf.SCF)
 
     if with_df is None:
@@ -95,13 +93,13 @@ class _DFHF:
     to_gpu = utils.to_gpu
     device = utils.device
     __name_mixin__ = 'DF'
-    _keys = {'rhoj', 'rhok', 'disp', 'screen_tol', 'with_df', 'only_dfj'}
+    _keys = {'disp', 'screen_tol', 'with_df', 'only_dfj'}
+
+    range_separated_mode = 'mix_outside_kernel' # Other options are 'mix_inside_kernel'
 
     def __init__(self, mf, dfobj, only_dfj):
         self.__dict__.update(mf.__dict__)
         self._eri = None
-        self.rhoj = None
-        self.rhok = None
         self.direct_scf = False
         self.with_df = dfobj
         self.only_dfj = only_dfj
@@ -109,7 +107,7 @@ class _DFHF:
     def undo_df(self):
         '''Remove the DFHF Mixin'''
         obj = lib.view(self, lib.drop_class(self.__class__, _DFHF))
-        del obj.rhoj, obj.rhok, obj.with_df, obj.only_dfj
+        del obj.with_df, obj.only_dfj
         return obj
 
     def reset(self, mol=None):
@@ -117,26 +115,132 @@ class _DFHF:
         return super().reset(mol)
 
     def get_j(self, mol=None, dm=None, hermi=1, omega=None):
-        return self.with_df.get_jk(dm, hermi, True, False, self.direct_scf_tol, omega)[0]
+        return self.get_jk(mol, dm, hermi, with_j=True, with_k=False, omega=omega)[0]
 
-    def get_k(self, mol=None, dm=None, hermi=1, omega=None):
-        return self.with_df.get_jk(dm, hermi, False, True, self.direct_scf_tol, omega)[1]
+    def get_k(self, mol=None, dm=None, hermi=1,
+              omega=None, lr_factor=None, sr_factor=None):
+        if mol is None:
+            mol = self.mol
+        omega, lr_factor, sr_factor = _check_rsh_factors(mol, omega, lr_factor, sr_factor)
+
+        range_separated_mode = getattr(self, 'range_separated_mode', 'mix_outside_kernel')
+        if range_separated_mode == 'mix_inside_kernel':
+            return self.get_jk(mol, dm, hermi, False, True, omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)[1]
+        else:
+            assert range_separated_mode == 'mix_outside_kernel'
+
+        if sr_factor == 0:
+            # Only LR
+            vk = self.get_jk(mol, dm, hermi, False, True, omega=omega)[1]
+            vk *= lr_factor
+            return vk
+
+        vk = self.get_jk(mol, dm, hermi, False, True)[1]
+
+        if sr_factor != 1:
+            vk *= sr_factor
+
+        if lr_factor != sr_factor:
+            vklr = self.get_jk(mol, dm, hermi, False, True, omega=abs(omega))[1]
+            vklr *= lr_factor - sr_factor
+            vk += vklr
+        return vk
 
     def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True,
-               omega=None):
+               omega=None, lr_factor=None, sr_factor=None):
+        if mol is None: mol = self.mol
         if dm is None: dm = self.make_rdm1()
-        if self.with_df and self.only_dfj:
-            vj = vk = None
+
+        if isinstance(self, ghf.GHF):
+            nao = mol.nao
+            if with_k and not self.only_dfj:
+                factor_l, factor_r = factorize_dm(dm, hermi)
+                if factor_r is None:
+                    factor_r = factor_l
+                n2c, nocc = factor_l.shape[-2:]
+                nao = n2c // 2
+                factor_l = factor_l.reshape(-1, n2c, nocc)
+                factor_r = factor_r.reshape(-1, n2c, nocc)
+                la = factor_l[:,:nao]
+                lb = factor_l[:,nao:]
+                ra = factor_r[:,:nao]
+                rb = factor_r[:,nao:]
+                is_real = dm.dtype == cp.float64
+                if dm.ndim == 2:
+                    n_dm = 1
+                else:
+                    n_dm = len(dm)
+
+            def get_jk_spin_free(mf, mol, dm, hermi, with_j=True, with_k=True,
+                                 omega=None, lr_factor=None, sr_factor=None):
+                vj = vk = None
+                if with_j:
+                    vj = mf.with_df.get_jk(dm, hermi, with_k=False)[0]
+
+                if not with_k:
+                    return vj, vk
+
+                if self.only_dfj:
+                    vk = hf.SCF.get_k(self, mol, dm, hermi, omega=omega,
+                                      lr_factor=lr_factor, sr_factor=sr_factor)
+                    return vj, vk
+
+                if is_real:
+                    # leading dimension of dm corresponds to aa,bb,ab,ba
+                    factor_l = cp.vstack([la, lb, la, lb])
+                    factor_r = cp.vstack([ra, rb, rb, ra])
+                else:
+                    # leading dimension of dm corresponds to
+                    # aaR,bbR,abR,baR,aaI,bbI,abI,baI
+                    factor_l = cp.stack([
+                        la.real, la.imag, # laR*raR - laI*raI
+                        lb.real, lb.imag, # lbR*rbR - lbI*rbI
+                        la.real, la.imag, # laR*rbR - laI*rbI
+                        lb.real, lb.imag, # lbR*raR - lbI*raI
+                        la.real, la.imag, # laR*raI + laI*raR
+                        lb.real, lb.imag, # lbR*rbI + lbI*rbR
+                        la.real, la.imag, # laR*rbI + laI*rbR
+                        lb.real, lb.imag, # lbR*raI + lbI*raR
+                    ]).reshape(8,2, n_dm,nao,nocc).transpose(0,2,3,1,4).reshape(8*n_dm, nao, 2*nocc)
+                    factor_r = cp.stack([
+                        ra.real, -ra.imag,
+                        rb.real, -rb.imag,
+                        rb.real, -rb.imag,
+                        ra.real, -ra.imag,
+                        ra.imag, ra.real,
+                        rb.imag, rb.real,
+                        rb.imag, rb.real,
+                        ra.imag, ra.real,
+                    ]).reshape(8,2, n_dm,nao,nocc).transpose(0,2,3,1,4).reshape(8*n_dm, nao, 2*nocc)
+                dm = tag_array(dm, factor_l=factor_l, factor_r=factor_r)
+                vk = self.with_df.get_jk(dm, hermi=0, with_j=False, omega=omega,
+                                         lr_factor=lr_factor, sr_factor=sr_factor)[1]
+                return vj, vk
+
+            vj, vk = ghf._get_jk(self, mol, dm, hermi, with_j, with_k,
+                                 jkbuild=get_jk_spin_free, omega=omega,
+                                 lr_factor=lr_factor, sr_factor=sr_factor)
+            symmetrize = getattr(dm, 'symmetrize', 0)
+            if with_k and not self.only_dfj and symmetrize:
+                # Hermitian conjugation also swaps the alpha-beta blocks.
+                # Symmetrize the assembled spinor K, not each AO block.
+                shape = vk.shape
+                vk = transpose_sum(vk.reshape(-1, shape[-1], shape[-1]),
+                                   hermi=symmetrize).reshape(shape)
+            return vj, vk
+
+        vj = vk = None
+        if self.only_dfj:
             if with_j:
-                vj = self.get_j(mol, dm, hermi, omega)
+                vj = self.with_df.get_jk(dm, hermi, with_k=False, omega=omega,
+                                         lr_factor=lr_factor, sr_factor=sr_factor)[0]
             if with_k:
-                vk = super().get_jk(mol, dm, hermi, False, True, omega)[1]
-        elif self.with_df:
-            vj, vk = self.with_df.get_jk(dm, hermi, with_j, with_k,
-                                         self.direct_scf_tol, omega)
+                vk = hf.SCF.get_k(self, mol, dm, hermi, omega=omega,
+                                  lr_factor=lr_factor, sr_factor=sr_factor)
         else:
-            raise ValueError(f"with_df field not found in a df object (type = {type(self)}) during a get_jk() call.")
-            # vj, vk = super().get_jk(mol, dm, hermi, with_j, with_k, omega)
+            # Full DF mode (DF J + DF K)
+            vj, vk = self.with_df.get_jk(dm, hermi, with_j, with_k, omega=omega,
+                                         lr_factor=lr_factor, sr_factor=sr_factor)
         return vj, vk
 
     def Gradients(self):
@@ -191,65 +295,27 @@ class _DFHF:
     def auxbasis(self):
         return getattr(self.with_df, 'auxbasis', None)
 
-    def get_veff(self, mol=None, dm=None, dm_last=None, vhf_last=0, hermi=1):
+    def get_veff(self, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
         '''
         effective potential
         '''
         if mol is None: mol = self.mol
         if dm is None: dm = self.make_rdm1()
         assert not self.direct_scf
+        log = logger.new_logger(self)
 
         if isinstance(self, rohf.ROHF):
-            if getattr(dm, 'mo_coeff', None) is not None:
-                mo_coeff = cupy.repeat(dm.mo_coeff[None], 2, axis=0)
-                mo_occ = cupy.asarray([dm.mo_occ>0, dm.mo_occ==2],
-                                      dtype=numpy.double)
-                if dm.ndim == 2:  # RHF DM
-                    dm = cupy.repeat(dm[None]*.5, 2, axis=0)
-                dm = tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
-            elif dm.ndim == 2:  # RHF DM
-                dm = cupy.repeat(dm[None]*.5, 2, axis=0)
+            dm = rohf._to_uhf_dm(dm)
 
         # for DFT
         if isinstance(self, rks.KohnShamDFT):
-            t0 = logger.init_timer(self)
-            rks.initialize_grids(self, mol, dm)
+            t0 = log.init_timer()
             ni = self._numint
             if isinstance(self, (uhf.UHF, rohf.ROHF)): # UKS
+                if self.grids.coords is None:
+                    rks.initialize_grids(self, mol, dm[0]+dm[1])
                 n, exc, vxc = ni.nr_uks(mol, self.grids, self.xc, dm)
-                logger.debug(self, 'nelec by numeric integration = %s', n)
-                if self.do_nlc():
-                    if ni.libxc.is_nlc(self.xc):
-                        xc = self.xc
-                    else:
-                        assert ni.libxc.is_nlc(self.nlc)
-                        xc = self.nlc
-                    n, enlc, vnlc = ni.nr_nlc_vxc(mol, self.nlcgrids, xc, dm[0]+dm[1])
-                    exc += enlc
-                    vxc += vnlc
-                    logger.debug(self, 'nelec with nlc grids = %s', n)
-                t0 = logger.timer(self, 'vxc', *t0)
-
-                if not ni.libxc.is_hybrid_xc(self.xc):
-                    vj = self.get_j(mol, dm[0]+dm[1], hermi)
-                    vxc += vj
-                else:
-                    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(self.xc, spin=mol.spin)
-                    vj, vk = self.get_jk(mol, dm, hermi)
-                    vj = vj[0] + vj[1]
-                    vxc += vj
-                    vk *= hyb
-                    if abs(omega) > 1e-10:
-                        vklr = self.get_k(mol, dm, hermi, omega=omega)
-                        vklr *= (alpha - hyb)
-                        vk += vklr
-                    vxc -= vk
-                    exc -= cupy.einsum('sij,sji->', dm, vk).real * .5
-                ecoul = cupy.einsum('sij,ji->', dm, vj).real * .5
-
-            elif isinstance(self, hf.RHF):
-                n, exc, vxc = ni.nr_rks(mol, self.grids, self.xc, dm)
-                logger.debug(self, 'nelec by numeric integration = %s', n)
+                log.debug('nelec by numeric integration = %s', n)
                 if self.do_nlc():
                     if ni.libxc.is_nlc(self.xc):
                         xc = self.xc
@@ -259,338 +325,356 @@ class _DFHF:
                     n, enlc, vnlc = ni.nr_nlc_vxc(mol, self.nlcgrids, xc, dm)
                     exc += enlc
                     vxc += vnlc
-                    logger.debug(self, 'nelec with nlc grids = %s', n)
-                t0 = logger.timer(self, 'vxc', *t0)
+                    log.debug('nelec with nlc grids = %s', n)
+                t0 = log.timer('vxc', *t0)
+
+                if not ni.libxc.is_hybrid_xc(self.xc):
+                    vj = self.get_j(mol, dm[0]+dm[1], hermi)
+                    vxc += vj
+                else:
+                    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(self.xc, spin=mol.spin)
+
+                    if omega != 0:
+                        range_separated_mode = getattr(self, 'range_separated_mode', 'mix_outside_kernel')
+                        if range_separated_mode == 'mix_outside_kernel':
+                            vj, vk = self.get_jk(mol, dm, hermi)
+                            vk *= hyb
+                            vklr = self.get_k(mol, dm, hermi, omega=omega)
+                            vklr *= (alpha - hyb)
+                            vk += vklr
+                        elif range_separated_mode == 'mix_inside_kernel':
+                            vj = self.get_j(mol, dm, hermi)
+                            vk = self.get_k(mol, dm, hermi, omega=omega, lr_factor=alpha, sr_factor=hyb)
+                        else:
+                            raise ValueError(f'range_separated_mode = {range_separated_mode} is not supported')
+                    else: # omega == 0
+                        vj, vk = self.get_jk(mol, dm, hermi)
+                        vk *= hyb
+                    vj = vj[0] + vj[1]
+                    vxc += vj
+                    vxc -= vk
+                    exc -= float(cupy.einsum('sij,sji->', dm, vk).real.get()) * .5
+                ecoul = float(cupy.einsum('sij,ji->', dm, vj).real.get()) * .5
+
+            elif isinstance(self, hf.RHF):
+                rks.initialize_grids(self, mol, dm)
+                n, exc, vxc = ni.nr_rks(mol, self.grids, self.xc, dm)
+                log.debug('nelec by numeric integration = %s', n)
+                if self.do_nlc():
+                    if ni.libxc.is_nlc(self.xc):
+                        xc = self.xc
+                    else:
+                        assert ni.libxc.is_nlc(self.nlc)
+                        xc = self.nlc
+                    n, enlc, vnlc = ni.nr_nlc_vxc(mol, self.nlcgrids, xc, dm)
+                    exc += enlc
+                    vxc += vnlc
+                    log.debug('nelec with nlc grids = %s', n)
+                t0 = log.timer('vxc', *t0)
 
                 if not ni.libxc.is_hybrid_xc(self.xc):
                     vj = self.get_j(mol, dm, hermi)
                     vxc += vj
                 else:
                     omega, alpha, hyb = ni.rsh_and_hybrid_coeff(self.xc, spin=mol.spin)
-                    vj, vk = self.get_jk(mol, dm, hermi)
-                    vxc += vj
-                    vk *= hyb
-                    if omega != 0:
-                        vklr = self.get_k(mol, dm, hermi, omega=abs(omega))
-                        vklr *= (alpha - hyb)
-                        vk += vklr
-                    vxc -= vk * .5
-                    exc -= cupy.einsum('ij,ji', dm, vk).real * .25
-                ecoul = cupy.einsum('ij,ji', dm, vj).real * .5
 
+                    if omega != 0:
+                        range_separated_mode = getattr(self, 'range_separated_mode', 'mix_outside_kernel')
+                        if range_separated_mode == 'mix_outside_kernel':
+                            vj, vk = self.get_jk(mol, dm, hermi)
+                            vk *= hyb
+                            vklr = self.get_k(mol, dm, hermi, omega=abs(omega))
+                            vklr *= (alpha - hyb)
+                            vk += vklr
+                        elif range_separated_mode == 'mix_inside_kernel':
+                            vj = self.get_j(mol, dm, hermi)
+                            vk = self.get_k(mol, dm, hermi, omega=omega, lr_factor=alpha, sr_factor=hyb)
+                        else:
+                            raise ValueError(f'range_separated_mode = {range_separated_mode} is not supported')
+                    else: # omega == 0
+                        vj, vk = self.get_jk(mol, dm, hermi)
+                        vk *= hyb
+                    vxc += vj
+                    vxc -= vk * .5
+                    exc -= float(cupy.einsum('ij,ji->', dm, vk).real.get()) * .25
+                ecoul = float(cupy.einsum('ij,ji->', dm, vj).real.get()) * .5
+            elif isinstance(self, ghf.GHF):
+                if hermi == 2:  # because rho = 0
+                    n, exc, vxc = 0, 0, 0
+                else:
+                    max_memory = self.max_memory - lib.current_memory()[0]
+                    if ni.collinear[0].lower() != 'm':
+                        raise NotImplementedError('Only multi-colinear GKS is implemented for DF')
+                    if self.grids.coords is None:
+                        self.initialize_grids(mol, dm)
+                    
+                    if self.grids.coords is None:
+                        self.initialize_grids(mol, dm)
+                    
+                    n, exc, vxc = ni.get_vxc(mol, self.grids, self.xc, dm,
+                                             hermi=hermi, max_memory=max_memory)
+                    log.debug('nelec by numeric integration = %s', n)
+                    t0 = log.timer('vxc', *t0)
+                    
+                    if self.do_nlc():
+                        if ni.libxc.is_nlc(self.xc):
+                            xc = self.xc
+                        else:
+                            assert ni.libxc.is_nlc(self.nlc)
+                            xc = self.nlc
+                        n_nlc, enlc, vnlc = ni.nr_nlc_vxc(mol, self.nlcgrids, xc, dm,
+                                                      hermi=hermi, max_memory=max_memory)
+                        exc += enlc
+                        vxc += vnlc
+                        log.debug('nelec with nlc grids = %s', n_nlc)
+
+                if not ni.libxc.is_hybrid_xc(self.xc):
+                    vk = None
+                    vj = self.get_j(mol, dm, hermi)
+                    vxc += vj
+                else:
+                    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(self.xc, spin=mol.spin)
+                    range_separated_mode = getattr(self, 'range_separated_mode', 'mix_outside_kernel')
+
+                    if omega == 0:
+                        vj, vk = self.get_jk(mol, dm, hermi)
+                        vk *= hyb
+                    else:
+                        if range_separated_mode == 'mix_outside_kernel':
+                            if alpha == 0:
+                                vj = self.get_j(mol, dm, hermi)
+                                vk = self.get_k(mol, dm, hermi, omega=-omega)
+                                vk *= hyb
+                            elif hyb == 0:
+                                vj = self.get_j(mol, dm, hermi)
+                                vk = self.get_k(mol, dm, hermi, omega=omega)
+                                vk *= alpha
+                            else:
+                                vj, vk = self.get_jk(mol, dm, hermi)
+                                vk *= hyb
+                                vklr = self.get_k(mol, dm, hermi, omega=omega)
+                                vklr *= (alpha - hyb)
+                                vk += vklr
+                        elif range_separated_mode == 'mix_inside_kernel':
+                            vj = self.get_j(mol, dm, hermi)
+                            vk = self.get_k(mol, dm, hermi, omega=omega, lr_factor=alpha, sr_factor=hyb)
+                        else:
+                            raise ValueError(f'range_separated_mode = {range_separated_mode} is not supported')
+                    vxc += vj - vk
+                    exc -= cupy.einsum('ij,ji->', dm, vk).real * .5
+                ecoul = cupy.einsum('ij,ji->', dm, vj).real * .5
             else:
                 raise NotImplementedError("DF only supports R/U/RO KS.")
-            t0 = logger.timer(self, 'veff', *t0)
-            return tag_array(vxc, ecoul=ecoul, exc=exc, vj=None, vk=None)
+            t0 = log.timer('veff', *t0)
+            return tag_array(vxc, ecoul=ecoul, exc=exc)
 
         if isinstance(self, (uhf.UHF, rohf.ROHF)):
             vj, vk = self.get_jk(mol, dm, hermi=hermi)
-            return vj[0] + vj[1] - vk
+            vj = vj[0] + vj[1]
+            vhf = vj - vk
+            ecoul = float(cp.einsum('sij,ji->', dm, vj).real.get()) * .5
+            return tag_array(vhf, ecoul=ecoul)
         elif isinstance(self, hf.RHF):
             vj, vk = self.get_jk(mol, dm, hermi=hermi)
-            return vj - vk * .5
+            vhf = vj - vk * .5
+            ecoul = float(cp.einsum('ij,ji->', dm, vj).real.get()) * .5
+            return tag_array(vhf, ecoul=ecoul)
+        elif isinstance(self, ghf.GHF): # GHF branch
+            vj, vk = self.get_jk(mol, dm, hermi=hermi)
+            vhf = vj - vk
+            ecoul = float(cp.einsum('ij,ji->', dm, vj).real.get()) * .5
+            return tag_array(vhf, ecoul=ecoul)
         else:
-            raise NotImplementedError("DF only supports R/U/RO HF.")
+            raise NotImplementedError("DF only supports R/U/RO/G HF.")
 
     def to_cpu(self):
         obj = self.undo_df().to_cpu().density_fit()
-        return utils.to_cpu(self, obj)
+        obj = utils.to_cpu(self, obj)
+        if hasattr(self, 'collinear'):
+            obj.collinear = self.collinear
+        if hasattr(self, 'spin_samples'):
+            obj.spin_samples = self.spin_samples
+        return obj
 
-def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
-                     with_j=True, with_k=True, hermi=0, device_id=0):
-    ''' Calculate J and K matrices on single GPU
-    '''
-    with cupy.cuda.Device(device_id):
-        assert isinstance(dfobj.verbose, int)
-        log = logger.new_logger(dfobj.mol, dfobj.verbose)
-        t0 = log.init_timer()
-        dms = cupy.asarray(dms)
-        mo_coeff = cupy.asarray(mo_coeff)
-        mo_occ = cupy.asarray(mo_occ)
-        nao = dms.shape[-1]
-        intopt = dfobj.intopt
-        rows = intopt.cderi_row
-        cols = intopt.cderi_col
-        nset = dms.shape[0]
-        dms_shape = dms.shape
-        vj = vk = None
-        if with_j:
-            dm_sparse = dms[:,rows,cols]
-            if hermi == 0:
-                dm_sparse += dms[:,cols,rows]
-            else:
-                dm_sparse *= 2
-            dm_sparse[:, intopt.cderi_diag] *= .5
-
-        if with_k:
-            vk = cupy.zeros_like(dms)
-
-        # SCF K matrix with occ
-        if mo_coeff is not None:
-            assert hermi == 1
-            nocc = 0
-            occ_coeff = [0]*nset
-            for i in range(nset):
-                occ_idx = mo_occ[i] > 0
-                occ_coeff[i] = mo_coeff[i][:,occ_idx] * mo_occ[i][occ_idx]**0.5
-                nocc += int(mo_occ[i].sum())
-            blksize = dfobj.get_blksize(extra=nao*nocc)
-            if with_j:
-                vj_packed = cupy.zeros_like(dm_sparse)
-            for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k):
-                # leading dimension is 1
-                if with_j:
-                    rhoj = dm_sparse.dot(cderi_sparse)
-                    vj_packed += cupy.dot(rhoj, cderi_sparse.T)
-                cderi_sparse = rhoj = None
-                for i in range(nset):
-                    if with_k:
-                        rhok = contract('Lji,jk->Lki', cderi, occ_coeff[i])
-                        # In most cases, syrk does not outperform cupy.dot
-                        #cublas.syrk('T', rhok.reshape([-1,nao]), out=vk[i], alpha=1.0, beta=1.0, lower=True)
-                        rhok = rhok.reshape([-1,nao])
-                        vk[i] += cupy.dot(rhok.T, rhok)
-                    rhok = None
-
-            if with_j:
-                vj = cupy.zeros(dms_shape)
-                vj[:,rows,cols] = vj_packed
-                vj[:,cols,rows] = vj_packed
-        t0 = log.timer_debug1(f'vj and vk on Device {device_id}', *t0)
-    return vj, vk
-
-def _jk_task_with_mo1(dfobj, dms, mo1s, occ_coeffs,
-                      with_j=True, with_k=True, hermi=0, device_id=0):
-    ''' Calculate J and K matrices with mo response
-        For CP-HF or TDDFT
-    '''
-    vj = vk = None
-    with cupy.cuda.Device(device_id):
-        assert isinstance(dfobj.verbose, int)
-        log = logger.new_logger(dfobj.mol, dfobj.verbose)
-        t0 = log.init_timer()
-        dms = cupy.asarray(dms)
-        mo1s = [cupy.asarray(mo1) for mo1 in mo1s]
-        occ_coeffs = [cupy.asarray(occ_coeff) for occ_coeff in occ_coeffs]
-
-        nao = dms.shape[-1]
-        intopt = dfobj.intopt
-        rows = intopt.cderi_row
-        cols = intopt.cderi_col
-        dms_shape = dms.shape
-        if with_j:
-            dm_sparse = dms[:,rows,cols]
-            if hermi == 0:
-                dm_sparse += dms[:,cols,rows]
-            else:
-                dm_sparse *= 2
-            dm_sparse[:, intopt.cderi_diag] *= .5
-
-        if with_k:
-            vk = cupy.zeros_like(dms)
-
-        if with_j:
-            vj_sparse = cupy.zeros_like(dm_sparse)
-
-        nocc = max([mo1.shape[2] for mo1 in mo1s])
-        blksize = dfobj.get_blksize(extra=2*nao*nocc)
-        for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k):
-            if with_j:
-                rhoj = dm_sparse.dot(cderi_sparse)
-                vj_sparse += cupy.dot(rhoj, cderi_sparse.T)
-                rhoj = None
-            cderi_sparse = None
-            if with_k:
-                iset = 0
-                for occ_coeff, mo1 in zip(occ_coeffs, mo1s):
-                    rhok = contract('Lij,jk->Lki', cderi, occ_coeff).reshape([-1,nao])
-                    for i in range(mo1.shape[0]):
-                        rhok1 = contract('Lij,jk->Lki', cderi, mo1[i]).reshape([-1,nao])
-                        #contract('Lki,Lkj->ij', rhok1, rhok, alpha=1.0, beta=1.0, out=vk[iset])
-                        vk[iset] += cupy.dot(rhok1.T, rhok)
-                        iset += 1
-                mo1 = rhok1 = rhok = None
-            cderi = None
-        mo1s = None
-        if with_j:
-            vj = cupy.zeros(dms_shape)
-            vj[:,rows,cols] = vj_sparse
-            vj[:,cols,rows] = vj_sparse
-        if with_k and hermi:
-            transpose_sum(vk)
-        vj_sparse = None
-
-        t0 = log.timer_debug1(f'vj and vk on Device {device_id}', *t0)
-    return vj, vk
-
-def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0):
-    ''' Calculate J and K matrices with density matrix
-    '''
-    with cupy.cuda.Device(device_id):
-        assert isinstance(dfobj.verbose, int)
-        log = logger.new_logger(dfobj.mol, dfobj.verbose)
-        t0 = log.init_timer()
-        dms = cupy.asarray(dms)
-        intopt = dfobj.intopt
-        rows = intopt.cderi_row
-        cols = intopt.cderi_col
-        nao = dms.shape[-1]
-        dms_shape = dms.shape
-        vj = vk = None
-        if with_j:
-            dm_sparse = dms[:,rows,cols]
-            if hermi == 0:
-                dm_sparse += dms[:,cols,rows]
-            else:
-                dm_sparse *= 2
-            dm_sparse[:, intopt.cderi_diag] *= .5
-            vj_sparse = cupy.zeros_like(dm_sparse)
-
-        if with_k:
-            vk = cupy.zeros_like(dms)
-
-        nset = dms.shape[0]
-        blksize = dfobj.get_blksize()
-        for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k):
-            if with_j:
-                rhoj = dm_sparse.dot(cderi_sparse)
-                vj_sparse += cupy.dot(rhoj, cderi_sparse.T)
-            if with_k:
-                for k in range(nset):
-                    rhok = contract('Lij,jk->Lki', cderi, dms[k]).reshape([-1,nao])
-                    #vk[k] += contract('Lki,Lkj->ij', rhok, cderi)
-                    vk[k] += cupy.dot(rhok.T, cderi.reshape([-1,nao]))
-        if with_j:
-            vj = cupy.zeros(dms_shape)
-            vj[:,rows,cols] = vj_sparse
-            vj[:,cols,rows] = vj_sparse
-
-        t0 = log.timer_debug1(f'vj and vk on Device {device_id}', *t0)
-    return vj, vk
-
-def get_jk(dfobj, dms_tag, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-14, omega=None):
+def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True,
+           omega=None, lr_factor=None, sr_factor=None):
     '''
     get jk with density fitting
-    outputs and input are on the same device
-    TODO: separate into three cases: j only, k only, j and k
     '''
-
     log = logger.new_logger(dfobj.mol, dfobj.verbose)
-    out_shape = dms_tag.shape
-    out_cupy = isinstance(dms_tag, cupy.ndarray)
-    if not isinstance(dms_tag, cupy.ndarray):
-        dms_tag = cupy.asarray(dms_tag)
-
-    assert(with_j or with_k)
-    if dms_tag is None: logger.error("dm is not given")
-    nao = dms_tag.shape[-1]
     t1 = t0 = log.init_timer()
     if dfobj._cderi is None:
         log.debug('Build CDERI ...')
-        dfobj.build(direct_scf_tol=direct_scf_tol, omega=omega)
+        dfobj.build(omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
         t1 = log.timer_debug1('init jk', *t0)
 
-    assert nao == dfobj.nao
-    intopt = dfobj.intopt
+    out_cupy = isinstance(dms, cp.ndarray)
+    dm_factor_l, dm_factor_r = factorize_dm(dms, hermi)
+    symmetrize = getattr(dms, 'symmetrize', 0)
 
-    nao = dms_tag.shape[-1]
-    dms = dms_tag.reshape([-1,nao,nao])
-    intopt = dfobj.intopt
-    dms = intopt.sort_orbitals(dms, axis=[1,2])
+    nspin = 1
+    if dm_factor_l.ndim == 4: # for UHF-TDDFT and UHF-hessian
+        assert dms.ndim == 4
+        nspin = 2
 
-    if getattr(dms_tag, 'mo_coeff', None) is not None:
-        mo_occ = dms_tag.mo_occ
-        mo_coeff = dms_tag.mo_coeff
-        nmo = mo_occ.shape[-1]
-        mo_coeff = mo_coeff.reshape(-1,nao,nmo)
-        mo_occ   = mo_occ.reshape(-1,nmo)
-        mo_coeff = intopt.sort_orbitals(mo_coeff, axis=[1])
-        cupy.cuda.get_current_stream().synchronize()
+    if dm_factor_r is None:
+        dm_factor_mode = 0
+    elif dm_factor_l.ndim == dm_factor_r.ndim:
+        dm_factor_mode = 1
+    elif dm_factor_l.ndim < dm_factor_r.ndim:
+        dm_factor_mode = 2
+    else: # dm_factor_l.ndim > dm_factor_r.ndim:
+        dm_factor_mode = 3
 
-        futures = []
-        with ThreadPoolExecutor(max_workers=num_devices) as executor:
-            for device_id in range(num_devices):
-                future = executor.submit(
-                    _jk_task_with_mo,
-                    dfobj, dms, mo_coeff, mo_occ,
-                    hermi=hermi, device_id=device_id,
-                    with_j=with_j, with_k=with_k)
-                futures.append(future)
+    nao, nocc = dm_factor_l.shape[-2:]
+    dms_3d = cp.asarray(dms).reshape(-1,nao,nao)
+    n_dm = dms_3d.shape[0] // nspin
 
-    elif hasattr(dms_tag, 'mo1'):
-        occ_coeffs = dms_tag.occ_coeff
-        mo1s = dms_tag.mo1
-        if not isinstance(occ_coeffs, (tuple, list)):
-            # *2 for double occupancy in RHF/RKS
-            occ_coeffs = [occ_coeffs * 2.0]
-        if not isinstance(mo1s, (tuple, list)):
-            mo1s = [mo1s]
-        occ_coeffs = [intopt.sort_orbitals(occ_coeff, axis=[0]) for occ_coeff in occ_coeffs]
-        mo1s = [intopt.sort_orbitals(mo1, axis=[1]) for mo1 in mo1s]
-        cupy.cuda.get_current_stream().synchronize()
+    if nocc == 0:
+        # dms equals to 0. vj and vk must be all zeros.
+        return dms, dms
 
-        futures = []
-        with ThreadPoolExecutor(max_workers=num_devices) as executor:
-            for device_id in range(num_devices):
-                future = executor.submit(
-                    _jk_task_with_mo1,
-                    dfobj, dms, mo1s, occ_coeffs,
-                    hermi=hermi, device_id=device_id,
-                    with_j=with_j, with_k=with_k)
-                futures.append(future)
+    if with_j:
+        pair_addresses, diags = dfobj._cderi_idx
+        rows, cols = divmod(cp.asarray(pair_addresses), nao)
+        dm_sparse = dms_3d[:,rows,cols]
+        if hermi == 0:
+            dm_sparse += dms_3d[:,cols,rows]
+        else:
+            dm_sparse *= 2
+        dm_sparse[:,diags] *= .5
 
-    # general K matrix with density matrix
-    else:
-        cupy.cuda.Stream.null.synchronize()
-        futures = []
-        with ThreadPoolExecutor(max_workers=num_devices) as executor:
-            for device_id in range(num_devices):
-                future = executor.submit(
-                    _jk_task_with_dm, dfobj, dms,
-                    hermi=hermi, device_id=device_id,
-                    with_j=with_j, with_k=with_k)
-                futures.append(future)
+    def proc():
+        # Cross-device copies require C- or F-contiguous factors.
+        factor_l = cp.asarray(dm_factor_l, order='A').reshape(nspin,-1,nao,nocc)
+        factor_r = dm_factor_r
+        if factor_r is not None:
+            factor_r = cp.asarray(factor_r, order='A').reshape(nspin,-1,nao,nocc)
+
+        vj = vk = None
+        if with_j:
+            _dm_sparse = cp.asarray(dm_sparse)
+            vj = cp.zeros_like(dm_sparse)
+
+        blksize = dfobj.get_blksize(mem_fraction=0.4)
+        if with_k:
+            vk = cupy.zeros((nspin, n_dm, nao, nao))
+            mem_avail = get_avail_mem(exclude_memory_pool=True)
+            dm_batch_size = int(mem_avail * 0.6 / (blksize*nao*nocc * 8))
+            if dm_factor_mode == 1:
+                dm_batch_size = dm_batch_size // 2
+            dm_batch_size = min(dm_batch_size, n_dm)
+            assert dm_batch_size > 0
+            log.debug1('blksize=%d, dm_batch_size=%d', blksize, dm_batch_size)
+
+            if dm_factor_mode == 0:
+                buf = cp.empty((dm_batch_size, blksize * nao*nocc))
+            elif dm_factor_mode == 1:
+                buf = cp.empty((2 * dm_batch_size, blksize * nao*nocc))
+            else:
+                buf = cp.empty((dm_batch_size+1, blksize * nao*nocc))
+                buf1 = buf[-1]
+
+        for cderi, cderi_tril in dfobj.loop(blksize=blksize, unpack=with_k):
+            if with_j:
+                auxvec = contract('np,Lp->nL', _dm_sparse, cderi_tril)
+                contract('nL,Lp->np', auxvec, cderi_tril, beta=1, out=vj)
+
+            if with_k:
+                nL = len(cderi)
+                for s in range(nspin):
+                    if dm_factor_mode == 0:
+                        for i0, i1 in lib.prange(0, n_dm, dm_batch_size):
+                            rhok = ndarray((i1-i0,nao,nocc,nL), buffer=buf)
+                            contract('Lij,njk->nikL', cderi, factor_l[s,i0:i1], out=rhok)
+                            contract('nikL,njkL->nij', rhok, rhok, beta=1, out=vk[s,i0:i1])
+                    elif dm_factor_mode == 1:
+                        for i0, i1 in lib.prange(0, n_dm, dm_batch_size):
+                            rhok, rhok1 = ndarray((2,i1-i0,nao,nocc,nL), buffer=buf)
+                            contract('Lij,njk->nikL', cderi, factor_l[s,i0:i1], out=rhok)
+                            contract('Lij,njk->nikL', cderi, factor_r[s,i0:i1], out=rhok1)
+                            contract('nikL,njkL->nij', rhok, rhok1, beta=1, out=vk[s,i0:i1])
+                    elif dm_factor_mode == 2:
+                        rhok = ndarray((nao,nocc,nL), buffer=buf1)
+                        contract('Lij,jk->ikL', cderi, factor_l[s,0], out=rhok)
+                        for i0, i1 in lib.prange(0, n_dm, dm_batch_size):
+                            rhok1 = ndarray((i1-i0,nao,nocc,nL), buffer=buf)
+                            contract('Lij,njk->nikL', cderi, factor_r[s,i0:i1], out=rhok1)
+                            contract('ikL,njkL->nij', rhok, rhok1, beta=1, out=vk[s,i0:i1])
+                    else:
+                        rhok1 = ndarray((nao,nocc,nL), buffer=buf1)
+                        contract('Lij,jk->ikL', cderi, factor_r[s,0], out=rhok1)
+                        for i0, i1 in lib.prange(0, n_dm, dm_batch_size):
+                            rhok = ndarray((i1-i0,nao,nocc,nL), buffer=buf)
+                            contract('Lij,njk->nikL', cderi, factor_l[s,i0:i1], out=rhok)
+                            contract('nikL,jkL->nij', rhok, rhok1, beta=1, out=vk[s,i0:i1])
+                rhok1 = rhok = None
+        return vj, vk
+
+    results = multi_gpu.run(proc, non_blocking=True)
 
     vj = vk = None
     if with_j:
-        vj = [future.result()[0] for future in futures]
-        vj = reduce_to_device(vj, inplace=True)
-        vj = intopt.unsort_orbitals(vj, axis=[1,2])
-        vj = vj.reshape(out_shape)
+        vj_sparse = multi_gpu.array_reduce([x[0] for x in results], inplace=True)
+        vj = cp.zeros_like(dms_3d)
+        vj[:,cols,rows] = vj[:,rows,cols] = vj_sparse
+        vj = vj.reshape(dms.shape)
+        if not out_cupy: vj = vj.get()
 
     if with_k:
-        vk = [future.result()[1] for future in futures]
-        vk = reduce_to_device(vk, inplace=True)
-        vk = intopt.unsort_orbitals(vk, axis=[1,2])
-        vk = vk.reshape(out_shape)
-
+        vk = multi_gpu.array_reduce([x[1] for x in results], inplace=True)
+        if symmetrize != 0:
+            vk = transpose_sum(vk.reshape(-1,nao,nao), hermi=symmetrize)
+        vk = vk.reshape(dms.shape)
+        if not out_cupy: vk = vk.get()
     t1 = log.timer_debug1('vj and vk', *t1)
-    if out_cupy:
-        return vj, vk
+    return vj, vk
+
+def get_j(dfobj, dm, hermi=1):
+    from gpu4pyscf.df.int3c2e_bdiv import int2c2e
+    from gpu4pyscf.df import j_engine_3c2e
+    if dfobj.intopt is None:
+        dfobj.build(build_cderi=False)
+
+    if dfobj._cd_j2c is None:
+        j2c = int2c2e(dfobj.auxmol)
+        try:
+            dfobj._cd_j2c = cholesky(j2c), 'cd'
+        except RuntimeError:  # cusolver.LinAlgError and any backend equivalent both subclass RuntimeError
+            from gpu4pyscf.df.df import LINEAR_DEP_THR
+            w, v = cp.linalg.eigh(j2c)
+            keep = cp.where(w > LINEAR_DEP_THR)[0]
+            dfobj._cd_j2c = v[:, keep] / cp.sqrt(w[keep]), 'eig'
+
+    dm_shape = dm.shape
+    intopt = dfobj.intopt
+    if dm.ndim == 2 or len(dm) == 1:
+        if dfobj.j_engine is None:
+            dfobj.j_engine = j_engine_3c2e.Int3c2eOpt(dfobj.mol, dfobj.auxmol).build()
+        intopt = dfobj.j_engine
+
+    mol = intopt.mol
+    auxmol = intopt.auxmol
+    dm = mol.apply_C_mat_CT(dm)
+    rhoj = intopt.contract_dm(dm, hermi)
+    rhoj = auxmol.apply_CT_dot(rhoj, axis=-1)
+
+    j2c, tag = dfobj._cd_j2c
+    if tag == 'cd':
+        if rhoj.ndim == 1:
+            # 1-d: .T is a no-op, but dpnp deprecates .T on non-2D arrays
+            rhoj = solve_triangular(j2c, rhoj, lower=True)
+            rhoj = solve_triangular(j2c.T, rhoj, lower=False)
+        else:
+            rhoj = solve_triangular(j2c, rhoj.T, lower=True)
+            rhoj = solve_triangular(j2c.T, rhoj, lower=False).T
     else:
-        if vj is not None:
-            vj = vj.get()
-        if vk is not None:
-            vk = vk.get()
-        return vj, vk
+        rhoj = rhoj.dot(j2c).dot(j2c.T)
 
-def get_j(dfobj, dm, hermi=1, direct_scf_tol=1e-13):
-    intopt = getattr(dfobj, 'intopt', None)
-    if intopt is None:
-        dfobj.build(direct_scf_tol=direct_scf_tol)
-        intopt = dfobj.intopt
-    j2c = dfobj.j2c
-    rhoj = int3c2e.get_j_int3c2e_pass1(intopt, dm)
-    if dfobj.cd_low.tag == 'eig':
-        rhoj, _, _, _ = cupy.linalg.lstsq(j2c, rhoj)
-    else:
-        rhoj = cupy.linalg.solve(j2c, rhoj)
-
-    rhoj *= 2.0
-    vj = int3c2e.get_j_int3c2e_pass2(intopt, rhoj)
-    return vj
-
-density_fit = _density_fit
+    rhoj = auxmol.apply_C_dot(rhoj, axis=-1)
+    vj = intopt.contract_auxvec(rhoj)
+    vj = mol.apply_CT_mat_C(vj)
+    return vj.reshape(dm_shape)
 
 def factorize_dm(dm, hermi=0):
     '''
@@ -605,33 +689,37 @@ def factorize_dm(dm, hermi=0):
             Contains orbol * eigenvalues (occupancies).
             When the input dm contains the mo_coeff attribute, orbor is None
     '''
-    if hasattr(dm, 'mo_coeff'):
-        mo_coeff = cp.asarray(dm.mo_coeff)
-        mo_occ = cp.asarray(dm.mo_occ)
-        assert mo_coeff.ndim == mo_occ.ndim + 1
-        if mo_coeff.ndim == 2:
-            mask = mo_occ > 0
-            dm_factor = mo_coeff[:,mask]
-            dm_factor *= cp.sqrt(mo_occ[mask])
-        elif mo_coeff.ndim == 3:
-            mask = (mo_occ > 0).any(axis=0)
-            dm_factor = mo_coeff[:,:,mask]
-            dm_factor *= cp.sqrt(mo_occ[:,None,mask])
-        else:
-            mask = (mo_occ > 0).any(axis=(0, 1))
-            dm_factor = mo_coeff[:,:,:,mask]
-            dm_factor *= cp.sqrt(mo_occ[:,:,None,mask])
-        return dm_factor, None
-    else:
-        shape = dm.shape
-        if len(shape) > 3:
-            dm = dm.reshape(-1, *shape[-2:])
-        l, r = decompose_rdm1_svd(dm, hermi)
-        if len(shape) > 3:
-            shape = shape[:-2] + l.shape[-2:]
-            l = l.reshape(shape)
-            r = r.reshape(shape)
-        return l, r
+    if isinstance(dm, CPArrayWithTag):
+        if hasattr(dm, 'mo_coeff'):
+            mo_coeff = cp.asarray(dm.mo_coeff)
+            mo_occ = cp.asarray(dm.mo_occ)
+            assert mo_coeff.ndim == mo_occ.ndim + 1
+            if mo_coeff.ndim == 2:
+                mask = mo_occ > 0
+                dm_factor = mo_coeff[:,mask]
+                dm_factor *= cp.sqrt(mo_occ[mask])
+            elif mo_coeff.ndim == 3:
+                mask = (mo_occ > 0).any(axis=0)
+                dm_factor = mo_coeff[:,:,mask]
+                dm_factor *= cp.sqrt(mo_occ[:,None,mask])
+            else:
+                mask = (mo_occ > 0).any(axis=(0, 1))
+                dm_factor = mo_coeff[:,:,:,mask]
+                dm_factor *= cp.sqrt(mo_occ[:,:,None,mask])
+            return dm_factor, None
+        if hasattr(dm, 'factor_l'):
+            return dm.factor_l, dm.factor_r
+
+    dm = cp.asarray(dm)
+    shape = dm.shape
+    if len(shape) > 3:
+        dm = dm.reshape(-1, *shape[-2:])
+    l, r = decompose_rdm1_svd(dm, hermi)
+    if len(shape) > 3:
+        shape = shape[:-2] + l.shape[-2:]
+        l = l.reshape(shape)
+        r = r.reshape(shape)
+    return l, r
 
 def decompose_rdm1_svd(dm, hermi=0):
     '''Decompose density matrix as U.Vh using SVD
@@ -647,20 +735,71 @@ def decompose_rdm1_svd(dm, hermi=0):
             Contains orbol * eigenvalues (occupancies)
     '''
     if hermi == 1:
-        s, u = cp.linalg.eigh(cp.asarray(dm))
+        s, u = cp.linalg.eigh(dm)
         mask = abs(s) > 1e-8
         if dm.ndim == 2:
             c = u[:,mask]
-            return c, contract('i,pi->pi', s[mask], c)
+            return c, contract('i,pi->pi', s[mask], c).conj()
         else:
             mask = mask.any(axis=0)
             c = u[:,:,mask]
-            return c, contract('si,spi->spi', s[:,mask], c)
+            return c, contract('si,spi->spi', s[:,mask], c).conj()
 
-    u, s, vh = cp.linalg.svd(cp.asarray(dm))
+    u, s, vh = cp.linalg.svd(dm)
     mask = s > 1e-8
     if dm.ndim == 2:
+        mask = cp.where(mask)[0]
         return u[:,mask], contract('i,ip->pi', s[mask], vh[mask])
     else:
-        mask = mask.any(axis=0)
+        mask = cp.where(mask.any(axis=0))[0]
         return u[:,:,mask], contract('si,sip->spi', s[:,mask], vh[:,mask])
+
+def _make_factorized_dm(factor_l, factor_r, symmetrize=1):
+    '''Build A = factor_l @ factor_r.T and retain its factors for DF exchange.
+
+    symmetrize=1 returns A + A.conj().T, 2 returns A - A.conj().T,
+    and 0 returns A. Conjugation of factor_r must be supplied by the caller.
+    '''
+    if factor_l.ndim == 4 and factor_r.ndim == 3:
+        dm = contract('snpi,sqi->snpq', factor_l, factor_r)
+    else:
+        dm = cp.matmul(factor_l, factor_r.swapaxes(-1, -2))
+    if symmetrize == 1 or symmetrize == 2:
+        nao = dm.shape[-1] # dm1 may have dimensions > 3
+        transpose_sum(dm.reshape(-1,nao,nao), inplace=True, hermi=symmetrize)
+    return tag_array(dm, factor_l=factor_l, factor_r=factor_r, symmetrize=symmetrize)
+
+def _tag_factorize_dm(dm, hermi=0):
+    if hasattr(dm, 'symmetrize'):
+        # This dm should be created by the _make_factorized_dm
+        return dm
+    l, r = factorize_dm(dm, hermi)
+    return tag_array(dm, factor_l=l, factor_r=r, symmetrize=0)
+
+def _transpose_dm(dm):
+    dm_T = dm.T
+    if hasattr(dm, 'symmetrize'):
+        dm_T.factor_l = dm.factor_r
+        dm_T.factor_r = dm.factor_l
+        dm_T.symmetrize = dm.symmetrize
+    else:
+        dm_T = dm_T.view(cp.ndarray)
+    return dm_T
+
+def _aggregate_dm_factor_l(dms):
+    factor_l = cp.stack([x.factor_l for x in dms])
+    factor_r = dms[0].factor_r
+    assert all(x.symmetrize == 0 for x in dms)
+    return tag_array(cp.stack(dms), factor_l=factor_l, factor_r=factor_r,
+                     symmetrize=0)
+
+def _stack_uhf_occ_oribtals(moa, mob):
+    nocca = moa.shape[-1]
+    noccb = mob.shape[-1]
+    assert nocca >= noccb
+    mo_ab = cp.empty((2,) + moa.shape, dtype=moa.dtype)
+    mo_ab[0] = moa
+    mo_ab[1,...,:noccb] = mob
+    if nocca > noccb:
+        mo_ab[1,...,noccb:] = 0.
+    return mo_ab

@@ -12,27 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
+import functools
 import numpy as np
+import scipy.linalg
 import cupy
 import h5py
-import itertools
-from functools import reduce
 from pyscf import gto
 from pyscf import lib as pyscf_lib
+from pyscf.data.nist import HARTREE2EV
 from pyscf.scf import hf as hf_cpu
 from pyscf.scf import chkfile
+from pyscf.lib import StreamObject
 from gpu4pyscf.gto.ecp import get_ecp
 from gpu4pyscf import lib
 from gpu4pyscf.lib import utils
+from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import (
     eigh, tag_array, return_cupy_array, cond, asarray, get_avail_mem,
-    block_diag, sandwich_dot)
+    block_diag, sandwich_dot, stack_with_padding)
 from gpu4pyscf.scf import diis, jk, j_engine
+from . import dispersion
 from gpu4pyscf.scf.smearing import smearing
-from gpu4pyscf.lib import logger
 from gpu4pyscf import __config__
 
-remove_overlap_zero_eigenvalue = getattr(__config__, 'scf_hf_remove_overlap_zero_eigenvalue', False)
+WITH_META_LOWDIN = getattr(__config__, 'scf_analyze_with_meta_lowdin', True)
+
+remove_overlap_zero_eigenvalue = getattr(__config__, 'scf_hf_remove_overlap_zero_eigenvalue', True)
 overlap_zero_eigenvalue_threshold = getattr(__config__, 'scf_hf_overlap_zero_eigenvalue_threshold', 1e-6)
 
 __all__ = [
@@ -40,27 +46,15 @@ __all__ = [
     'energy_elec', 'RHF', 'SCF'
 ]
 
-def get_jk(mol, dm, hermi=1, vhfopt=None, with_j=True, with_k=True, omega=None,
-           verbose=None):
-    '''Compute J, K matrices with CPU-GPU hybrid algorithm
-    '''
+@pyscf_lib.with_doc(jk.get_jk.__doc__)
+def get_jk(mol, dm, hermi=1, vhfopt=None, with_j=True, with_k=True,
+           omega=None, lr_factor=None, sr_factor=None, verbose=None):
     with mol.with_range_coulomb(omega):
-        vj, vk = jk.get_jk(mol, dm, hermi, vhfopt, with_j, with_k, verbose)
+        vj, vk = jk.get_jk(mol, dm, hermi, vhfopt, with_j, with_k, omega,
+                           lr_factor, sr_factor, verbose)
     if not isinstance(dm, cupy.ndarray):
         if with_j: vj = vj.get()
         if with_k: vk = vk.get()
-    return vj, vk
-
-def _get_jk(mf, mol, dm=None, hermi=1, with_j=True, with_k=True, omega=None):
-    if omega is None:
-        omega = mol.omega
-    vhfopt = mf._opt_gpu.get(omega)
-    if vhfopt is None:
-        with mol.with_range_coulomb(omega):
-            vhfopt = mf._opt_gpu[omega] = jk._VHFOpt(
-                mol, mf.direct_scf_tol, tile=1).build()
-
-    vj, vk = get_jk(mol, dm, hermi, vhfopt, with_j, with_k, omega)
     return vj, vk
 
 def make_rdm1(mo_coeff, mo_occ):
@@ -74,47 +68,73 @@ def make_rdm1(mo_coeff, mo_occ):
 
 def get_occ(mf, mo_energy=None, mo_coeff=None):
     if mo_energy is None: mo_energy = mf.mo_energy
+    mo_energy = cupy.asarray(mo_energy)
     e_idx = cupy.argsort(mo_energy)
     nmo = mo_energy.size
     mo_occ = cupy.zeros(nmo)
     nocc = mf.mol.nelectron // 2
-    if nocc > nmo:
-        raise RuntimeError('Failed to assign occupancies. '
-                           f'Nocc ({nocc}) > Nmo ({nmo})')
+
+    if nocc < nmo:
+        homo, lumo = mo_energy[e_idx[nocc-1:nocc+1]].get()
+        gap = (lumo - homo) * HARTREE2EV
+        mf.scf_summary['gap'] = gap
+        if mf.verbose >= logger.INFO:
+            if homo+1e-3 > lumo:
+                logger.warn(mf, 'HOMO %.15g == LUMO %.15g', homo, lumo)
+            else:
+                logger.info(mf, '  HOMO = %.15g  LUMO = %.15g  gap/eV = %.5f',
+                            homo, lumo, gap)
+    elif nocc > nmo:
+        raise RuntimeError(f'Failed to assign mo_occ. Nocc ({nocc}) > Nmo ({nmo})')
     mo_occ[e_idx[:nocc]] = 2
-    if mf.verbose >= logger.INFO and nocc < nmo:
-        homo = float(mo_energy[e_idx[nocc-1]])
-        lumo = float(mo_energy[e_idx[nocc]])
-        if homo+1e-3 > lumo:
-            logger.warn(mf, 'HOMO %.15g == LUMO %.15g', homo, lumo)
-        else:
-            logger.info(mf, '  HOMO = %.15g  LUMO = %.15g', homo, lumo)
     return mo_occ
 
 def get_veff(mf, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
+    if mol is None: mol = mf.mol
     if dm is None: dm = mf.make_rdm1()
+    ddm = cupy.asarray(dm)
     if dm_last is not None and mf.direct_scf:
-        dm = asarray(dm) - asarray(dm_last)
-    vj = mf.get_j(mol, dm, hermi)
-    vhf = mf.get_k(mol, dm, hermi)
+        assert vhf_last is not None
+        dm_last = cupy.asarray(dm_last)
+        ddm = ddm - dm_last
+    else:
+        dm_last = None
+    vj = mf.get_j(mol, ddm, hermi)
+    ecoul = _trace_ecoul(vj, ddm, dm_last, vhf_last)
+    vhf = mf.get_k(mol, ddm, hermi)
     vhf *= -.5
     vhf += vj
-    if vhf_last is not None:
-        vhf += asarray(vhf_last)
+    if dm_last is not None:
+        vhf += cupy.asarray(vhf_last)
+    if ecoul is not None:
+        vhf = tag_array(vhf, ecoul=ecoul)
     return vhf
+
+def _trace_ecoul(vj, ddm, dm_last=None, vhf_last=None):
+    ecoul = None
+    if dm_last is not None:
+        if hasattr(vhf_last, 'ecoul') and ddm.ndim == 2:
+            # Ecoul = 1/2 (dm_last+ddm)*J[dm_last+ddm]
+            # = 1/2 (dm_last*J[dm_last] + 2 dm_last*J[ddm] + ddm*J[ddm])
+            # = Ecoul_last + dm_last*J[ddm] + 1/2 ddm*J[ddm]
+            ecoul = float(cupy.einsum('ij,ji->', dm_last, vj).real.get())
+            ecoul += float(cupy.einsum('ij,ji->', ddm, vj).real.get()) * .5
+            ecoul += vhf_last.ecoul
+    elif ddm.ndim == 2:
+        ecoul = float(cupy.einsum('ij,ji->', ddm, vj).real.get()) * .5
+    return ecoul
 
 def get_grad(mo_coeff, mo_occ, fock_ao):
     occidx = mo_occ > 0
     viridx = ~occidx
-    g = reduce(cupy.dot, (mo_coeff[:,viridx].conj().T, fock_ao,
-                           mo_coeff[:,occidx])) * 2
+    g = mo_coeff[:,viridx].conj().T.dot(fock_ao.dot(mo_coeff[:,occidx])) * 2
     return g.ravel()
 
 def damping(f, f_prev, factor):
     return f*(1-factor) + f_prev*factor
 
 def level_shift(s, d, f, factor):
-    dm_vir = s - reduce(cupy.dot, (s, d, s))
+    dm_vir = s - s.dot(d).dot(s)
     return f + dm_vir * factor
 
 def get_hcore(mol):
@@ -126,10 +146,12 @@ def get_hcore(mol):
         h = asarray(pp_int.get_gth_pp(mol))
     else:
         assert not mol.nucmod
-        from gpu4pyscf.df.int3c2e_bdiv import contract_int3c2e_auxvec
+        #from gpu4pyscf.df.int3c2e_bdiv import contract_int3c2e_auxvec
+        from gpu4pyscf.df.j_engine_3c2e import contract_int3c2e_auxvec
         nucmol = gto.mole.fakemol_for_charges(mol.atom_coords())
+        Z = cupy.asarray(mol.atom_charges(), dtype=np.float64)
         #:h = mol.intor_symmetric('int1e_nuc')
-        h = contract_int3c2e_auxvec(mol, nucmol, -mol.atom_charges())
+        h = contract_int3c2e_auxvec(mol, nucmol, -Z)
     h += int1e_kin(mol)
     if len(mol._ecpbas) > 0:
         h += get_ecp(mol)
@@ -165,21 +187,24 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
         f = level_shift(s1e, dm*.5, f, level_shift_factor)
     return f
 
-def energy_elec(self, dm=None, h1e=None, vhf=None):
+def energy_elec(mf, dm=None, h1e=None, vhf=None):
     '''
     electronic energy
     '''
-    if dm is None: dm = self.make_rdm1()
-    if h1e is None: h1e = self.get_hcore()
-    if vhf is None: vhf = self.get_veff(self.mol, dm)
-    e1 = cupy.einsum('ij,ji->', h1e, dm).real
-    e_coul = cupy.einsum('ij,ji->', vhf, dm).real * .5
-    e1 = float(e1.get())
-    e_coul = float(e_coul.get())
-    self.scf_summary['e1'] = e1
-    self.scf_summary['e2'] = e_coul
-    logger.debug(self, 'E1 = %s  E_coul = %s', e1, e_coul)
-    return e1+e_coul, e_coul
+    if dm is None: dm = mf.make_rdm1()
+    if h1e is None: h1e = mf.get_hcore()
+    if vhf is None or getattr(vhf, 'ecoul', None) is None:
+        vhf = mf.get_veff(mf.mol, dm)
+    e1 = cupy.einsum('ij,ji->', h1e, dm).real.item()
+    e2 = cupy.einsum('ij,ji->', vhf, dm).real.item() * .5
+    ecoul = vhf.ecoul.real
+    exx = e2 - ecoul
+    mf.scf_summary['e1'] = e1
+    mf.scf_summary['e2'] = e2
+    mf.scf_summary['coul'] = ecoul
+    mf.scf_summary['exc'] = exx
+    logger.debug(mf, 'E1 = %s  E2 = %s  Ecoul = %s  Exc = %s', e1, e2, ecoul, exx)
+    return e1+e2, e2
 
 def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
            dump_chk=True, dm0=None, callback=None, conv_check=True, **kwargs):
@@ -197,29 +222,34 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         t1 = log.timer_debug1('generating initial guess', *t1)
 
     if hasattr(dm0, 'mo_coeff') and hasattr(dm0, 'mo_occ'):
-        if dm0.ndim == 2:
-            mo_coeff = cupy.asarray(dm0.mo_coeff[:,dm0.mo_occ>0])
-            mo_occ = cupy.asarray(dm0.mo_occ[dm0.mo_occ>0])
-            dm0 = tag_array(dm0, mo_occ=mo_occ, mo_coeff=mo_coeff)
-        else:
-            # Drop attributes like mo_coeff, mo_occ for UHF and other methods.
-            dm0 = asarray(dm0, order='C')
+        mo_coeff = cupy.asarray(dm0.mo_coeff)
+        mo_occ = cupy.asarray(dm0.mo_occ)
+        dm0 = cupy.asarray(dm0, order='C')
+        dm0 = tag_array(dm0, mo_occ=mo_occ, mo_coeff=mo_coeff)
+    else:
+        dm0 = cupy.asarray(dm0, order='C')
 
-    h1e = cupy.asarray(mf.get_hcore(mol))
-    s1e = cupy.asarray(mf.get_ovlp(mol))
-    t1 = log.timer_debug1('hcore', *t1)
+    assert isinstance(dm0, cupy.ndarray)
 
-    dm, dm0 = asarray(dm0, order='C'), None
+    dm, dm0 = dm0, None
+    # Call get_veff before get_hcore. In PBC, the initialization for
+    # two-electron integrals can be reused by get_hcore, avoiding redundant
+    # initialization.
     vhf = mf.get_veff(mol, dm)
+
+    h1e = cupy.asarray(mf.get_hcore())
+    s1e = cupy.asarray(mf.get_ovlp())
+
     e_tot = mf.energy_tot(dm, h1e, vhf)
     log.info('init E= %.15g', e_tot)
+    x_orth = mf.check_linear_dependency(s1e, log)
     t1 = log.timer('SCF initialization', *t0)
     scf_conv = False
 
     # Skip SCF iterations. Compute only the total energy of the initial density
     if mf.max_cycle <= 0:
         fock = mf.get_fock(h1e, s1e, vhf, dm)  # = h1e + vhf, no DIIS
-        mo_energy, mo_coeff = mf.eig(fock, s1e, overwrite=True)
+        mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         return scf_conv, e_tot, mo_energy, mo_coeff, mo_occ
 
@@ -231,16 +261,10 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         mf_diis.space = mf.diis_space
         mf_diis.rollback = mf.diis_space_rollback
         # CDIIS just require a C that's orthonormal (C.T@S@C==I), and X satisfies that.
-        if hasattr(mf, 'overlap_canonical_decomposed_x') and mf.overlap_canonical_decomposed_x is not None:
-            if type(mf.overlap_canonical_decomposed_x) is list: # k point
-                nkpts = len(mf.overlap_canonical_decomposed_x)
-                mf_diis.Corth = cupy.zeros([nkpts, mol.nao, mol.nao], dtype = cupy.complex128)
-                for k in range(nkpts):
-                    xk = mf.overlap_canonical_decomposed_x[k]
-                    _, nmo_k = xk.shape
-                    mf_diis.Corth[k, :, :nmo_k] = xk
-            else:
-                mf_diis.Corth = cupy.asarray(mf.overlap_canonical_decomposed_x)
+        if isinstance(x_orth, list): # k point
+            mf_diis.Corth = stack_with_padding(x_orth)
+        else:
+            mf_diis.Corth = cupy.asarray(x_orth)
     else:
         mf_diis = None
 
@@ -260,7 +284,7 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
 
         fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis, fock_last=fock_last)
         t1 = log.timer_debug1('DIIS', *t0)
-        mo_energy, mo_coeff = mf.eig(fock, s1e)
+        mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
         if mf.damp is not None:
             fock_last = fock
         fock = None
@@ -282,39 +306,53 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         log.info('cycle= %d E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
                  cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
 
+        if callable(mf.check_convergence):
+            scf_conv = mf.check_convergence(locals())
+        elif abs(e_tot-last_hf_e) < conv_tol and norm_gorb < conv_tol_grad:
+            scf_conv = True
+
         if dump_chk:
-            mf.dump_chk(locals())
+            mf.dump_chk({
+                'mol': mol,
+                'mo_energy': mo_energy,
+                'mo_occ': mo_occ,
+                'mo_coeff': mo_coeff,
+                'e_tot': e_tot,
+            })
 
         if callable(callback):
             callback(locals())
 
-        e_diff = abs(e_tot-last_hf_e)
-        if(e_diff < conv_tol and norm_gorb < conv_tol_grad):
-            scf_conv = True
+        if scf_conv:
             break
     else:
         log.warn("SCF failed to converge")
 
     mf.cycles = cycle + 1
     if scf_conv and mf.level_shift is not None:
+        mo_coeff = mo_occ = mo_energy = mf_diis = None
         # An extra diagonalization, to remove level shift
-        mo_energy, mo_coeff = mf.eig(fock, s1e)
+        mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
+        fock = None
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot, last_hf_e = mf.energy_tot(dm, h1e, vhf), e_tot
 
-        fock = mf.get_fock(h1e, s1e, vhf, dm)
+        fock = mf.get_fock(h1e, s1e, vhf, dm, level_shift_factor=0)
         norm_gorb = cupy.linalg.norm(mf.get_grad(mo_coeff, mo_occ, fock))
         norm_ddm = cupy.linalg.norm(dm-dm_last)
 
         conv_tol = conv_tol * 10
         conv_tol_grad = conv_tol_grad * 3
-        if abs(e_tot-last_hf_e) < conv_tol or norm_gorb < conv_tol_grad:
+        if callable(mf.check_convergence):
+            scf_conv = mf.check_convergence(locals())
+        elif abs(e_tot-last_hf_e) < conv_tol or norm_gorb < conv_tol_grad:
             scf_conv = True
         else:
-            log.warn("Level-shifted SCF extra cycle failed to converge")
             scf_conv = False
+        if not scf_conv:
+            log.warn("Level-shifted SCF extra cycle failed to converge")
         logger.info(mf, 'Extra cycle  E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
                     e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
         if dump_chk:
@@ -393,7 +431,7 @@ def canonicalize(mf, mo_coeff, mo_occ, fock=None):
             mo_e[idx] = e
     return mo_e, mo
 
-def init_guess_by_minao(mol):
+def init_guess_by_minao(mol, high_spin=False):
     '''Generate initial guess density matrix based on ANO basis, then project
     the density matrix to the basis set defined by ``mol``
 
@@ -401,11 +439,155 @@ def init_guess_by_minao(mol):
     This function returns block diagonal density matrix associated with each atom.
     While the function in PySCF projects the density matrix into the full space of atomic basis
 
+    Args:
+        high_spin : bool
+            Split the atomic RHF occupations into aligned high-spin channels.
+
     Returns:
-        Density matrix, 2D ndarray
+        Density matrix, a tagged CuPy array, shape (nao, nao), or (2, nao, nao) if high_spin.
     '''
+    atm_conf = _atomic_minao_configs(mol)
+    spin_signs = None
+    if high_spin:
+        spin_signs = [1] * mol.natm
+    return _build_sad_dm(mol, atm_conf, spin_signs)
+
+def _infer_afm_cluster_spin_signs(mol, threshold=5., mag_elements=None):
+    """Infer atomic spin signs for nearest-neighbor AFM clusters.
+
+    Only elements in the B and N columns, and the 3d, 4d and 5d
+    transition-metals are considered. Other atoms remain zero.
+
+    Returns a list of -1, 0 or 1 in molecular atom order.
+    """
+    spin_signs = [0] * mol.natm
+    coords = mol.atom_coords()
+    dist = np.linalg.norm(coords[:,None] - coords, axis=2)
+    Z = [gto.charge(a[0]) for a in mol._atom]
+    if mag_elements is None:
+        mag_elements = [
+            5, 13, 31, 49, 81,  # B column
+            7, 15, 33, 51, 83,  # N column
+            21, 22, 23, 24, 25, 26, 27, 28, 29, 30,  # 3d
+            39, 40, 41, 42, 43, 44, 45, 46, 47, 48,  # 4d
+            71, 72, 73, 74, 75, 76, 77, 78, 79, 80]  # 5d
+
+    remaining = np.where(np.isin(Z, mag_elements))[0].tolist()
+    while remaining:
+        current = remaining.pop(0)
+        spin_signs[current] = 1
+        while remaining:
+            nearest = int(np.argmin(dist[current, remaining]))
+            ia = remaining[nearest]
+            if dist[current, ia] >= threshold:
+                break
+            spin_signs[ia] = -spin_signs[current]
+            current = remaining.pop(nearest)
+
+    if sum(spin_signs) < 0:
+        spin_signs = [-x for x in spin_signs]
+    return spin_signs
+
+def _infer_fm_cluster_spin_signs(mol, threshold=5., mag_elements=None):
+    """Infer atomic spin signs for nearest-neighbor FM clusters.
+
+    Only elements in the B and N columns, and the 3d, 4d and 5d
+    transition-metals are considered. Other atoms remain zero.
+
+    Returns a list of -1, 0 or 1 in molecular atom order.
+    """
+    spin_signs = [0] * mol.natm
+    coords = mol.atom_coords()
+    dist = np.linalg.norm(coords[:,None] - coords, axis=2)
+    Z = [gto.charge(a[0]) for a in mol._atom]
+    if mag_elements is None:
+        mag_elements = [
+            5, 13, 31, 49, 81,  # B column
+            7, 15, 33, 51, 83,  # N column
+            21, 22, 23, 24, 25, 26, 27, 28, 29, 30,  # 3d
+            39, 40, 41, 42, 43, 44, 45, 46, 47, 48,  # 4d
+            71, 72, 73, 74, 75, 76, 77, 78, 79, 80]  # 5d
+
+    remaining = np.where(np.isin(Z, mag_elements))[0].tolist()
+    spin_sign = 1
+    while remaining:
+        current = remaining.pop(0)
+        spin_signs[current] = spin_sign
+        while remaining:
+            nearest = int(np.argmin(dist[current, remaining]))
+            ia = remaining[nearest]
+            if dist[current, ia] >= threshold:
+                break
+            spin_signs[ia] = spin_sign
+            current = remaining.pop(nearest)
+        spin_sign = -spin_sign
+
+    if sum(spin_signs) < 0:
+        spin_signs = [-x for x in spin_signs]
+    return spin_signs
+
+def _build_sad_dm(mol, atm_conf, spin_signs=None):
+    """Build a superposition-of-atomic-densities (SAD) initial guess.
+
+    Args:
+        mol :
+            Mole or Cell instance
+        atm_conf : dict
+            Maps atom symbols to spin-summed (occ, c, dm)
+        spin_signs : sequence or None
+            One spin sign per atom: 1 for alpha-aligned high spin,
+            -1 for beta-aligned high spin, or 0 for equal spin populations.
+            None assembles a spin-summed density without splitting occupations.
+
+    Returns:
+        A tagged density matrix with atom-diagonal blocks.
+    """
+    if spin_signs is not None:
+        assert len(spin_signs) == mol.natm
+
+    atm_dms = []
+    for ia in range(mol.natm):
+        element = mol.atom_symbol(ia)
+        if spin_signs is None:
+            atm_dms.append(atm_conf[element])
+            continue
+
+        occ, c, dm = atm_conf[element]
+        if spin_signs[ia] == 0:
+            occ_a = occ_b = occ * .5
+            dm_a = dm_b = dm * .5
+        else:
+            occ_a = cupy.minimum(occ, 1.)
+            occ_b = occ - occ_a
+            dm_a = (c * occ_a).dot(c.conj().T)
+            dm_b = dm - dm_a
+            if spin_signs[ia] == -1:
+                occ_a, occ_b = occ_b, occ_a
+                dm_a, dm_b = dm_b, dm_a
+        atm_dms.append(((occ_a, occ_b), (c, c), (dm_a, dm_b)))
+
+    if spin_signs is None: # spin-summed dm
+        dm = block_diag([d for _, _, d in atm_dms])
+        mo_coeff = block_diag([c for _, c, _ in atm_dms])
+        mo_occ = cupy.hstack([o for o, _, _ in atm_dms])
+    else:
+        dm_a = block_diag([d[0] for _, _, d in atm_dms])
+        dm_b = block_diag([d[1] for _, _, d in atm_dms])
+        mo_a = block_diag([c[0] for _, c, _ in atm_dms])
+        mo_b = block_diag([c[1] for _, c, _ in atm_dms])
+        occ_a = cupy.hstack([o[0] for o, _, _ in atm_dms])
+        occ_b = cupy.hstack([o[1] for o, _, _ in atm_dms])
+        dm = cupy.stack([dm_a, dm_b])
+        mo_coeff = cupy.stack([mo_a, mo_b])
+        mo_occ = cupy.stack([occ_a, occ_b])
+    return tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
+
+def _atomic_minao_configs(mol, max_z=96):
+    """Return unique atom-symbol -> (occ, c, dm) MINAO configurations on the GPU.
+
+    Atoms with nuclear charge above max_z are handled using atomic HF.
+    """
     from pyscf.scf import atom_hf
-    from pyscf.scf import addons
 
     def minao_basis(symb, nelec_ecp):
         occ = []
@@ -480,66 +662,389 @@ def init_guess_by_minao(mol):
                              'will be used as initial guess for %s', symb)
         return occ, basis_ano
 
-    # Issue 548
-    if any(gto.charge(mol.atom_symbol(ia)) > 96 for ia in range(mol.natm)):
-        from pyscf.scf.hf import init_guess_by_atom
-        logger.info(mol, 'MINAO initial guess is not available for super-heavy '
-                    'elements. "atom" initial guess is used.')
-        return init_guess_by_atom(mol)
-
-    nelec_ecp_dic = {mol.atom_symbol(ia): mol.atom_nelec_core(ia)
-                          for ia in range(mol.natm)}
-
-    basis = {}
-    occdic = {}
-    for symb, nelec_ecp in nelec_ecp_dic.items():
-        occ_add, basis_add = minao_basis(symb, nelec_ecp)
-        occdic[symb] = occ_add
-        basis[symb] = basis_add
-
     mol1 = gto.Mole()
     mol1._built = True
     mol2 = mol.copy()
 
     aoslice = mol.aoslice_by_atom()
-    nao = aoslice[-1,3]
-    dm = cupy.zeros((nao, nao))
     # Preallocate a buffer in cupy memory pool for small arrays held in atm_conf
     workspace = cupy.empty(50**2*12)
     workspace = None # noqa: F841
+
     atm_conf = {}
-    mo_coeff = []
-    mo_occ = []
+    heavy_atoms = [i for i, a in enumerate(mol._atom) if gto.charge(a[0]) > max_z]
+    if heavy_atoms:
+        logger.debug(mol, 'MINAO initial guess is not available for %s. '
+                     'Using atomic HF instead.', heavy_atoms)
+        fake_mol = mol.copy()
+        fake_mol.atom = [mol._atom[ia] for ia in heavy_atoms]
+        fake_mol.unit = 'Bohr'
+        fake_mol.spin = None
+        fake_mol.build(False, False)
+        atm_conf = _atomic_hf_configs(fake_mol)
+
     for ia, (p0, p1) in enumerate(aoslice[:,2:]):
         symb = mol.atom_symbol(ia)
-        if gto.is_ghost_atom(symb):
+        if symb in atm_conf:
+            continue
+        if gto.is_ghost_atom(symb) or p0 == p1:
             n = p1 - p0
-            mo_coeff.append(cupy.zeros((n, 0)))
-            mo_occ.append(cupy.zeros(0))
+            atm_conf[symb] = (cupy.zeros(0), cupy.zeros((n, 0)),
+                             cupy.zeros((n, n)))
             continue
 
-        if symb not in atm_conf:
-            nelec_ecp = mol.atom_nelec_core(ia)
-            occ, basis = minao_basis(symb, nelec_ecp)
-            mol1._atm, mol1._bas, mol1._env = mol1.make_env(
-                [mol._atom[ia]], {symb: basis}, [])
-            i0, i1 = aoslice[ia,:2]
-            mol2._bas = mol._bas[i0:i1]
-            s22 = mol2.intor_symmetric('int1e_ovlp')
-            s21 = gto.mole.intor_cross('int1e_ovlp', mol2, mol1)
-            c = pyscf_lib.cho_solve(s22, s21, strict_sym_pos=False)
-            c = cupy.asarray(c[:,occ>0], order='C')
-            occ = cupy.asarray(occ[occ>0], order='C')
-            atm_conf[symb] = occ, c
+        i0, i1 = aoslice[ia,:2]
+        nelec_ecp = mol.atom_nelec_core(ia)
+        occ, basis = minao_basis(symb, nelec_ecp)
+        mol1._atm, mol1._bas, mol1._env = mol1.make_env(
+            [mol._atom[ia]], {symb: basis}, [])
+        mol2._bas = mol._bas[i0:i1]
+        s22 = mol2.intor_symmetric('int1e_ovlp')
+        s21 = gto.mole.intor_cross('int1e_ovlp', mol2, mol1)
+        c = pyscf_lib.cho_solve(s22, s21, strict_sym_pos=False)
+        c = cupy.asarray(c[:,occ>0], order='C')
+        occ = cupy.asarray(occ[occ>0], order='C')
+        atm_conf[symb] = occ, c, (c*occ).dot(c.conj().T)
 
-        occ, c = atm_conf[symb]
-        dm[p0:p1,p0:p1] = (c*occ).dot(c.conj().T)
-        mo_coeff.append(c)
-        mo_occ.append(occ)
+    return atm_conf
 
-    mo_coeff = block_diag(mo_coeff)
-    mo_occ = cupy.hstack(mo_occ)
-    return tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
+def init_guess_by_atom(mol, high_spin=False):
+    '''Generate initial guess density matrix from superposition of atomic HF
+    density matrices. By default, use occupation-averaged atomic RHF.
+
+    Args:
+        high_spin : bool
+            Use high-spin ground-state atomic configurations for each atom.
+
+    Returns:
+        Density matrix, a tagged CuPy array, shape (nao, nao), or (2, nao, nao) if high_spin.
+    '''
+    atm_conf = _atomic_hf_configs(mol, high_spin=high_spin)
+    spin_signs = None
+    if high_spin:
+        spin_signs = [1] * mol.natm
+    return _build_sad_dm(mol, atm_conf, spin_signs)
+
+def _atomic_hf_configs(mol, high_spin=False):
+    """Return unique atom-symbol -> (occ, c, dm) atomic HF configurations on the GPU.
+
+    high_spin selects the atomic ground-state configuration. Occupations and
+    densities are spin-summed; spin splitting is performed during assembly.
+    """
+    from pyscf.scf import atom_hf
+    from pyscf.data import elements
+
+    configuration = (elements.CONFIGURATION if high_spin else
+                     elements.NRSRHF_CONFIGURATION)
+
+    atm_scf = atom_hf.get_atm_nrhf(mol, configuration)
+    aoslice = mol.aoslice_by_atom()
+    if mol.cart:
+        c2s_l = {l: gto.cart2sph(l, normalized='sp')
+                 for l in set(mol._bas[:,gto.ANG_OF])}
+
+    atm_conf = {}
+    for ia in range(mol.natm):
+        symb = key = mol.atom_symbol(ia)
+        if key in atm_conf:
+            continue
+        if symb not in atm_scf:
+            symb = mol.atom_pure_symbol(ia)
+        if symb in atm_scf:
+            e_hf, e, c, occ = atm_scf[symb]
+            c = asarray(c[:,occ>0])
+            occ = asarray(occ[occ>0])
+            if mol.cart:
+                b0, b1 = aoslice[ia,:2]
+                c2s = [c2s_l[mol.bas_angular(ib)]
+                       for ib in range(b0, b1) for _ in range(mol.bas_nctr(ib))]
+                c2s = asarray(scipy.linalg.block_diag(*c2s))
+                c = c2s.dot(c)
+        else:  # symb's basis is not specified in the input
+            nao_atm = aoslice[ia,3] - aoslice[ia,2]
+            c = cupy.zeros((nao_atm, 0))
+            occ = cupy.zeros(0)
+        atm_conf[key] = occ, c, (c*occ).dot(c.conj().T)
+
+    return atm_conf
+
+def _init_guess_by_qchem_sad(mol, mf_template, uhf_for_atom=False, high_spin=True):
+    '''
+        Generate initial guess density matrix from superposition of atomic density matrix.
+
+        If uhf_for_atom is True, use atomic UHF calculations in vacuum.
+        Otherwise, use the unrestricted version of mf_template's method.
+        The basis, ECP, and auxiliary basis (if applicable) are preserved.
+
+        If high_spin is True, retain aligned atomic spins in unrestricted
+        guesses. Otherwise, average the alpha and beta densities. Closed-shell
+        restricted guesses always use the spin-summed density.
+
+        The Q-Chem-style presets combine these independent options: AUTOSAD
+        uses the molecular method for the atomic calculations and retains
+        aligned spins (uhf_for_atom=False, high_spin=True). SAD uses atomic
+        UHF calculations and spin-averaged densities (uhf_for_atom=True,
+        high_spin=False).
+    '''
+    from pyscf.data.elements import NEUTRAL_ATOM_SPIN
+    from pyscf.data.elements import charge as charge_of_element
+    from gpu4pyscf.scf.uhf import UHF
+    from gpu4pyscf.scf.rohf import ROHF
+    from gpu4pyscf.dft.rks import RKS
+    from gpu4pyscf.dft.uks import UKS
+    assert isinstance(mf_template, RHF) or isinstance(mf_template, UHF) # GHF not supported
+
+    elements = [mol.atom_symbol(ia) for ia in range(mol.natm)]
+    unique_elements = list(dict.fromkeys(elements))
+
+    mf_per_element = {}
+    for element in unique_elements:
+        Z = charge_of_element(element)
+        if Z == 0: # Ghost atom
+            mf_per_element[element] = None
+            continue
+        assert 0 < Z <= len(NEUTRAL_ATOM_SPIN)
+        spin = NEUTRAL_ATOM_SPIN[Z - 1]
+        assert spin >= 0 # So extra electron is always put in alpha orbitals, and we can guarantee high spin configuration
+        charge = 0 # Only support neutral atoms for now
+
+        mol_atom = mol.copy()
+        mol_atom.atom = f"{element} 0 0 0"
+        mol_atom.charge = charge
+        mol_atom.spin = spin
+        # Temporary workaround for a PySCF Mole.build bug: rebuilding a copied
+        # molecule as an atom without an ECP leaves the old _ecpbas table intact.
+        # Its pointers refer to the previous _env and can cause invalid integral
+        # reads. Clear it here until the fix is available in supported PySCF versions.
+        mol_atom._ecpbas = np.zeros((0, gto.BAS_SLOTS), dtype=np.int32)
+        mol_atom.magmom = []
+        mol_atom.build(False, False)
+
+        mf_atom = mf_template.copy()
+        mf_atom.init_guess = 'minao'
+        for key, attr in mf_template.__dict__.items():
+            if isinstance(attr, StreamObject):
+                setattr(mf_atom, key, attr.copy())
+
+        if isinstance(mf_template, RKS):
+            mf_atom = mf_atom.to_uks()
+        elif isinstance(mf_template, RHF):
+            mf_atom = mf_atom.to_uhf()
+        assert isinstance(mf_atom, UHF)
+
+        if uhf_for_atom:
+            mf_atom = mf_atom.to_uhf()
+            assert not isinstance(mf_atom, UKS)
+
+        if hasattr(mf_atom, 'with_solvent'):
+            mf_atom = mf_atom.undo_solvent()
+
+        mf_atom = mf_atom.reset(mol_atom)
+
+        mf_atom.conv_tol = 1e-10
+
+        mf_atom.kernel()
+        assert mf_atom.converged
+
+        mf_per_element[element] = mf_atom
+
+    dm0 = cupy.zeros((2, mol.nao, mol.nao))
+
+    for i_atom, (_, _, p0, p1) in enumerate(mol.aoslice_by_atom()):
+        element = elements[i_atom]
+        mf_atom = mf_per_element[element]
+        if mf_atom is None: # Ghost atom
+            continue # Keep corresponding block of density matrix zero.
+        nao_atom = mf_atom.mol.nao
+
+        dm_atom = mf_atom.make_rdm1()
+        assert dm_atom.shape == (2, nao_atom, nao_atom)
+
+        assert not mf_atom.mol.cart, "Spherical averaging for Cartesian basis not supported yet"
+
+        ao_loc = mf_atom.mol.ao_loc_nr()
+        for i_bas in range(mf_atom.mol.nbas):
+            nctr_i = mf_atom.mol._bas[i_bas, gto.NCTR_OF]
+            li = mf_atom.mol._bas[i_bas, gto.ANG_OF]
+            nao_li = 2 * li + 1
+            iao_li = ao_loc[i_bas]
+            for j_bas in range(mf_atom.mol.nbas):
+                nctr_j = mf_atom.mol._bas[j_bas, gto.NCTR_OF]
+                lj = mf_atom.mol._bas[j_bas, gto.ANG_OF]
+                nao_lj = 2 * lj + 1
+                iao_lj = ao_loc[j_bas]
+
+                if li != lj:
+                    dm_atom[:, iao_li:iao_li + nao_li * nctr_i, iao_lj:iao_lj + nao_lj * nctr_j] = 0
+                else:
+                    for i_ctr in range(nctr_i):
+                        for j_ctr in range(nctr_j):
+                            for i_dm in range(2):
+                                dm_l_trace = float(cupy.trace(dm_atom[i_dm,
+                                                                      iao_li + i_ctr * nao_li : iao_li + (i_ctr + 1) * nao_li,
+                                                                      iao_lj + j_ctr * nao_lj : iao_lj + (j_ctr + 1) * nao_lj]))
+                                dm_atom[i_dm,
+                                        iao_li + i_ctr * nao_li : iao_li + (i_ctr + 1) * nao_li,
+                                        iao_lj + j_ctr * nao_lj : iao_lj + (j_ctr + 1) * nao_lj] = cupy.eye(nao_li) * (dm_l_trace / nao_li)
+
+        dm0[:, p0:p1, p0:p1] = dm_atom
+
+    if isinstance(mf_template, RHF) and not isinstance(mf_template, ROHF):
+        dm0 = dm0[0] + dm0[1]
+    else:
+        if not high_spin: # Reproduce Q-Chem SCF_GUESS SAD behavior
+            dm_averaged = (dm0[0] + dm0[1]) * 0.5
+            dm0[0] = dm0[1] = dm_averaged
+
+    mf_template.reset(mol)
+
+    return dm0
+
+def init_guess_by_qchem_sad(mol, mf_template):
+    return _init_guess_by_qchem_sad(mol, mf_template, uhf_for_atom=False, high_spin=True)
+
+def init_guess_by_qchem_sad_hf(mol, mf_template):
+    return _init_guess_by_qchem_sad(mol, mf_template, uhf_for_atom=True, high_spin=False)
+
+def get_vsap(ni, mol, grids):
+    assert not mol.has_ecp(), 'ECP or PP not supported for SAP guess'
+
+    if grids.coords is None:
+        grids.build()
+    opt = getattr(ni, 'gdftopt', None)
+    if opt is None:
+        ni.build(mol, grids.coords)
+        opt = ni.gdftopt
+    _sorted_mol = opt._sorted_mol
+
+    nao = _sorted_mol.nao
+    vmat = cupy.zeros((nao, nao))
+
+    from pyscf.data.elements import charge as charge_of_element
+    atom_Zs = [charge_of_element(e) for e in mol.elements]
+    atom_coords = cupy.asarray(mol.atom_coords())
+
+    from pyscf.dft.sap_data import sap_Zeff as sap_Zeff_cpu
+    sap_Zeff = cupy.asarray(sap_Zeff_cpu)
+
+    from gpu4pyscf.lib.cupy_helper import add_sparse
+    from gpu4pyscf.dft.numint import _scale_ao
+    for ao, mask, weight, coords in ni.block_loop(_sorted_mol, grids, nao, 0):
+        vxc = cupy.zeros(weight.size)
+        for i_atom, Z in enumerate(atom_Zs):
+            if Z < 1:
+                continue
+            if Z >= sap_Zeff.shape[0]:
+                raise ValueError('Atoms beyond Og are not supported')
+            r_nuc_grid = cupy.linalg.norm(atom_coords[i_atom] - coords, axis=1)
+            r_nuc_grid = r_nuc_grid[r_nuc_grid > 1e-12]
+
+            Zeff = cupy.interp(r_nuc_grid, sap_Zeff[0,:], sap_Zeff[Z,:], right = 0.0)
+
+            vxc -= Zeff / r_nuc_grid
+
+        aow = _scale_ao(ao, weight * vxc)
+        add_sparse(vmat, ao.dot(aow.T), mask)
+        vxc = None
+    vmat = opt.unsort_orbitals(vmat, axis=[0, 1])
+
+    return vmat
+
+def make_sap(mol, sap_basis):
+    atom_coords = mol.atom_coords()
+    elements = mol.elements
+
+    # charge sumcheck
+    Z_eff = sum([np.sum(sap_basis[e][:,1]) for e in elements])
+    if np.abs(Z_eff + mol.nelectron) > 1e-6:
+        logger.warn(
+            mol,
+            '\n'.join(['SAP basis coefficients must be equal or close'
+            + f'to total electronic charge: {Z_eff} !≃ {mol.nelectron}',
+            f'Check fails with value {np.abs(Z_eff + mol.nelectron)}']))
+
+    auxmol = None
+
+    from pyscf.gto.mole import fakemol_for_cgtf_charge
+    for i_atom, element in enumerate(elements):
+        expnt = sap_basis[element][:,0]
+        coeff = sap_basis[element][:,1]
+        nucleon_fakemol = fakemol_for_cgtf_charge(
+            np.asarray([atom_coords[i_atom]], dtype=float),
+            expnt,
+            coeff
+        )
+
+        if auxmol is None:
+            auxmol = nucleon_fakemol
+        else:
+            auxmol = auxmol + nucleon_fakemol
+
+    from gpu4pyscf.df import int3c2e_bdiv
+
+    aux_coeff = cupy.ones(auxmol.nao)
+    V = -int3c2e_bdiv.contract_int3c2e_auxvec(mol, auxmol, aux_coeff)
+
+    return V
+
+def process_sap_basis(mf, mol, sap_basis):
+    logger.info(mf, '''Initial guess from superposition of atomic potentials (doi:10.1021/acs.jctc.8b01089)
+This is the Gaussian fit version as described in doi:10.1063/5.0004046.''')
+    if isinstance(sap_basis, str):
+        atoms = [coord[0] for coord in mol._atom]
+        sapbas = {}
+        for atom in set(atoms):
+            single_element_bs = gto.basis.load(sap_basis, atom)
+            if isinstance(single_element_bs, dict):
+                sapbas[atom] = np.asarray(single_element_bs[atom][0][1:], dtype=float)
+            else:
+                sapbas[atom] = np.asarray(single_element_bs[0][1:], dtype=float)
+        logger.note(mf, f'Found SAP basis {sap_basis.split("/")[-1]}')
+    elif isinstance(sap_basis, dict):
+        sapbas = {}
+        for key in sap_basis:
+            sapbas[key] = np.asarray(sap_basis[key][0][1:], dtype=float)
+    else:
+        logger.error(mf, 'sap_basis is of an unexpected datatype.')
+
+    return sapbas
+
+def _cast_rhf_init_guess(fn):
+    @functools.wraps(fn)
+    def fn_init_guess(mf, mol=None, breaksym=None):
+        if mol is None: mol = mf.mol
+        dm = fn(mf, mol)
+        assert dm.ndim == 2
+        if hasattr(dm, 'mo_coeff'):
+            idx = np.where(cupy.asnumpy(dm.mo_occ) > 0)[0]
+            mo_coeff = asarray(dm.mo_coeff[:,idx])
+            mo_occ = asarray(dm.mo_occ[idx])
+            dm = tag_array(asarray(dm), mo_coeff=mo_coeff, mo_occ=mo_occ)
+        else:
+            dm = asarray(dm)
+        return dm
+    return fn_init_guess
+
+def check_linear_dependency(s, log=None):
+    e, v = eigh(s)
+    if log is not None:
+        abs_e = abs(e).get()
+        emax = abs_e.max()
+        emin = abs_e.min()
+        c = emax / emin
+        log.debug('cond(S) = %s', c)
+        if c > 1e10:
+            log.warn('Singularity detected in the overlap matrix. '
+                     'SCF may be inaccurate and difficult to converge.')
+    if remove_overlap_zero_eigenvalue:
+        mask = e > overlap_zero_eigenvalue_threshold
+        x = v[:,mask] / cupy.sqrt(e[mask])
+    else:
+        x = v / cupy.sqrt(e)
+    return x
+
+def canonical_orthogonalization(s):
+    return check_linear_dependency(s)
 
 def as_scanner(mf):
     if isinstance(mf, pyscf_lib.SinglePointScanner):
@@ -586,6 +1091,7 @@ class SCF(pyscf_lib.StreamObject):
     max_cycle           = hf_cpu.SCF.max_cycle
     init_guess          = hf_cpu.SCF.init_guess
     conv_tol_cpscf      = 1e-6   # TODO: reuse the default value in PySCF
+    sap_basis           = 'sapgrasplarge'
 
     disp                = None
     DIIS                = diis.SCF_DIIS
@@ -609,7 +1115,7 @@ class SCF(pyscf_lib.StreamObject):
         'direct_scf', 'direct_scf_tol', 'conv_check', 'callback',
         'mol', 'chkfile', 'mo_energy', 'mo_coeff', 'mo_occ',
         'e_tot', 'converged', 'cycles', 'scf_summary',
-        'disp', 'disp_with_3body', 'overlap_canonical_decomposed_x'
+        'disp', 'disp_with_3body',
     }
 
     # methods
@@ -634,83 +1140,53 @@ class SCF(pyscf_lib.StreamObject):
         self.cycles = 0
         self.scf_summary = {}
 
-        self.overlap_canonical_decomposed_x = None
         self._opt_gpu = {None: None}
         self._opt_jengine = {None: None}
         self._eri = None # Note: self._eri requires large amount of memory
 
     __getstate__, __setstate__ = pyscf_lib.generate_pickle_methods(
-        excludes=('_opt_gpu', '_eri', '_numint', '_opt_jengine',
-                  'overlap_canonical_decomposed_x'))
-
-    def check_sanity(self):
-        s1e = self.get_ovlp()
-        assert isinstance(s1e, cupy.ndarray)
-        if s1e.ndim == 2:
-            c = cond(s1e, sympos=True)
-        else:
-            c = cupy.asarray([cond(xi, sympos=True) for xi in s1e])
-        logger.debug(self, 'cond(S) = %s', c)
-        if cupy.max(c)*1e-17 > self.conv_tol or cupy.max(c) > 1e10:
-            logger.warn(self, 'Singularity detected in overlap matrix (condition number = %4.3g). '
-                        'SCF may be inaccurate and hard to converge.', cupy.max(c))
-
-            if remove_overlap_zero_eigenvalue:
-                if s1e.ndim == 2:
-                    e, v = eigh(s1e)
-                    mask = e > overlap_zero_eigenvalue_threshold
-                    x = v[:,mask] / cupy.sqrt(e[mask])
-
-                    nao, nmo = x.shape
-                    if nmo < nao:
-                        self.overlap_canonical_decomposed_x = x
-                        logger.warn(self, f"{nao - nmo} small eigenvectors of overlap matrix removed "
-                                           "because of linear dependency between AOs.\n"
-                                           "The support for low-rank overlap matrix is not fully tested. "
-                                           "Please report any bug you encountered to the developers.")
-                else:
-                    nkpts = s1e.shape[0]
-                    x_kpts = []
-                    for k in range(nkpts):
-                        ek, vk = cupy.linalg.eigh(s1e[k])
-                        mask = ek > overlap_zero_eigenvalue_threshold
-                        xk = vk[:,mask] / cupy.sqrt(ek[mask])
-
-                        x_kpts.append(xk)
-                        nao, nmo_k = xk.shape
-                        if nmo_k < nao:
-                            logger.warn(self, f"For the {k}-th k point, {nao - nmo_k} small eigenvectors of overlap matrix removed "
-                                               "because of linear dependency between AOs.")
-
-                    if any([x.shape[1] < x.shape[0] for x in x_kpts]):
-                        self.overlap_canonical_decomposed_x = x_kpts
-                        logger.warn(self, "The support for low-rank overlap matrix is not fully tested. "
-                                          "Please report any bug you encountered to the developers.")
-
-        return super().check_sanity()
+        excludes=('_eri', '_numint', '_opt', '_opt_gpu', '_opt_jengine',
+                  'chkfile', '_chkfile', 'callback'))
 
     def build(self, mol=None):
         if mol is None: mol = self.mol
         self.check_sanity()
         return self
 
-    def eig(self, fock, s, overwrite=False):
+    def check_linear_dependency(self, s, verbose=None):
+        log = logger.new_logger(self, verbose)
+        x = check_linear_dependency(s, log)
+        nao, nmo = x.shape
+        if nmo < nao:
+            log.warn(f"{nao - nmo} small eigenvectors of overlap matrix removed "
+                     "because of linear dependency between AOs.\n"
+                     "The support for low-rank overlap matrix is not fully tested. "
+                     "Please report any bug you encountered to the developers.")
+        return x
+
+    def eig(self, h, s, overwrite=False, x=None):
         '''
         Solve generalized eigenvalue problem.
 
         When overwrite is specified, both fock and s matrices are overwritten.
+
+        Kwargs:
+            overwrite: bool
+                whether to allow modifying the h and s matrices in the input (to
+                reduce memory footprint)
+            x: ndarray
+                The matrix that orthogonalizes the s matrix: x^dagger s x = 1 .
+                When x is specified, the input s can be skipped.
         '''
-        x = None
-        if hasattr(self, 'overlap_canonical_decomposed_x') and self.overlap_canonical_decomposed_x is not None:
-            x = asarray(self.overlap_canonical_decomposed_x)
         if x is None:
-            if fock.dtype != s.dtype:
-                s = s.astype(fock.dtype)
-            # In DIIS, fock and overlap matrices are temporarily constructed
+            if h.dtype != s.dtype:
+                s = s.astype(h.dtype)
+            # In DIIS, h and overlap matrices are temporarily constructed
             # and discarded, they can be overwritten in the eigh solver.
-            mo_energy, mo_coeff = eigh(fock, s, overwrite=overwrite)
+            mo_energy, mo_coeff = eigh(h, s, overwrite=overwrite)
         else:
-            mo_energy, C = eigh(x.conj().T @ fock @ x)
+            x = cupy.asarray(x)
+            mo_energy, C = eigh(x.conj().T.dot(h).dot(x))
             mo_coeff = x @ C
         return mo_energy, mo_coeff
     _eigh = eig
@@ -753,50 +1229,221 @@ class SCF(pyscf_lib.StreamObject):
     get_fock                 = get_fock
     get_occ                  = get_occ
     get_grad                 = staticmethod(get_grad)
-    init_guess_by_atom       = hf_cpu.SCF.init_guess_by_atom
-    init_guess_by_huckel     = hf_cpu.SCF.init_guess_by_huckel
-    init_guess_by_mod_huckel = hf_cpu.SCF.init_guess_by_mod_huckel
-    init_guess_by_1e         = hf_cpu.SCF.init_guess_by_1e
-    init_guess_by_chkfile    = hf_cpu.SCF.init_guess_by_chkfile
-    from_chk                 = hf_cpu.SCF.from_chk
-    get_init_guess           = return_cupy_array(hf_cpu.SCF.get_init_guess)
+    init_guess_by_1e         = _cast_rhf_init_guess(hf_cpu.SCF.init_guess_by_1e)
+    init_guess_by_huckel     = _cast_rhf_init_guess(hf_cpu.SCF.init_guess_by_huckel)
+    init_guess_by_mod_huckel = _cast_rhf_init_guess(hf_cpu.SCF.init_guess_by_mod_huckel)
+    init_guess_by_chkfile    = return_cupy_array(hf_cpu.SCF.init_guess_by_chkfile)
+    from_chk                 = return_cupy_array(hf_cpu.SCF.from_chk)
     make_rdm2                = NotImplemented
     energy_elec              = NotImplemented
     energy_tot               = energy_tot
     energy_nuc               = hf_cpu.SCF.energy_nuc
     check_convergence        = None
-    do_disp                  = hf_cpu.SCF.do_disp
-    get_dispersion           = hf_cpu.SCF.get_dispersion
+    do_disp                  = dispersion.check_disp
+    get_dispersion           = dispersion.get_dispersion
     kernel = scf             = scf
     as_scanner               = hf_cpu.SCF.as_scanner
     _finalize                = hf_cpu.SCF._finalize
     init_direct_scf          = NotImplemented
-    get_jk                   = _get_jk
     get_veff                 = NotImplemented
     mulliken_meta = pop      = NotImplemented
-    mulliken_pop             = NotImplemented
     _is_mem_enough           = NotImplemented
     density_fit              = NotImplemented
     newton                   = NotImplemented
     x2c = x2c1e = sfx2c1e    = NotImplemented
-    stability                = NotImplemented
     update_                  = NotImplemented
     istype                   = hf_cpu.SCF.istype
-    to_rhf                   = NotImplemented
-    to_uhf                   = NotImplemented
-    to_ghf                   = NotImplemented
-    to_rks                   = NotImplemented
-    to_uks                   = NotImplemented
-    to_gks                   = NotImplemented
+
+    def to_rhf(self):
+        '''Convert the input mean-field object to a RHF/ROHF object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        from gpu4pyscf.scf import addons
+        return addons.convert_to_rhf(self)
+
+    def to_uhf(self):
+        '''Convert the input mean-field object to a UHF object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        from gpu4pyscf.scf import addons
+        return addons.convert_to_uhf(self)
+
+    def to_ghf(self):
+        '''Convert the input mean-field object to a GHF object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        from gpu4pyscf.scf import addons
+        return addons.convert_to_ghf(self)
+
+    def to_rks(self, xc='HF'):
+        '''Convert the input mean-field object to a RKS/ROKS object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        return self.to_rhf().to_ks(xc)
+
+    def to_uks(self, xc='HF'):
+        '''Convert the input mean-field object to a UKS object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        return self.to_uhf().to_ks(xc)
+
+    def to_gks(self, xc='HF'):
+        '''Convert the input mean-field object to a GKS object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        return self.to_ghf().to_ks(xc)
+
     to_ks                    = NotImplemented
     canonicalize             = NotImplemented
+    gen_response             = NotImplemented
     dump_scf_summary         = hf_cpu.dump_scf_summary
 
     smearing = smearing
 
-    def init_guess_by_minao(self, mol=None):
+    def init_guess_by_minao(self, mol=None, high_spin=False):
         if mol is None: mol = self.mol
-        return init_guess_by_minao(mol)
+        return init_guess_by_minao(mol, high_spin)
+
+    def init_guess_by_atom(self, mol=None, high_spin=False):
+        if mol is None: mol = self.mol
+        return init_guess_by_atom(mol, high_spin)
+
+    def init_guess_by_sap(self, mol=None):
+        if mol is None: mol = self.mol
+        sap_basis = process_sap_basis(self, mol, self.sap_basis)
+
+        Vsap = make_sap(mol, sap_basis=sap_basis)
+        Hcore = self.get_hcore(mol)
+        S = self.get_ovlp(mol)
+        Hsap = Hcore + Vsap
+        mo_energy, mo_coeff = self.eig(Hsap, S)
+
+        mo_occ = self.get_occ(mo_energy, mo_coeff)
+        return self.make_rdm1(mo_coeff, mo_occ)
+
+    def get_vsap(self, mol=None):
+        if mol is None: mol = self.mol
+
+        from gpu4pyscf.dft.gen_grid import Grids
+        if hasattr(self, "grids"):
+            grids = self.grids
+        else:
+            grids = Grids(mol)
+            grids.atom_grid = (99,590)
+            logger.info(self, f"DFT grid not found, set SAP grid to {grids.atom_grid}")
+        assert isinstance(grids, Grids)
+
+        from gpu4pyscf.dft.numint import NumInt
+        if hasattr(self, "_numint"):
+            ni = self._numint
+        else:
+            ni = NumInt()
+        assert isinstance(ni, NumInt)
+
+        return get_vsap(ni, mol, grids)
+
+    def init_guess_by_vsap(self, mol=None):
+        if mol is None: mol = self.mol
+
+        Vsap = self.get_vsap()
+        from gpu4pyscf.pbc.gto.int1e import int1e_kin
+        T = int1e_kin(mol)
+        S = self.get_ovlp(mol)
+        Hsap = T + Vsap
+        mo_energy, mo_coeff = self.eig(Hsap, S)
+
+        mo_occ = self.get_occ(mo_energy, mo_coeff)
+        return self.make_rdm1(mo_coeff, mo_occ)
+
+    def get_init_guess(self, mol=None, key='minao', **kwargs):
+        '''Dispatch initial guesses
+
+        Args:
+            mol : Mole or None
+                Molecule for the guess. Defaults to self.mol.
+            key : str or density matrix
+                Case-insensitive initial-guess key:
+
+                - 'minao' (default): project minimal atomic orbitals into
+                  the molecular basis.
+                - 'atom': superposition of atomic HF densities.
+                - 'minao_high_spin': MINAO guess with aligned atomic spins.
+                - 'atom_high_spin': atomic HF guess with aligned atomic spins.
+                - 'qchem_sad': Q-Chem-style SAD using spin-averaged atomic UHF densities.
+                - 'qchem_autosad': Q-Chem-style AUTOSAD using unrestricted
+                  atomic calculations at the molecular method's level, with aligned spins.
+                - '1e' or 'hcore': diagonalize the core Hamiltonian.
+                - 'huckel': on-the-fly Huckel guess.
+                - 'mod_huckel': modified Huckel guess.
+                - 'vsap': superposition of atomic potentials, when the SCF
+                  object provides init_guess_by_vsap (DFT only).
+                - 'sap': superposition of fitted atomic potentials, when
+                  the SCF object provides init_guess_by_sap; forwards kwargs.
+                - 'chkfile' or any key starting with 'chk': read self.chkfile;
+                  fall back to MINAO on OSError or KeyError.
+                - 'SAD_FRAC_OCC': Psi4-style fractional atomic UHF; currently not supported.
+        '''
+        if not isinstance(key, str):
+            return key
+        if mol is None:
+            mol = self.mol
+        key = key.lower()
+        logger.info(self, 'Initial guess from %s', key)
+
+        if key == 'minao_high_spin':
+            dm = self.init_guess_by_minao(mol, high_spin=True)
+        elif key == 'atom_high_spin':
+            dm = self.init_guess_by_atom(mol, high_spin=True)
+        elif key == 'qchem_sad':
+            return _init_guess_by_qchem_sad(mol, self, uhf_for_atom=True, high_spin=False)
+        elif key == 'qchem_autosad':
+            return _init_guess_by_qchem_sad(mol, self, uhf_for_atom=False, high_spin=True)
+        elif key == 'sad_frac_occ':
+            raise NotImplementedError('SAD_FRAC_OCC: Psi4-style high-spin fractional atomic UHF.')
+        elif key == '1e' or key == 'hcore':
+            dm = self.init_guess_by_1e(mol)
+        elif key == 'huckel':
+            dm = self.init_guess_by_huckel(mol)
+        elif key == 'mod_huckel':
+            dm = self.init_guess_by_mod_huckel(mol)
+        elif getattr(mol, 'natm', 0) == 0:
+            logger.info(self, 'No atom found in mol. Use 1e initial guess')
+            dm = self.init_guess_by_1e(mol)
+        elif key == 'atom':
+            dm = self.init_guess_by_atom(mol)
+        elif key == 'vsap':
+            # Only available for DFT objects
+            dm = self.init_guess_by_vsap(mol)
+        elif key == 'sap':
+            dm = self.init_guess_by_sap(mol, **kwargs)
+        elif key[:3] == 'chk':
+            try:
+                dm = self.init_guess_by_chkfile()
+            except (OSError, KeyError):
+                logger.warn(self, 'Fail in reading %s. Use MINAO initial guess',
+                            self.chkfile)
+                dm = self.init_guess_by_minao(mol)
+        else:
+            dm = self.init_guess_by_minao(mol)
+        return dm
 
     def get_hcore(self, mol=None):
         if mol is None: mol = self.mol
@@ -824,12 +1471,30 @@ class SCF(pyscf_lib.StreamObject):
         if dm is None: dm = self.make_rdm1()
         return hf_cpu.quad_moment(mol, cupy.asnumpy(dm), unit, origin, verbose)
 
+    def soscf(self):
+        return self.newton()
+
     def remove_soscf(self):
-        lib.logger.warn('remove_soscf has no effect in current version')
+        if hasattr(self, 'undo_soscf'):
+            return self.undo_soscf()
         return self
 
-    def analyze(self, *args, **kwargs):
-        return self.to_cpu().analyze()
+    def analyze(self, verbose=logger.DEBUG, with_meta_lowdin=WITH_META_LOWDIN,
+                **kwargs):
+        return self.to_cpu().analyze(
+            verbose=verbose, with_meta_lowdin=with_meta_lowdin, **kwargs)
+
+    def stability(self, internal=True, external=False, verbose=None, return_status=False, **kwargs):
+        from gpu4pyscf.scf.stability import rhf_stability
+        return rhf_stability(self, internal, external, verbose, return_status, **kwargs)
+
+    def mulliken_pop(self, mol=None, dm=None, s=None, verbose=logger.DEBUG):
+        '''Mulliken population analysis
+        '''
+        if mol is None: mol = self.mol
+        if dm is None: dm = self.make_rdm1()
+        if s is None: s = self.get_ovlp(mol)
+        return hf_cpu.mulliken_pop(mol, cupy.asnumpy(dm), cupy.asnumpy(s), verbose)
 
     def reset(self, mol=None):
         if mol is not None:
@@ -838,17 +1503,32 @@ class SCF(pyscf_lib.StreamObject):
         self._opt_jengine = {None: None}
         self._eri = None
         self.scf_summary = {}
-        self.overlap_canonical_decomposed_x = None
         return self
 
     def dump_chk(self, envs):
-        assert isinstance(envs, dict)
         if self.chkfile:
+            assert isinstance(envs, dict)
             chkfile.dump_scf(
                 self.mol, self.chkfile, envs['e_tot'],
                 cupy.asnumpy(envs['mo_energy']), cupy.asnumpy(envs['mo_coeff']),
                 cupy.asnumpy(envs['mo_occ']), overwrite_mol=False)
 
+    @pyscf_lib.with_doc(jk.get_jk.__doc__)
+    def get_jk(self, mol, dm=None, hermi=1, with_j=True, with_k=True,
+               omega=None, lr_factor=None, sr_factor=None):
+        if dm is None: dm = self.make_rdm1()
+        if omega is None:
+            omega = mol.omega
+        vhfopt = self._opt_gpu.get(omega)
+        if vhfopt is None:
+            with mol.with_range_coulomb(omega):
+                vhfopt = self._opt_gpu[omega] = jk._VHFOpt(
+                    mol, self.direct_scf_tol).build()
+
+        return get_jk(mol, dm, hermi, vhfopt, with_j, with_k,
+                      omega, lr_factor, sr_factor)
+
+    @pyscf_lib.with_doc(j_engine.get_j.__doc__)
     def get_j(self, mol, dm, hermi=1, omega=None):
         if omega is None:
             omega = mol.omega
@@ -861,15 +1541,16 @@ class SCF(pyscf_lib.StreamObject):
             vj = vj.get()
         return vj
 
-    def get_k(self, mol=None, dm=None, hermi=1, omega=None):
+    @pyscf_lib.with_doc(jk.get_k.__doc__)
+    def get_k(self, mol, dm, hermi=1, omega=None, lr_factor=None, sr_factor=None):
         if omega is None:
             omega = mol.omega
         vhfopt = self._opt_gpu.get(omega)
         with mol.with_range_coulomb(omega):
             if vhfopt is None:
                 vhfopt = self._opt_gpu[omega] = jk._VHFOpt(
-                    mol, self.direct_scf_tol, tile=1).build()
-            vk = jk.get_k(mol, dm, hermi, vhfopt)
+                    mol, self.direct_scf_tol).build()
+            vk = jk.get_k(mol, dm, hermi, vhfopt, omega, lr_factor, sr_factor)
         if not isinstance(dm, cupy.ndarray):
             vk = vk.get()
         return vk
@@ -882,6 +1563,27 @@ class SCF(pyscf_lib.StreamObject):
 
     def Hessian(self):
         raise NotImplementedError
+
+    def _transfer_attrs_(self, dst):
+        '''This helper function transfers attributes from one SCF object to
+        another SCF object. It is invoked by to_ks and to_hf methods.
+        '''
+        from gpu4pyscf.df.df_jk import _DFHF
+        if isinstance(self, _DFHF) and not hasattr(dst, 'with_df'):
+            # * Handle DF_SCF instances for to_xxx methods.
+            # * Only the molecular SCF methods need to be explicitly converted.
+            #   For PBC SCF methods, DF is enabled by default. calling density_fit()
+            #   may alter the DF class. Conversion should be avoided here.
+            dst = dst.density_fit(auxbasis=self.with_df.auxbasis)
+        # Search for all tracked attributes, including those in base classes
+        cls_keys = [getattr(cls, '_keys', ()) for cls in dst.__class__.__mro__[:-1]]
+        dst_keys = set(dst.__dict__).union(*cls_keys)
+
+        loc_dic = self.__dict__
+        keys = set(loc_dic).intersection(dst_keys)
+        dst.__dict__.update({k: loc_dic[k] for k in keys})
+        dst.converged = False
+        return dst
 
 class KohnShamDFT:
     '''
@@ -912,6 +1614,16 @@ class RHF(SCF):
 
     energy_elec = energy_elec
 
+    def init_guess_by_minao(self, mol=None, high_spin=False):
+        return SCF.init_guess_by_minao(self, mol, high_spin=False)
+
+    def init_guess_by_atom(self, mol=None, high_spin=False):
+        return SCF.init_guess_by_atom(self, mol, high_spin=False)
+
+    def spin_square(self, mo_coeff=None, s=None):
+        '''Spin square and multiplicity of a RHF determinant'''
+        return 0, 1
+
     def Gradients(self):
         from gpu4pyscf.grad import rhf
         return rhf.Gradients(self)
@@ -925,6 +1637,11 @@ class RHF(SCF):
                 'incorrect nuclear gradients, TDDFT, and other methods.')
         return gpu4pyscf.df.df_jk.density_fit(self, auxbasis, with_df, only_dfj)
 
+    def sfx2c1e(self):
+        from gpu4pyscf.x2c.sfx2c1e import sfx2c1e
+        return sfx2c1e(self)
+    x2c = x2c1e = sfx2c1e
+
     def newton(self):
         from gpu4pyscf.scf.soscf import newton
         return newton(self)
@@ -933,3 +1650,9 @@ class RHF(SCF):
         mf = hf_cpu.RHF(self.mol)
         utils.to_cpu(self, out=mf)
         return mf
+
+    def to_ks(self, xc='HF'):
+        '''Convert to RKS object.
+        '''
+        from gpu4pyscf import dft
+        return self._transfer_attrs_(dft.RKS(self.mol, xc=xc))

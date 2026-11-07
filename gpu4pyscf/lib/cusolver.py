@@ -16,13 +16,18 @@
 import numpy as np
 import cupy
 import ctypes
-from ctypes.util import find_library
 from cupy_backends.cuda.libs import cusolver
 from cupy_backends.cuda.libs import cublas
 from cupy.cuda import device
 
+from gpu4pyscf.lib.utils import load_library
+
+from ctypes.util import find_library
 libcusolver = find_library('cusolver')
-libcusolver = ctypes.CDLL(libcusolver)
+if libcusolver is not None:
+    libcusolver = ctypes.CDLL(libcusolver)
+else:
+    libcusolver = load_library('libcusolver', path='nvidia/cusolver/lib')
 
 # workspace size (lwork) provided by the cusolver*_bufferSize is an 32-bit
 # integer. For arrays above this dimension, the workspace size would overflow.
@@ -103,11 +108,11 @@ libcusolver.cusolverDnZhegvd.argtypes = [
 ]
 
 def eigh(h, s, overwrite=False):
-    '''
-    solve generalized eigenvalue problem
+    '''Solve the generalized Hermitian eigenproblem with positive-definite s.
     '''
     assert h.dtype == s.dtype
     assert h.dtype in (np.float64, np.complex128)
+    assert h.flags.c_contiguous and s.flags.c_contiguous
     n = h.shape[0]
     if h.dtype == np.complex128 and h.flags.c_contiguous:
         # zhegvd requires the matrices in F-order. For hermitian matrices,
@@ -121,6 +126,7 @@ def eigh(h, s, overwrite=False):
         A = h.copy()
         B = s.copy()
     _handle = device.get_cusolver_handle()
+    cusolver.setStream(_handle, cupy.cuda.get_current_stream().ptr)
     w = cupy.zeros(n)
 
     # TODO: reuse workspace
@@ -175,6 +181,15 @@ def eigh(h, s, overwrite=False):
 
     if status != 0:
         raise LinAlgError("failed in eigh kernel")
+    # API success only confirms execution; devInfo reports numerical failure.
+    info = int(devInfo.get()[0])
+    if info < 0:
+        raise LinAlgError(f'eigh failed: cuSOLVER argument {-info} is invalid (devInfo={info})')
+    if info > n:
+        raise LinAlgError('eigh failed: overlap matrix is not positive definite '
+                          f'(leading minor {info-n}, devInfo={info})')
+    if info != 0:
+        raise LinAlgError(f'eigh failed to converge (devInfo={info})')
     return w, A.T
 
 def cholesky(A):
@@ -183,6 +198,7 @@ def cholesky(A):
         A = A.T
     x = A.copy(order='C')
     handle = device.get_cusolver_handle()
+    cusolver.setStream(handle, cupy.cuda.get_current_stream().ptr)
     if A.dtype == np.float64:
         potrf = cusolver.dpotrf
         potrf_bufferSize = cusolver.dpotrf_bufferSize

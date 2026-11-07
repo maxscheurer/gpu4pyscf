@@ -22,9 +22,45 @@ from pyscf import lib, scf
 from pyscf import dft as cpu_dft
 from pyscf.dft import Grids as Grids_cpu
 from pyscf.dft.numint import NumInt as pyscf_numint
+from pyscf.dft import gen_grid as gen_grid_cpu
 from gpu4pyscf.dft.numint import NumInt
 from gpu4pyscf import dft as gpu_dft
 from gpu4pyscf.dft import Grids as Grids_gpu
+from gpu4pyscf.dft import gen_grid as gen_grid_gpu
+
+def find_matching_index_between_two_grids(coords1, weights1, rho1, coords2, weights2, rho2):
+    # If there's no rho, you can pass in rho1 = rho2 = 1.0
+
+    if isinstance(coords1, cupy.ndarray): coords1 = coords1.get()
+    if isinstance(weights1, cupy.ndarray): weights1 = weights1.get()
+    if isinstance(rho1, cupy.ndarray): rho1 = rho1.get()
+    if isinstance(coords2, cupy.ndarray): coords2 = coords2.get()
+    if isinstance(weights2, cupy.ndarray): weights2 = weights2.get()
+    if isinstance(rho2, cupy.ndarray): rho2 = rho2.get()
+
+    nonzero1 = np.where(weights1 * rho1 > 1e-10)[0]
+    nonzero2 = np.where(weights2 * rho2 > 1e-10)[0]
+    assert len(nonzero1) == len(nonzero2), \
+        f"The two sets of grids have different number of grids with non-zero rhos ({len(nonzero1)} vs {len(nonzero2)})."
+
+    coords1 = coords1[nonzero1]
+    coords2 = coords2[nonzero2]
+    coords1 = np.round(coords1, decimals = 10)
+    coords2 = np.round(coords2, decimals = 10)
+    sort1 = np.lexsort(coords1.T)
+    sort2 = np.lexsort(coords2.T)
+
+    coords1 = coords1[sort1]
+    coords2 = coords2[sort2]
+    coords_diff = np.max(np.abs(coords1 - coords2)) # Already rounded to nearest 1e-10
+    assert coords_diff == 0, f"The two sets of grids have different coordinates (max diff = {coords_diff})."
+
+    map1 = nonzero1[sort1]
+    map2 = nonzero2[sort2]
+    weights_diff = np.max(np.abs(weights1[map1] - weights2[map2]))
+    assert weights_diff < 1e-10, f"The two sets of grids have different weights (max diff = {weights_diff})."
+
+    return map1, map2
 
 def setUpModule():
     global mol, grids_cpu, grids_gpu
@@ -99,7 +135,70 @@ class KnownValues(unittest.TestCase):
             assert np.linalg.norm(gpu_coords.get() - cpu_coords) < 1e-6
             assert np.linalg.norm(gpu_weights.get() - cpu_weights) < 1e-6
 
-    def test_GDFTscreen_index_kernel_bugfix(self):
+    def test_stratmann_scheme(self):
+        grids_cpu = Grids_cpu(mol)
+        grids_cpu.atom_grid = (50,194)
+        grids_cpu.becke_scheme = gen_grid_cpu.stratmann
+        grids_cpu.build()
+
+        grids_gpu = Grids_gpu(mol)
+        grids_gpu.atom_grid = (50,194)
+        grids_gpu.becke_scheme = gen_grid_gpu.stratmann
+        grids_gpu.build()
+
+        idx1, idx2 = find_matching_index_between_two_grids(grids_cpu.coords, grids_cpu.weights, 1.0,
+                                                           grids_gpu.coords, grids_gpu.weights, 1.0,)
+        assert np.linalg.norm(grids_gpu.coords[idx2].get() - grids_cpu.coords[idx1]) < 1e-10
+        assert np.linalg.norm(grids_gpu.weights[idx2].get() - grids_cpu.weights[idx1]) < 1e-10
+
+        mf = mol.RKS(xc = "r2scan").density_fit(auxbasis = "cc-pvqz-jkfit").to_gpu()
+        mf.grids.becke_scheme = gen_grid_gpu.stratmann
+        mf.conv_tol = 1e-12
+        test_energy = mf.kernel()
+        assert mf.converged
+
+        ref_energy = -75.96234634235809 # From pyscf
+
+        assert np.abs(test_energy - ref_energy) < 1e-10
+
+    def test_no_radii_adjustment(self):
+        grids_cpu = Grids_cpu(mol)
+        grids_cpu.atom_grid = (50,194)
+        grids_cpu.radii_adjust = None
+        grids_cpu.becke_scheme = gen_grid_cpu.stratmann
+        grids_cpu.build()
+
+        grids_gpu = Grids_gpu(mol)
+        grids_gpu.atom_grid = (50,194)
+        grids_gpu.radii_adjust = None
+        grids_gpu.becke_scheme = gen_grid_gpu.stratmann
+        grids_gpu.build()
+
+        idx1, idx2 = find_matching_index_between_two_grids(grids_cpu.coords, grids_cpu.weights, 1.0,
+                                                           grids_gpu.coords, grids_gpu.weights, 1.0,)
+        assert np.linalg.norm(grids_gpu.coords[idx2].get() - grids_cpu.coords[idx1]) < 1e-10
+        assert np.linalg.norm(grids_gpu.weights[idx2].get() - grids_cpu.weights[idx1]) < 1e-10
+
+        mf = mol.RKS(xc = "r2scan").density_fit(auxbasis = "cc-pvqz-jkfit").to_gpu()
+        mf.grids.radii_adjust = None
+        mf.grids.becke_scheme = gen_grid_cpu.stratmann
+        mf.conv_tol = 1e-12
+        test_energy = mf.kernel()
+        assert mf.converged
+
+        ref_energy = -75.96234774753147 # From pyscf
+
+        assert np.abs(test_energy - ref_energy) < 1e-10
+
+    def test_default_grids(self):
+        grids = Grids_gpu(mol)
+        grids.atom_grid = {'default': (6, 50), 'S': (99, 590)}
+        grids.prune = None
+        grids.build()
+        # grids.size != 900 due to alignment
+        assert 900 <= grids.size <= 1024
+
+    def test_GDFTscreen_index_kernel_bugfix_high_cost(self):
         # To reproduce the bug, remove the first __syncthreads() in _screen_index() CUDA kernel.
         # See issue 919. Not able to reproduce with smaller molecule or basis.
         mol = pyscf.M(
@@ -150,10 +249,10 @@ class KnownValues(unittest.TestCase):
         )
 
         dm = cp.ones((mol.nao, mol.nao))
-        sorted_grids = Grids_gpu(mol)
+        sorted_grids = gen_grid_gpu.Grids(mol)
         sorted_grids.atom_grid = (150, 974)
         sorted_grids.build(sort_grids=True)
-        unsorted_grids = Grids_gpu(mol)
+        unsorted_grids = gen_grid_gpu.Grids(mol)
         unsorted_grids.atom_grid = (150, 974)
         unsorted_grids.build(sort_grids=False)
 
@@ -164,6 +263,109 @@ class KnownValues(unittest.TestCase):
 
         assert abs(n_s - n_u) < 2e-9
         assert abs(e_s - e_u) < 2e-9
+
+
+def _density_on_grid(mf, grids):
+    ao = cpu_dft.numint.eval_ao(mf.mol, cp.asnumpy(grids.coords))
+    return cpu_dft.numint.eval_rho(mf.mol, ao, mf.make_rdm1())
+
+
+class GridPartition(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        molecule = pyscf.M(atom='O .1 .2 0; H .8 .1 .5; H -.5 .7 .6',
+                           basis='sto-3g', verbose=0)
+        mf = scf.RHF(molecule).set(conv_tol=1e-12).run()
+        assert mf.converged
+        cls.small_grid_mf = mf
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.small_grid_mf
+
+    def test_atom_partition(self):
+        for scheme in ['original_becke', 'stratmann']:
+            with self.subTest(scheme=scheme):
+                small_grid_mf = self.small_grid_mf
+                molecule = small_grid_mf.mol
+                grid = Grids_gpu(molecule).set(atom_grid=(8, 50))
+                coords, weights = grid.get_partition(
+                    molecule, concat=False, becke_scheme=getattr(gen_grid_gpu, scheme))
+                table = gen_grid_cpu.gen_atomic_grids(molecule, atom_grid=(8, 50),
+                                                      radi_method=grid.radi_method)
+                ref_coords, ref_weights = gen_grid_cpu.get_partition(
+                    molecule, table, concat=False, becke_scheme=getattr(gen_grid_cpu, scheme))
+                assert len(coords) == len(weights) == molecule.natm
+                for c, w, rc, rw in zip(coords, weights, ref_coords, ref_weights):
+                    np.testing.assert_allclose(cp.asnumpy(c), rc, atol=1e-12, rtol=0)
+                    np.testing.assert_allclose(cp.asnumpy(w), rw, atol=1e-10, rtol=0)
+
+    def test_box_grouping(self):
+        small_grid_mf = self.small_grid_mf
+        molecule = small_grid_mf.mol
+        grid = Grids_gpu(molecule).set(atom_grid=(8, 50), alignment=1)
+        grid.build(sort_grids=False)
+        order = cp.asnumpy(gen_grid_gpu.arg_group_grids(molecule, grid.coords))
+        np.testing.assert_array_equal(np.sort(order), np.arange(grid.size))
+        atom_coords = molecule.atom_coords()
+        lower = atom_coords.min(axis=0) - gen_grid_gpu.GROUP_BOUNDARY_PENALTY
+        upper = atom_coords.max(axis=0) + gen_grid_gpu.GROUP_BOUNDARY_PENALTY
+        boxes = np.rint((upper - lower) / gen_grid_gpu.GROUP_BOX_SIZE).astype(int)
+        cells = np.floor((cp.asnumpy(grid.coords) - lower) / ((upper - lower) / boxes)).astype(int)
+        cells = np.clip(cells, -1, boxes)
+        labels = np.unique(cells, axis=0, return_inverse=True)[1][order]
+        for label in np.unique(labels):
+            assert np.all(np.diff(np.flatnonzero(labels == label)) == 1)
+
+    def test_prune_by_density(self):
+        small_grid_mf = self.small_grid_mf
+        molecule = small_grid_mf.mol
+        grid = Grids_gpu(molecule).set(atom_grid=(30, 110))
+        grid.build(with_non0tab=True, sort_grids=False)
+        density = _density_on_grid(small_grid_mf, grid)
+        before = {name: cp.asnumpy(getattr(grid, name)).copy()
+                  for name in ('coords', 'weights', 'atm_idx', 'quadrature_weights')}
+        population = density @ before['weights']
+        assert abs(population - molecule.nelectron) < gen_grid_gpu.NELEC_ERROR_TOL * population
+        grid.get_non0ao_idx()
+        cache = grid._non0ao_idx
+        assert cache is not None
+        assert grid.prune_by_density_(cp.asarray(density), threshold=0) is grid
+        assert grid._non0ao_idx is cache
+        threshold = 1e-5
+        retained = abs(density * before['weights']) > threshold / grid.size
+        assert 0 < retained.sum() < grid.size
+        grid.prune_by_density_(cp.asarray(density), threshold=threshold)
+        assert grid._non0ao_idx is None
+        n = retained.sum()
+        for name, original in before.items():
+            np.testing.assert_array_equal(cp.asnumpy(getattr(grid, name))[:n], original[retained])
+        assert grid.size % grid.alignment == 0
+        np.testing.assert_array_equal(cp.asnumpy(grid.weights)[n:], 0)
+        np.testing.assert_array_equal(cp.asnumpy(grid.quadrature_weights)[n:], 0)
+        np.testing.assert_array_equal(cp.asnumpy(grid.atm_idx)[n:], -1)
+        np.testing.assert_array_equal(grid.non0tab,
+                                      gen_grid_cpu.make_mask(molecule, cp.asnumpy(grid.coords)))
+        assert grid.screen_index is grid.non0tab
+        after_population = _density_on_grid(small_grid_mf, grid) @ cp.asnumpy(grid.weights)
+        # Each omitted weighted density is at most threshold / original grid count.
+        assert abs(after_population - population) <= threshold + 1e-10
+
+
+class AtomicGrids(unittest.TestCase):
+    def test_sg1_heavier_elements(self):
+        for element in ['S', 'Ca']:
+            with self.subTest(element=element):
+                molecule = pyscf.M(atom=f'{element} 0 0 0', basis='sto-3g', verbose=0)
+                actual = gen_grid_gpu.gen_atomic_grids(
+                    molecule, atom_grid=(8, 194), prune=gen_grid_gpu.sg1_prune)[element]
+                # GPU SG1 uses an unpruned 194-point rule beyond the SG1 radii table.
+                prune = gen_grid_cpu.sg1_prune if element == 'S' else None
+                reference = gen_grid_cpu.gen_atomic_grids(
+                    molecule, atom_grid=(8, 194), prune=prune)[element]
+                for value, expected in zip(actual, reference):
+                    np.testing.assert_allclose(cp.asnumpy(value), expected, atol=1e-12, rtol=0)
+
 
 if __name__ == "__main__":
     print("Full Tests for grids")

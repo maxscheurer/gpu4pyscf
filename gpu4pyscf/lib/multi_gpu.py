@@ -16,11 +16,12 @@
 import builtins
 from concurrent.futures import ThreadPoolExecutor
 import functools
+from threading import Lock
 import cupy as cp
 import numpy as np
 from pyscf.lib import prange
 from gpu4pyscf.lib.memcpy import p2p_transfer
-from gpu4pyscf.__config__ import num_devices
+from gpu4pyscf.__config__ import num_devices, _p2p_access
 
 __all__ = [
     'run', 'map', 'reduce', 'array_reduce', 'array_broadcast', 'lru_cache'
@@ -33,7 +34,7 @@ def run(func, args=(), kwargs={}, non_blocking=False):
         non_blocking: If `True`, functions are executed in parallel using multi-threads.
     '''
     if num_devices == 1:
-        return [func(*args, *kwargs)]
+        return [func(*args, **kwargs)]
 
     synchronize()
 
@@ -57,21 +58,30 @@ def map(func, tasks, args=(), kwargs={}, schedule='dynamic') -> list:
             If 'dynamic', tasks are scheduled dynamically, with better load balance.
     '''
     if num_devices == 1:
-        return [func(t, *args, *kwargs) for t in tasks]
+        return [func(t, *args, **kwargs) for t in tasks]
 
     tasks = enumerate(tasks)
+    if schedule == 'dynamic':
+        task_lock = Lock()
+    else:
+        tasks = list(tasks)
     result = {}
 
     def consumer():
         if schedule == 'dynamic':
             stream = cp.cuda.stream.get_current_stream()
-            for key, t in tasks:
+            while True:
+                # The input may be a generator; serialize advancement only.
+                with task_lock:
+                    try:
+                        key, t = next(tasks)
+                    except StopIteration:
+                        break
                 result[key] = func(t, *args, **kwargs)
                 stream.synchronize()
         else:
-            _tasks = list(tasks)
             device_id = cp.cuda.device.get_device_id()
-            for key, t in _tasks[device_id::num_devices]:
+            for key, t in tasks[device_id::num_devices]:
                 result[key] = func(t, *args, **kwargs)
 
     run(consumer, non_blocking=True)
@@ -96,9 +106,10 @@ def reduce(func, tasks, args=(), kwargs={}, schedule='dynamic'):
         else:
             groups[device_id] += r
 
-    for i in num_devices:
+    for i in range(num_devices):
         if groups[i] is None:
-            groups[i] = cp.zeros(result[0].shape, dtype=dtype)
+            with cp.cuda.Device(i):
+                groups[i] = cp.zeros(result[0].shape, dtype=dtype)
     return array_reduce(groups, inplace=True)
 
 def array_broadcast(a):
@@ -146,20 +157,30 @@ def array_reduce(array_list, inplace=False):
                 array_list[device_id] = array_list[device_id].copy().ravel()
 
     Device = cp.cuda.Device
-    blksize = 1024*1024*1024 // dtype.itemsize # 1GB
+    # corresponding to MEMPOOL_THRESHOLD
+    blksize = 100*1024*1024 // dtype.itemsize # 100 MB
     # Tree-reduce
     step = 1
     while step < num_devices:
-        for device_id in range(0, num_devices, 2*step):
-            if device_id + step < num_devices:
-                Device(device_id+step).synchronize()
-                with Device(device_id):
-                    dst = array_list[device_id]
-                    src = array_list[device_id+step]
-                    buf = cp.empty_like(dst[:blksize])
-                    for p0, p1 in prange(0, size, blksize):
-                        dst[p0:p1] += p2p_transfer(buf[:p1-p0], src[p0:p1])
+        for p0, p1 in prange(0, size, blksize):
+            for device_id in range(0, num_devices, 2*step):
+                if device_id + step < num_devices:
+                    Device(device_id+step).synchronize()
+                    with Device(device_id):
+                        dst = array_list[device_id]
+                        src = array_list[device_id+step]
+                        if _p2p_access:
+                            dst[p0:p1] += src[p0:p1]
+                        else:
+                            dst[p0:p1] += cp.asarray(src[p0:p1])
         step *= 2
+    # It's important to synchronize with the main thread before returning from
+    # this function. The CPU thread may return before the GPU transfers completed.
+    # In the caller, the worker thread contexts (which own the arrays on
+    # the other GPU devices) may be released. Resources on those devices are
+    # recycled while the transfers are still in progress. This can
+    # result in incomplete data transfers or illegal memory accesses.
+    synchronize()
     return array_list[0].reshape(out_shape)
 
 def property(cache=None):
@@ -169,18 +190,20 @@ def property(cache=None):
     When cache is specified, data for each device will be cached in the
     attribute defined by the specified name
     '''
-    assert isinstance(cache, str)
+    assert cache is None or isinstance(cache, str)
 
     def new_decorator(method):
         def attr_method(obj):
             device_id = cp.cuda.device.get_device_id()
-            _cache = getattr(obj, cache, None) # _cache must be a dict
-            if cache is None or not isinstance(_cache, dict):
+            if cache is None:
                 out = method(obj)
                 if device_id != out.device:
                     # the output of method might not be a cupy array
                     out = out.copy()
                 return out
+
+            _cache = getattr(obj, cache)
+            assert isinstance(_cache, dict)
 
             if device_id in _cache:
                 out = _cache[device_id]

@@ -37,7 +37,7 @@ def diagonalize_tda(a, nroots=5):
     nocc, nvir = a.shape[:2]
     nov = nocc * nvir
     a = a.reshape(nov, nov)
-    e = np.linalg.eig(np.asarray(a))[0]
+    e = np.linalg.eigh(np.asarray(a))[0]
     lowest_e = np.sort(e[e.real > 0].real)[:nroots]
     lowest_e = lowest_e[lowest_e > 1e-3]
     return lowest_e
@@ -56,7 +56,7 @@ class KnownValues(unittest.TestCase):
         cls.mol = mol.build()
 
         cls.mf = mf = mol.RHF().to_gpu().run()
-        cls.td_hf = mf.TDHF().run(conv_tol=1e-6, lindep=1.0E-6)
+        cls.td_hf = mf.TDHF().run(conv_tol=1e-6, lindep=1e-10)
 
         mf_lda = mol.RKS().to_gpu().density_fit()
         mf_lda.xc = 'lda, vwn'
@@ -334,6 +334,23 @@ class KnownValues(unittest.TestCase):
         td_scan(mol)
         self.assertAlmostEqual(lib.fp(td_scan.e), 0.41508325757603637, 5)
 
+    def test_td_casida_scanner(self):
+        mol = gto.M(
+            verbose = 0,
+            atom = '''
+              H  0.2  0.   .8
+              F  0.   0.2  0.''',
+            basis = '631g')
+        mol.verbose=5
+        mf = mol.RKS().to_gpu().density_fit().run(conv_tol=1e-10)
+        td = mf.TDDFT()
+        td.nstates = 3
+        ref = td.kernel()[0]
+        td_scan = td.as_scanner()
+        td_scan.max_cycle = 1
+        td_scan(mol)
+        self.assertAlmostEqual(abs(td_scan.e - ref).max(), 0, delta=1e-6)
+
     def test_transition_multipoles(self):
         td_hf = self.td_hf
         self.assertAlmostEqual(abs(lib.fp(td_hf.transition_dipole()             [2])), 0.39833021312014988, 4)
@@ -521,6 +538,60 @@ class KnownValues(unittest.TestCase):
         abxy_ref = ftdhf(cp.asarray([xy])).get().reshape(2,nocc,nvir)
         self.assertAlmostEqual(abs(ab1 - abxy_ref[0]).max(), 0, 9)
         self.assertAlmostEqual(abs(ab2 - abxy_ref[1]).max(), 0, 9)
+
+
+class TDDFTResponse(unittest.TestCase):
+    def test_tpss_triplet_response_matches_spin_blocks(self):
+        mol = gto.M(atom='O 0 0 0; H 0 -.757 .587; H 0 .721 .633',
+                    basis='sto-3g', verbose=0)
+        cpu_mf = mol.RKS(xc='TPSS')
+        cpu_mf.grids.level = 0
+        cpu_mf.conv_tol = 1e-12
+        cpu_mf.kernel()
+        assert cpu_mf.converged
+        mf = cpu_mf.to_gpu()
+        assert getattr(mf._numint, 'gdftopt', None) is None
+        td = mf.TDA().set(singlet=False, nstates=2, conv_tol=1e-10, lindep=1e-24)
+        a, b = td.get_ab()
+        cpu_a, cpu_b = cpu_mf.to_uks().TDDFT().get_ab()
+        # Closed-shell spin adaptation: the triplet block is aa-ab.
+        np.testing.assert_allclose(a, cpu_a[0]-cpu_a[1], atol=1e-9, rtol=1e-9)
+        np.testing.assert_allclose(b, cpu_b[0]-cpu_b[1], atol=1e-9, rtol=1e-9)
+        size = a.shape[0]*a.shape[1]
+        vind, _ = td.gen_vind()
+        np.testing.assert_allclose(vind(cp.eye(size)).get(), a.reshape(size, size).T,
+                                   atol=1e-9, rtol=1e-9)
+        # Request the complete tiny-basis spectrum, including all symmetry sectors.
+        td.nstates = size
+        td.kernel()
+        assert np.all(td.converged)
+        np.testing.assert_allclose(td.e, np.linalg.eigvalsh(a.reshape(size, size)), atol=1e-9, rtol=0)
+        # Electric dipole excitation from a singlet to a triplet is spin forbidden.
+        np.testing.assert_array_equal(td.transition_dipole(), np.zeros((size, 3)))
+        np.testing.assert_array_equal(td.oscillator_strength(), np.zeros(size))
+
+    def test_uks_fresh_response_matches_cpu(self):
+        mol = gto.M(atom='Li 0 0 0; H 0 0 1.6', charge=1, spin=1,
+                    basis='sto-3g', verbose=0)
+        cpu_mf = mol.UKS(xc='TPSS')
+        cpu_mf.grids.level = 0
+        cpu_mf.conv_tol = 1e-12
+        cpu_mf.kernel()
+        assert cpu_mf.converged
+        mf = cpu_mf.to_gpu()
+        assert getattr(mf._numint, 'gdftopt', None) is None
+        td = mf.TDA()
+        a, b = td.get_ab()
+        cpu_a, cpu_b = cpu_mf.TDA().get_ab()
+        for actual, expected in zip(a+b, cpu_a+cpu_b):
+            np.testing.assert_allclose(actual, expected, atol=1e-9, rtol=1e-9)
+        na = a[0].shape[0]*a[0].shape[1]
+        nb = a[2].shape[0]*a[2].shape[1]
+        matrix = np.block([[a[0].reshape(na, na), a[1].reshape(na, nb)],
+                           [a[1].reshape(na, nb).T, a[2].reshape(nb, nb)]])
+        vind, _ = td.gen_vind()
+        np.testing.assert_allclose(vind(cp.eye(na+nb)).get(), matrix.T, atol=1e-9, rtol=1e-9)
+
 
 if __name__ == "__main__":
     print("Full Tests for TD-RKS")

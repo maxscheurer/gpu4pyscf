@@ -18,12 +18,13 @@ import cupyx.scipy.linalg as cpx_linalg
 
 from pyscf import gto, lib
 from gpu4pyscf import scf
-from gpu4pyscf.df.int3c2e import VHFOpt, get_int3c2e_slice
-from gpu4pyscf.lib.cupy_helper import cart2sph, contract, get_avail_mem
+from gpu4pyscf.lib.cupy_helper import contract, get_avail_mem, fill_symmetric
 from gpu4pyscf.tdscf import parameter, math_helper, spectralib, _lr_eig, _krylov_tools
+from gpu4pyscf.tdscf import rhf as td_rhf
 from pyscf.data.nist import HARTREE2EV
 from gpu4pyscf.lib import logger
-from gpu4pyscf.df import int3c2e
+from gpu4pyscf.df import int3c2e_bdiv
+from gpu4pyscf.gto.mole import SortedMole
 
 CITATION_INFO = """
 Please cite the TDDFT-ris method:
@@ -171,43 +172,6 @@ BLKSIZE = 256
 AUXBLKSIZE = 256
 
 
-def get_int3c2e(mol, auxmol, aosym=True, omega=None):
-    '''
-    Generate full int3c2e tensor on GPU
-    for debug purpose
-    '''
-    nao = mol.nao
-    naux = auxmol.nao
-    intopt = VHFOpt(mol, auxmol, 'int2e')
-    intopt.build(diag_block_with_triu=True, aosym=aosym, group_size=BLKSIZE, group_size_aux=BLKSIZE)
-    int3c = cp.empty([naux, nao, nao], order='C')
-    for cp_ij_id, _ in enumerate(intopt.log_qs):
-        cpi = intopt.cp_idx[cp_ij_id]
-        cpj = intopt.cp_jdx[cp_ij_id]
-        li = intopt.angular[cpi]
-        lj = intopt.angular[cpj]
-        i0, i1 = intopt.cart_ao_loc[cpi], intopt.cart_ao_loc[cpi+1]
-        j0, j1 = intopt.cart_ao_loc[cpj], intopt.cart_ao_loc[cpj+1]
-
-        int3c_slice = cp.empty([naux, j1-j0, i1-i0], order='C')
-        for cp_kl_id, _ in enumerate(intopt.aux_log_qs):
-            k0, k1 = intopt.aux_ao_loc[cp_kl_id], intopt.aux_ao_loc[cp_kl_id+1]
-            get_int3c2e_slice(intopt, cp_ij_id, cp_kl_id, out=int3c_slice[k0:k1], omega=omega)
-
-        if not mol.cart:
-            int3c_slice = cart2sph(int3c_slice, axis=1, ang=lj)
-            int3c_slice = cart2sph(int3c_slice, axis=2, ang=li)
-
-        i0, i1 = intopt.ao_loc[cpi], intopt.ao_loc[cpi+1]
-        j0, j1 = intopt.ao_loc[cpj], intopt.ao_loc[cpj+1]
-        int3c[:, j0:j1, i0:i1] = int3c_slice
-    if aosym:
-        row, col = np.tril_indices(nao)
-        int3c[:, row, col] = int3c[:, col, row]
-    int3c = intopt.unsort_orbitals(int3c, aux_axis=[0], axis=[1,2])
-    return int3c
-
-
 def get_Tpq(mol, auxmol, lower_inv_eri2c, C_p, C_q, 
            calc='JK', aosym=True, omega=None, alpha=None, beta=None,
            group_size=BLKSIZE, group_size_aux=AUXBLKSIZE, log=None, 
@@ -224,26 +188,30 @@ def get_Tpq(mol, auxmol, lower_inv_eri2c, C_p, C_q,
     Returns:
         Tpq: cupy.ndarray (naux, nao, nao)
     """
-    nao = mol.nao
-    naux = auxmol.nao
+    #from gpu4pyscf.df.int3c2e import VHFOpt, get_int3c2e_slice
+    sr_factor = lr_factor = None
+    if omega is not None and alpha is not None and beta is not None:
+        sr_factor = alpha
+        lr_factor = alpha + beta
 
-    intopt = VHFOpt(mol, auxmol, 'int2e')
-    intopt.build(aosym=True, group_size=group_size, group_size_aux=group_size_aux,verbose=mol.verbose)
+    sorted_mol = SortedMole.from_mol(mol, decontract=True)
+    opt = int3c2e_bdiv.Int3c2eOpt(sorted_mol, auxmol).build(tril=aosym)
+    pair_addresses = opt.pair_and_diag_indices(cart=True, original_ao_order=False)[0]
+    nao_pair = len(pair_addresses)
+    C_p = sorted_mol.apply_C_dot(C_p)
+    C_q = sorted_mol.apply_C_dot(C_q)
 
-    C_p = C_p[intopt._ao_idx,:]
-    C_q = C_q[intopt._ao_idx,:]
-
+    nao = sorted_mol.nao
+    naux = opt.auxmol.nao
     siz_p = C_p.shape[1]
     siz_q = C_q.shape[1]
 
-    upper_inv_eri2c = lower_inv_eri2c[intopt._aux_ao_idx, intopt._aux_ao_idx[:,None]]
-    # equivalent to 
-    # upper_inv_eri2c = lower_inv_eri2c[intopt._aux_ao_idx,:][:,intopt._aux_ao_idx].T.copy()
+    upper_inv_eri2c = cp.asarray(
+        opt.auxmol.ctr_coeff, dtype=lower_inv_eri2c.dtype).dot(lower_inv_eri2c).T
 
     xp = np if in_ram else cp
     log.info(f'xp {xp}')
     P_dtype = xp.float32 if single else xp.float64
-    int3c_dtype = cp.float32 if single else cp.float64
 
     if 'J' in calc:
         Pia = xp.empty((naux, siz_p, siz_q), dtype=P_dtype)
@@ -252,49 +220,33 @@ def get_Tpq(mol, auxmol, lower_inv_eri2c, C_p, C_q,
         Pij = xp.empty((naux, siz_p, siz_p), dtype=P_dtype)
         Pab = xp.empty((naux, siz_q, siz_q), dtype=P_dtype)
 
-    for cp_kl_id, _ in enumerate(intopt.aux_log_qs):
-        k0, k1 = intopt.aux_ao_loc[cp_kl_id], intopt.aux_ao_loc[cp_kl_id+1]
+    batch_size = 32
+    mem_avail = get_avail_mem(exclude_memory_pool=True)
+    word_avail = mem_avail // 8
+    batch_size = min(int(word_avail * 0.5) // nao_pair, naux)
+    eval_j3c, x, _, aux_offsets = opt.int3c2e_evaluator(
+        aux_batch_size=batch_size, cart=True,
+        omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
+    blksize = min(int(word_avail * 0.25) // nao**2, batch_size)
+    # The evaluator fills a complete auxiliary tile before orbital contractions.
+    batch_size = int((aux_offsets[1:]-aux_offsets[:-1]).max())
+    blksize = min(blksize, batch_size)
 
-        int3c_slice = cp.empty((k1 - k0, nao, nao), dtype=int3c_dtype, order='C')
-        for cp_ij_id, _ in enumerate(intopt.log_qs):
-            cpi = intopt.cp_idx[cp_ij_id]
-            cpj = intopt.cp_jdx[cp_ij_id]
-            li = intopt.angular[cpi]
-            lj = intopt.angular[cpj]
+    buf = cp.empty((batch_size, nao_pair))
+    j3c_full = cp.zeros((nao, nao, blksize))
+    for batch_id, (p0, p1) in enumerate(zip(aux_offsets[:-1], aux_offsets[1:])):
+        compressed = eval_j3c(aux_batch_id=batch_id, out=buf)
+        naux_in_batch = compressed.shape[1]
+        for k0, k1 in lib.prange(0, naux_in_batch, blksize):
+            j3c = j3c_full[:,:,:k1-k0]
+            fill_symmetric(compressed, pair_addresses, nao, k0, k1, out=j3c)
+            int3c_slice = j3c.transpose(2, 0, 1)
+            if 'J' in calc:
+                Pia[p0+k0:p0+k1,:,:] = get_PuvCupCvq_to_Ppq(int3c_slice,C_p,C_q, in_ram=in_ram)
 
-            int3c_slice_blk = get_int3c2e_slice(intopt, cp_ij_id, cp_kl_id, omega=0)
-
-            if not mol.cart:
-                int3c_slice_blk = cart2sph(int3c_slice_blk, axis=1, ang=lj)
-                int3c_slice_blk = cart2sph(int3c_slice_blk, axis=2, ang=li)
-
-
-            if omega and omega != 0:
-                int3c_slice_blk_omega = get_int3c2e_slice(intopt, cp_ij_id, cp_kl_id, omega=omega)
-
-                if not mol.cart:
-                    int3c_slice_blk_omega = cart2sph(int3c_slice_blk_omega, axis=1, ang=lj)
-                    int3c_slice_blk_omega = cart2sph(int3c_slice_blk_omega, axis=2, ang=li)
-                int3c_slice_blk = alpha * int3c_slice_blk +  beta * int3c_slice_blk_omega
-
-            int3c_slice_blk = cp.asarray(int3c_slice_blk, dtype=int3c_dtype, order='C')
-            i0, i1 = intopt.ao_loc[cpi], intopt.ao_loc[cpi+1]
-            j0, j1 = intopt.ao_loc[cpj], intopt.ao_loc[cpj+1]
-
-            assert int3c_slice[:,j0:j1, i0:i1].shape == int3c_slice_blk.shape
-            int3c_slice[:,j0:j1, i0:i1] = int3c_slice_blk
-
-        if aosym:
-            row, col = cp.tril_indices(nao)
-            int3c_slice[:, row, col] = int3c_slice[:, col, row]
-
-        '''Puv -> Ppq, AO->MO transform '''
-        if 'J' in calc:
-            Pia[k0:k1,:,:] = get_PuvCupCvq_to_Ppq(int3c_slice,C_p,C_q, in_ram=in_ram)
-
-        if 'K' in calc:
-            Pij[k0:k1,:,:] = get_PuvCupCvq_to_Ppq(int3c_slice,C_p,C_p, in_ram=in_ram)
-            Pab[k0:k1,:,:] = get_PuvCupCvq_to_Ppq(int3c_slice,C_q,C_q, in_ram=in_ram)
+            if 'K' in calc:
+                Pij[p0+k0:p0+k1,:,:] = get_PuvCupCvq_to_Ppq(int3c_slice,C_p,C_p, in_ram=in_ram)
+                Pab[p0+k0:p0+k1,:,:] = get_PuvCupCvq_to_Ppq(int3c_slice,C_q,C_q, in_ram=in_ram)
 
     if in_ram:
         def einsum2dot(_,a,b):
@@ -329,14 +281,13 @@ def get_Tpq(mol, auxmol, lower_inv_eri2c, C_p, C_q,
         return Tia, Tij, Tab
    
 
-def get_eri2c_inv_lower(auxmol, omega=0, alpha=None, beta=None):
+def get_eri2c_inv_lower(auxmol, omega=0, alpha=None, beta=None, dtype=cp.float32):
 
-    eri2c = auxmol.intor('int2c2e')
+    eri2c = int3c2e_bdiv.int2c2e(auxmol)
 
     if omega and omega != 0:
 
-        with auxmol.with_range_coulomb(omega):
-            eri2c_erf = auxmol.intor('int2c2e')
+        eri2c_erf = int3c2e_bdiv.int2c2e(auxmol, omega=omega)
 
         eri2c = alpha * eri2c + beta * eri2c_erf
 
@@ -357,7 +308,7 @@ def get_eri2c_inv_lower(auxmol, omega=0, alpha=None, beta=None):
         '''
         lower_inv_eri2c = math_helper.matrix_power(eri2c,-0.5,epsilon=LINEAR_EPSILON)
 
-    lower_inv_eri2c = cp.asarray(lower_inv_eri2c, dtype=cp.float32, order='C')
+    lower_inv_eri2c = cp.asarray(lower_inv_eri2c, dtype=dtype, order='C')
     return lower_inv_eri2c
 
 
@@ -509,7 +460,7 @@ def gen_ijab_MVP(T_ij, T_ab):
             # vir_range = vir_end - vir_start
 
             # Extract the corresponding chunk of T_ab
-            T_ab_chunk = T_ab[:, vir_start:vir_end, :]  # Shape: (nauxao, vir_range, n_vir)
+            T_ab_chunk = cp.asarray(T_ab[:, vir_start:vir_end, :])  # Shape: (nauxao, vir_range, n_vir)
 
             # Compute T_ab_V for the current chunk
             T_ab_chunk_V = contract("Pab,mjb->Pamj", T_ab_chunk, V)
@@ -574,7 +525,7 @@ def gen_ibja_MVP(T_ia):
             V_chunk = V[:, occ_start:occ_end, :]  # Shape: (n_state, occ_range, n_vir)
 
             # Extract the corresponding chunk of T_ia
-            T_ia_chunk = T_ia[:, occ_start:occ_end, :]  # Shape: (nauxao, occ_range, n_vir)
+            T_ia_chunk = cp.asarray(T_ia[:, occ_start:occ_end, :])  # Shape: (nauxao, occ_range, n_vir)
 
             # Compute T_ib_V for the current chunk
             T_ib_V_chunk = contract("Pib,mjb->Pimj", T_ia_chunk, V_chunk)
@@ -632,7 +583,7 @@ def get_ab(td, mf, J_fit, K_fit, theta, mo_energy=None, mo_coeff=None, mo_occ=No
 
     def get_erimo(auxmol_i):
         naux = auxmol_i.nao
-        int3c = int3c2e.get_int3c2e(mol, auxmol_i)
+        int3c = int3c2e_bdiv.aux_e2(mol, auxmol_i)
         int2c2e = auxmol_i.intor('int2c2e')
         int3c = cp.asarray(int3c)
         int2c2e = cp.asarray(int2c2e)
@@ -647,7 +598,7 @@ def get_ab(td, mf, J_fit, K_fit, theta, mo_energy=None, mo_coeff=None, mo_occ=No
         return eri_mo
     def get_erimo_omega(auxmol_i, omega):
         naux = auxmol_i.nao
-        int3c = int3c2e.get_int3c2e(mol, auxmol_i, omega=omega)
+        int3c = int3c2e_bdiv.aux_e2(mol, auxmol_i, omega=omega)
         with auxmol_i.with_range_coulomb(omega):
             int2c2e = auxmol_i.intor('int2c2e')
         int3c = cp.asarray(int3c)
@@ -724,6 +675,7 @@ class TD_Scanner(lib.SinglePointScanner):
     def __init__(self, td):
         self.__dict__.update(td.__dict__)
         self._scf = td._scf.as_scanner()
+        self._basis_fp = np.hstack(td.mol.bas_exps())
 
     def __call__(self, mol_or_geom, **kwargs):
         assert self.device == 'gpu'
@@ -734,6 +686,9 @@ class TD_Scanner(lib.SinglePointScanner):
         
         self.reset(mol)
         mf_scanner = self._scf
+        mo_prev = mf_scanner.mo_coeff
+        occ_prev = mf_scanner.mo_occ
+
         mf_e = mf_scanner(mol)
         self.n_occ = None
         self.n_vir = None
@@ -752,19 +707,31 @@ class TD_Scanner(lib.SinglePointScanner):
         self.lower_inv_eri2c_K = None
         self.RKS = True
         self.UKS = False
-        self.mo_coeff = cp.asarray(self._scf.mo_coeff, dtype=self.dtype)
+        self.mo_coeff = self._scf.mo_coeff
         self.build()
-        self.kernel()
+
+        # Reuse the previous step for initial guess.
+        x0 = self.xy
+        if x0 is not None:
+            if np.array_equal(self._basis_fp, np.hstack(mol.bas_exps())):
+                logger.info(self, 'Use cashed TDDFT guess (AO projected)')
+                x0 = self._transfer_initial_guess(x0, mo_prev, occ_prev)
+            else:
+                # When the basis set is changed, avoid using xy from the
+                # previous step as initial guess.
+                x0 = self.xy = None
+
+        self.kernel(x0=x0)
         return mf_e + self.energies/HARTREE2EV
 
 
 class RisBase(lib.StreamObject):
     def __init__(self, mf,  
                 theta: float = 0.2, J_fit: str = 'sp', K_fit: str = 's', 
-                Ktrunc: float = 40.0, a_x: float = None, omega: float = None, 
+                Ktrunc: float = 0.0, a_x: float = None, omega: float = None, 
                 alpha: float = None, beta: float = None, conv_tol: float = 1e-3, 
                 nstates: int = 5, max_iter: int = 25, spectra: bool = False, 
-                out_name: str = '', print_threshold: float = 0.05, gram_schmidt: bool = False, 
+                out_name: str = '', print_threshold: float = 0.05, gram_schmidt: bool = True,
                 single: bool = True, group_size: int = 256, group_size_aux: int = 256, 
                 in_ram: bool = True, verbose=None):
         """
@@ -834,7 +801,7 @@ class RisBase(lib.StreamObject):
         self.nstates = nstates
         self.max_iter = max_iter
         self.mol = mf.mol
-        self.mo_coeff = cp.asarray(mf.mo_coeff, dtype=self.dtype)
+        self.mo_coeff = mf.mo_coeff
         self.spectra = spectra
         self.out_name = out_name
         self.print_threshold = print_threshold
@@ -849,8 +816,8 @@ class RisBase(lib.StreamObject):
         
         self._in_ram = in_ram
 
-        logger.TIMER_LEVEL = 4
         self.log = logger.new_logger(self)
+        self.log.TIMER_LEVEL = 4
         self.log.info(f'group_size {group_size}, group_size_aux {group_size_aux}')
     
         ''' following attributes will be initialized in self.build() '''
@@ -922,10 +889,14 @@ class RisBase(lib.StreamObject):
         return get_ab(self, mf, J_fit, K_fit, theta, singlet=True)
     
     def build(self):
+        self.dtype = cp.dtype(cp.float32 if self.single else cp.float64)
         log = self.log
         log.info(f'nstates: {self.nstates}')
         log.info(f'N atoms:{self._scf.mol.natm}')
         log.info(f'conv_tol: {self.conv_tol}')
+        if self.single and self.conv_tol < 1e-5:
+            log.warn('Eigenvalue problem is solved in fp32 precision and may not '
+                     f'converge to the required threshold {self.conv_tol}.')
         log.info(f'max_iter: {self.max_iter}')
         log.info(f'Ktrunc: {self.Ktrunc}')
         log.info(f'calculate and print UV-vis spectra info: {self.spectra}')
@@ -1079,7 +1050,7 @@ class RisBase(lib.StreamObject):
         byte_T_ia_J = self.auxmol_J.nao_nr() * self.n_occ * self.n_vir * self.dtype.itemsize
         log.info(f'T_ia_J will take {byte_T_ia_J / (1024 ** 2):.0f} MB memory') 
 
-        self.lower_inv_eri2c_J = get_eri2c_inv_lower(self.auxmol_J, omega=0)
+        self.lower_inv_eri2c_J = get_eri2c_inv_lower(self.auxmol_J, omega=0, dtype=self.dtype)
 
         if self.a_x != 0:
             
@@ -1094,7 +1065,8 @@ class RisBase(lib.StreamObject):
             if self._JK_share_aux:
                 self.lower_inv_eri2c_K = self.lower_inv_eri2c_J
             else:
-                self.lower_inv_eri2c_K = get_eri2c_inv_lower(auxmol_K, omega=self.omega, alpha=self.alpha, beta=self.beta)
+                self.lower_inv_eri2c_K = get_eri2c_inv_lower(auxmol_K, omega=self.omega,
+                                                          alpha=self.alpha, beta=self.beta, dtype=self.dtype)
              
         self.log = log
 
@@ -1155,6 +1127,9 @@ class RisBase(lib.StreamObject):
     def nac_method(self):
         return self.NAC()
 
+    def nac_gradient_method(self):
+        return self.NACGradients()
+
     def reset(self, mol=None):
         if mol is not None:
             self.mol = mol
@@ -1163,12 +1138,42 @@ class RisBase(lib.StreamObject):
 
     as_scanner = as_scanner
 
+    force_and_nacv = td_rhf.TDBase.force_and_nacv
+
+
 class TDA(RisBase):
     def __init__(self, mf, **kwargs):
         super().__init__(mf, **kwargs)
         log = self.log
         log.warn("TDA-ris is still in the experimental stage, and its APIs are subject to change in future releases.")
         log.info('TDA-ris initialized')
+
+    def _transfer_initial_guess(self, xy, mo_coeff, mo_occ):
+        mf = self._scf
+        if mf.istype('UHF'):
+            raise NotImplementedError('Does not support UKS method yet')
+        S = mf.get_ovlp()
+        nstates = len(xy[0])
+        orbo1 = mo_coeff[:, mo_occ==2]
+        orbv1 = mo_coeff[:, mo_occ==0]
+        orbo2 = mf.mo_coeff[:, mf.mo_occ==2]
+        orbv2 = mf.mo_coeff[:, mf.mo_occ==0]
+        S_occ = cp.asarray(orbo2.T.dot(S).dot(orbo1), dtype=self.dtype)
+        S_vir = cp.asarray(orbv2.T.dot(S).dot(orbv1), dtype=self.dtype)
+        nocc = orbo1.shape[1]
+        nvir = orbv1.shape[1]
+
+        X_mo = xy[0].reshape(nstates, nocc, nvir)
+        X_mo = cp.einsum('ui,nij,vj->nuv', S_occ, X_mo, S_vir)
+        X_mo = X_mo.reshape(nstates, -1)
+        Y_mo = xy[1]
+        if not isinstance(Y_mo, (np.ndarray, cp.ndarray)):
+            return X_mo
+
+        Y_mo = xy[1].reshape(nstates, nocc, nvir)
+        Y_mo = cp.einsum('ui,nij,vj->nuv', S_occ, Y_mo, S_vir)
+        Y_mo = Y_mo.reshape(nstates, -1)
+        return X_mo, Y_mo
 
 
     ''' ===========  RKS hybrid =========== '''
@@ -1278,7 +1283,7 @@ class TDA(RisBase):
             raise NotImplementedError('Does not support UKS method yet')
         return TDA_MVP, hdiag
 
-    def kernel(self):
+    def kernel(self, x0=None):
 
         '''for TDA, pure and hybrid share the same form of
                      AX = Xw
@@ -1287,10 +1292,14 @@ class TDA(RisBase):
         '''
         log = self.log
 
+        initguess_fn = None
+        if x0 is not None:
+            initguess_fn = lambda *args, **kwargs: (True, None, x0)
+
         TDA_MVP, hdiag = self.gen_vind()
         converged, energies, X = _krylov_tools.krylov_solver(matrix_vector_product=TDA_MVP,hdiag=hdiag, n_states=self.nstates, problem_type='eigenvalue',
                                               conv_tol=self.conv_tol, max_iter=self.max_iter, gram_schmidt=self.gram_schmidt,
-                                              single=self.single, verbose=log)
+                                              initguess_fn=initguess_fn, single=self.single, verbose=log)
 
         self.converged = converged
         log.debug(f'check orthonormality of X: {cp.linalg.norm(cp.dot(X, X.T) - cp.eye(X.shape[0])):.2e}')
@@ -1328,6 +1337,14 @@ class TDA(RisBase):
             from gpu4pyscf.nac.tdrks_ris import NAC
             return NAC(self)
 
+    def NACGradients(self):
+        if getattr(self._scf, 'with_df', None):
+            from gpu4pyscf.df.nac import tdrks_ris_grad_nacv
+            return tdrks_ris_grad_nacv.NAC_multistates(self)
+        else:
+            from gpu4pyscf.nac import tdrks_ris_grad_nacv
+            return tdrks_ris_grad_nacv.NAC_multistates(self)
+
     
 class TDDFT(RisBase):
     def __init__(self, mf, **kwargs):
@@ -1335,6 +1352,8 @@ class TDDFT(RisBase):
         log = self.log
         log.warn("TDDFT-ris is still in the experimental stage, and its APIs are subject to change in future releases.")
         log.info('TDDFT-ris is initialized')
+
+    _transfer_initial_guess = TDA._transfer_initial_guess
 
     ''' ===========  RKS hybrid =========== '''
     def gen_RKS_TDDFT_hybrid_MVP(self):
@@ -1456,26 +1475,47 @@ class TDDFT(RisBase):
         return TDDFT_MVP, hdiag
     
     #  TODO: UKS 
-    def kernel(self):
+    def kernel(self, x0=None):
         self.build()
         log = self.log
+
         TDDFT_MVP, hdiag = self.gen_vind()
         if self.a_x != 0:
             '''hybrid TDDFT'''
+            initguess_fn = None
+            if x0 is not None:
+                initguess_fn = lambda *args, **kwargs: (True, None, x0[0], x0[1])
+
             converged, energies, X, Y = _krylov_tools.ABBA_krylov_solver(matrix_vector_product=TDDFT_MVP, hdiag=hdiag,
                                                     n_states=self.nstates, conv_tol=self.conv_tol,
                                                     max_iter=self.max_iter, gram_schmidt=self.gram_schmidt,
-                                                    single=self.single, verbose=self.verbose)
+                                                    initguess_fn=initguess_fn, single=self.single, verbose=self.verbose)
             self.converged = converged
             if not all(self.converged):
                 log.info('TD-SCF states %s not converged.',
                             [i for i, x in enumerate(self.converged) if not x])
         elif self.a_x == 0:
             '''pure TDDFT'''
+            initguess_fn = None
             hdiag_sq = hdiag
+
+            if x0 is not None:
+                def XY_2_Z(X_Y):
+                    '''Given X, Y, (A-B)^2, return Z.
+
+                        X - Y = (A-B)^-1/2 Z
+                        X + Y = (A-B)^1/2 Z omega^-1
+                    '''
+                    AmB_sq = hdiag_sq
+                    AmB = AmB_sq**0.5
+                    X, Y = X_Y
+                    Z = AmB**0.5 * (X - Y)
+                    return Z
+                initguess_fn = lambda *args, **kwargs: (True, None, XY_2_Z(x0))
+
             converged, energies_sq, Z = _krylov_tools.krylov_solver(matrix_vector_product=TDDFT_MVP, hdiag=hdiag_sq,
                                             n_states=self.nstates, conv_tol=self.conv_tol, max_iter=self.max_iter,
-                                            gram_schmidt=self.gram_schmidt, single=self.single, verbose=self.verbose)
+                                            gram_schmidt=self.gram_schmidt, initguess_fn=initguess_fn, single=self.single, verbose=self.verbose)
             self.converged = converged
             if not all(self.converged):
                 log.info('TD-SCF states %s not converged.',
@@ -1506,6 +1546,7 @@ class TDDFT(RisBase):
 
     Gradients = TDA.Gradients
     NAC = TDA.NAC
+    NACGradients = TDA.NACGradients
 
 
 class StaticPolarizability(RisBase):
@@ -1581,12 +1622,11 @@ class StaticPolarizability(RisBase):
         TDA_MVP, hdiag = self.gen_vind()
         transition_dipole = self.transition_dipole()
 
-        _, solver = _krylov_tools.krylov_solver(matrix_vector_product=TDA_MVP,hdiag=hdiag, problem_type='linear',
+        self.converged, X = _krylov_tools.krylov_solver(matrix_vector_product=TDA_MVP,hdiag=hdiag, problem_type='linear',
                                         rhs=-transition_dipole, conv_tol=self.conv_tol, max_iter=self.max_iter, 
                                         gram_schmidt=self.gram_schmidt, single=self.single, verbose=log)
-        X = solver.run()
         # actually X here means X+Y
-        alpha = cp.dot(X, transition_dipole.T)*4
+        alpha = -cp.dot(X, transition_dipole.T)*4
 
         self.xy = X
         self.alpha = alpha

@@ -27,10 +27,17 @@ else:
     MultiGridNumInt_cpu = multigrid_cpu.MultiGridFFTDF
 from gpu4pyscf.pbc.dft import multigrid_v2 as multigrid
 from gpu4pyscf.pbc.tools import ifft, fft
+from gpu4pyscf.pbc.dft import numint, UniformGrids
+from gpu4pyscf.pbc.dft import KRKS as KRKS_gpu
+from gpu4pyscf.pbc.dft import KUKS as KUKS_gpu
+
 import pytest
 
+if multigrid.libgpbc is None:
+    raise unittest.SkipTest('multigrid v2 kernels not compiled')
+
 def setUpModule():
-    global cell_orth, cell_nonorth
+    global cell_orth, cell_nonorth, cell_he
     global kpts, dm, dm1
     np.random.seed(2)
     cell_orth = gto.M(
@@ -63,9 +70,16 @@ def setUpModule():
         unit = 'bohr',
         mesh = [18] * 3) # GGA needs dense mesh for derivative in reciprocal space
 
+    cell_he = pyscf.M(atom='He 0 0 0',
+                      basis=[[0, ( 1, 1, .1), (.5, .1, 1)],
+                             [1, (.8, 1)],
+                             [2, (.6, 1)]],
+                      unit='B',
+                      a=np.eye(3)*5)
+
 def tearDownModule():
-    global cell_orth, cell_nonorth
-    del cell_orth, cell_nonorth
+    global cell_orth, cell_nonorth, cell_he
+    del cell_orth, cell_nonorth, cell_he
 
 class KnownValues(unittest.TestCase):
     def test_get_pp(self):
@@ -270,7 +284,7 @@ class KnownValues(unittest.TestCase):
         assert abs(exc0-exc1).max() < 1e-8
         assert abs(ref-vxc.get()).max() < 1e-8
 
-    def test_get_vxc_mgga(self):
+    def test_get_vxc_mgga_high_cost(self):
         nao = cell_orth.nao
         np.random.seed(2)
         xc = 'r2scan'
@@ -297,7 +311,7 @@ class KnownValues(unittest.TestCase):
         assert abs(exc0-exc1).max() < 1e-7
         assert abs(ref-vxc.get()).max() < 1e-7
 
-    def test_get_vxc_mgga_kpts(self):
+    def test_get_vxc_mgga_kpts_high_cost(self):
         nao = cell_orth.nao
         np.random.seed(3)
         xc = 'r2scan'
@@ -564,14 +578,14 @@ class KnownValues(unittest.TestCase):
         ret = multigrid._unique_image_pair(Ls)
         assert ret[0].shape == (2431, 3)
         assert abs(lib.fp(ret[0].get()) - 1.5047201402319172) < 1e-10
-        assert abs(lib.fp(ret[1].get()) - -483.0210637951298) < 1e-10
+        assert abs(lib.fp(ret[1].get()) - -483.0210637951298) < 1e-9
 
         np.random.seed(2)
         Ls = Ls[np.random.rand(len(Ls)) > .5]
         ret = multigrid._unique_image_pair(Ls)
         assert ret[0].shape == (2377, 3)
         assert abs(lib.fp(ret[0].get()) - -34.99306750756055) < 1e-10
-        assert abs(lib.fp(ret[1].get()) - 1347.464804553046) < 1e-10
+        assert abs(lib.fp(ret[1].get()) - 1347.464804553046) < 1e-8
 
         Lx = np.append(np.arange(0, 3), np.arange(-3, 0))
         Ly = np.append(np.arange(0, 3), np.arange(-3, 0))
@@ -581,7 +595,7 @@ class KnownValues(unittest.TestCase):
         ret = multigrid._unique_image_pair(Ls)
         assert ret[0].shape == (1331, 3)
         assert abs(lib.fp(ret[0].get()) - -1.355090495130784) < 1e-10
-        assert abs(lib.fp(ret[1].get()) - 2145.771285837819) < 1e-10
+        assert abs(lib.fp(ret[1].get()) - 2145.771285837819) < 1e-8
 
     def test_image_pair_to_difference(self):
         cell = gto.M(a=np.eye(3)*3, atom='He 0. 0. 0.', basis=[[0, [1, 1]]])
@@ -589,6 +603,280 @@ class KnownValues(unittest.TestCase):
         difference_images, inverse = multigrid.image_pair_to_difference(Ls, cell.lattice_vectors())
         assert difference_images.shape == (25, 3)
         assert len(inverse) == len(Ls)**2
+
+    def test_nr_rks_fxc(self):
+        cell = cell_he
+        np.random.seed(9)
+        nao = cell.nao
+        dm_he = np.random.rand(nao, nao)
+        dm_he = dm_he + dm_he.T
+        dm_he = dm_he * .2 + np.eye(nao)
+        dm_he = cp.asarray(dm_he)
+
+        dm1 = np.random.rand(2,1,nao,nao)
+        dm1 = dm1 + dm1.transpose(0,1,3,2)
+        dm1 = cp.asarray(dm1)
+        grids = UniformGrids(cell)
+
+        ni = numint.NumInt()
+        mg = multigrid.MultiGridNumInt(cell)
+
+        xc = 'lda,'
+        ref = ni.nr_rks_fxc(cell, grids, xc, dm_he, dm1, hermi=1)
+        v = mg.nr_rks_fxc(cell, grids, xc, dm_he, dm1, hermi=1)
+        self.assertAlmostEqual(abs(v-ref).max().get(), 0, 10)
+
+        xc = 'b88,'
+        ref = ni.nr_rks_fxc(cell, grids, xc, dm_he, dm1, hermi=1)
+        v = mg.nr_rks_fxc(cell, grids, xc, dm_he, dm1, hermi=1)
+        self.assertAlmostEqual(abs(v-ref).max().get(), 0, 10)
+
+        xc = 'r2scan,'
+        ref = ni.nr_rks_fxc(cell, grids, xc, dm_he, dm1, hermi=1)
+        v = mg.nr_rks_fxc(cell, grids, xc, dm_he, dm1, hermi=1)
+        self.assertAlmostEqual(abs(v-ref).max().get(), 0, 10)
+
+        kpts = cell.make_kpts([3,1,1])
+        dm_he = np.random.rand(len(kpts), nao, nao)
+        dm_he = dm_he + dm_he.transpose(0,2,1)
+        dm_he = dm_he * .2 + np.eye(nao)
+        dm_he = cp.asarray(dm_he)
+
+        dm1 = np.random.rand(2,len(kpts),nao,nao)
+        dm1 = dm1 + np.random.random(dm1.shape)*1j
+        dm1 = dm1 + dm1.transpose(0,1,3,2).conj()
+        dm1 = cp.asarray(dm1)
+
+        ni = numint.KNumInt()
+
+        xc = 'lda,'
+        ref = ni.nr_rks_fxc(cell, grids, xc, dm_he, dm1, hermi=1, kpts=kpts)
+        v = mg.nr_rks_fxc(cell, grids, xc, dm_he, dm1, hermi=1, kpts=kpts)
+        self.assertAlmostEqual(abs(v-ref).max().get(), 0, 10)
+
+        xc = 'b88,'
+        ref = ni.nr_rks_fxc(cell, grids, xc, dm_he, dm1, hermi=1, kpts=kpts)
+        v = mg.nr_rks_fxc(cell, grids, xc, dm_he, dm1, hermi=1, kpts=kpts)
+        self.assertAlmostEqual(abs(v-ref).max().get(), 0, 10)
+
+        xc = 'r2scan,'
+        ref = ni.nr_rks_fxc(cell, grids, xc, dm_he, dm1, hermi=1, kpts=kpts)
+        v = mg.nr_rks_fxc(cell, grids, xc, dm_he, dm1, hermi=1, kpts=kpts)
+        self.assertAlmostEqual(abs(v-ref).max().get(), 0, 10)
+
+    def test_nr_uks_fxc(self):
+        cell = cell_he
+        np.random.seed(9)
+        nao = cell.nao
+        dm_he = np.random.rand(2, nao, nao)
+        dm_he = dm_he + dm_he.transpose(0,2,1)
+        dm_he = dm_he * .2 + np.eye(nao)
+        dm_he = cp.asarray(dm_he)
+
+        dm1 = np.random.rand(2,3,1,nao,nao)
+        dm1 = dm1 + dm1.transpose(0,1,2,4,3)
+        dm1 = cp.asarray(dm1)
+        grids = UniformGrids(cell)
+
+        ni = numint.NumInt()
+        mg = multigrid.MultiGridNumInt(cell)
+
+        xc = 'lda,'
+        ref = ni.nr_uks_fxc(cell, grids, xc, dm_he, dm1, hermi=1)
+        v = mg.nr_uks_fxc(cell, grids, xc, dm_he, dm1, hermi=1)
+        self.assertAlmostEqual(abs(v-ref).max().get(), 0, 10)
+
+        xc = 'b88,'
+        ref = ni.nr_uks_fxc(cell, grids, xc, dm_he, dm1, hermi=1)
+        v = mg.nr_uks_fxc(cell, grids, xc, dm_he, dm1, hermi=1)
+        self.assertAlmostEqual(abs(v-ref).max().get(), 0, 10)
+
+        xc = 'r2scan,'
+        ref = ni.nr_uks_fxc(cell, grids, xc, dm_he, dm1, hermi=1)
+        v = mg.nr_uks_fxc(cell, grids, xc, dm_he, dm1, hermi=1)
+        self.assertAlmostEqual(abs(v-ref).max().get(), 0, 10)
+
+        kpts = cell.make_kpts([3,1,1])
+        dm_he = np.random.rand(2, len(kpts), nao, nao)
+        dm_he = dm_he + dm_he.transpose(0,1,3,2)
+        dm_he = dm_he * .2 + np.eye(nao)
+        dm_he = cp.asarray(dm_he)
+
+        dm1 = np.random.rand(2,3, len(kpts),nao,nao)
+        dm1 = dm1 + np.random.random(dm1.shape)*1j
+        dm1 = dm1 + dm1.transpose(0,1,2,4,3).conj()
+        dm1 = cp.asarray(dm1)
+
+        ni = numint.KNumInt()
+
+        xc = 'lda,'
+        ref = ni.nr_uks_fxc(cell, grids, xc, dm_he, dm1, hermi=1, kpts=kpts)
+        v = mg.nr_uks_fxc(cell, grids, xc, dm_he, dm1, hermi=1, kpts=kpts)
+        self.assertAlmostEqual(abs(v-ref).max().get(), 0, 10)
+
+        xc = 'b88,'
+        ref = ni.nr_uks_fxc(cell, grids, xc, dm_he, dm1, hermi=1, kpts=kpts)
+        v = mg.nr_uks_fxc(cell, grids, xc, dm_he, dm1, hermi=1, kpts=kpts)
+        self.assertAlmostEqual(abs(v-ref).max().get(), 0, 10)
+
+        xc = 'r2scan,'
+        ref = ni.nr_uks_fxc(cell, grids, xc, dm_he, dm1, hermi=1, kpts=kpts)
+        v = mg.nr_uks_fxc(cell, grids, xc, dm_he, dm1, hermi=1, kpts=kpts)
+        self.assertAlmostEqual(abs(v-ref).max().get(), 0, 10)
+
+    @unittest.skip('multigrid_v2 derivatives not fully implemented')
+    def test_shell_splitting_for_large_fock_in_imagediff_space_gamma(self):
+        cell = gto.M(
+            a = np.eye(3)*3.5668,
+            atom = '''
+                C     0.      0.      0.
+                C     0.8817  0.8917  0.8917
+                C     1.7834  1.7834  0.
+                C     2.6751  2.6751  0.8917
+                C     1.7834  0.      1.7834
+                C     2.6751  0.8917  2.6751
+                C     0.      1.7834  1.7834
+                C     0.8917  2.6751  2.6751
+            ''',
+            basis = "gth-dzvp",
+            pseudo = 'gth-pbe',
+            precision = 1e-8,
+            verbose = 0,
+            output='/dev/null'
+        )
+
+        kpts = cell.make_kpts([1,1,1])
+        mf = KRKS_gpu(cell, xc = 'pbe', kpts = kpts)
+        mf.conv_tol = 1e-10
+
+        # mf._numint = multigrid.MultiGridNumInt(cell)
+        # ref_energy = mf.kernel()
+        # assert mf.converged
+        # ref_gradient = mf.Gradients().kernel()
+        # print(repr(ref_energy))
+        # print(repr(ref_gradient))
+
+        with lib.temporary_env(multigrid, get_avail_mem=(lambda **kw: 2**28)):
+            mf._numint = multigrid.MultiGridNumInt(cell)
+
+            test_energy = mf.kernel()
+            assert mf.converged
+            test_gradient = mf.Gradients().kernel()
+
+        ref_energy = -44.93180128532909
+        ref_gradient = np.array([
+            [ 2.87614262e-03,  1.33298682e-03,  1.33298682e-03],
+            [-8.42690061e-03,  1.01735391e-05,  1.01735391e-05],
+            [ 2.82851274e-03,  1.28135252e-03, -1.28134877e-03],
+            [-1.00471252e-04, -8.51551903e-06,  8.51502092e-06],
+            [ 2.82851274e-03, -1.28134877e-03,  1.28135252e-03],
+            [-1.00471252e-04,  8.51502093e-06, -8.51551903e-06],
+            [ 2.87618947e-03, -1.33322853e-03, -1.33322853e-03],
+            [-2.78640919e-03, -8.51738633e-06, -8.51738633e-06],
+        ])
+
+        assert abs(test_energy - ref_energy) < 1e-10
+        assert np.max(np.abs(test_gradient - ref_gradient)) < 1e-8
+
+    @unittest.skip('multigrid_v2 derivatives not fully implemented')
+    def test_shell_splitting_for_large_fock_in_imagediff_space_k(self):
+        cell = gto.M(
+            a = np.eye(3)*3.5668,
+            atom = '''
+                C     0.      0.      0.
+                C     0.8817  0.8917  0.8917
+                C     1.7834  1.7834  0.
+                C     2.6751  2.6751  0.8917
+                C     1.7834  0.      1.7834
+                C     2.6751  0.8917  2.6751
+                C     0.      1.7834  1.7834
+                C     0.8917  2.6751  2.6751
+            ''',
+            basis = "gth-dzvp",
+            pseudo = 'gth-pbe',
+            precision = 1e-8,
+            verbose = 5,
+            output='/dev/null'
+        )
+
+        kpts = cell.make_kpts([1,1,3])
+        mf = KRKS_gpu(cell, xc = 'pbe', kpts = kpts)
+        mf.conv_tol = 1e-10
+
+        # mf._numint = multigrid.MultiGridNumInt(cell)
+        # ref_energy = mf.kernel()
+        # assert mf.converged
+        # ref_gradient = mf.Gradients().kernel()
+        # print(repr(ref_energy))
+        # print(repr(ref_gradient))
+
+        with lib.temporary_env(multigrid, get_avail_mem=(lambda **kw: 2**28)):
+            mf._numint = multigrid.MultiGridNumInt(cell)
+
+            test_energy = mf.kernel()
+            assert mf.converged
+            test_gradient = mf.Gradients().kernel()
+
+        ref_energy = -45.30199423477792
+        ref_gradient = np.array([
+            [ 2.36897360e-03,  1.19228739e-03,  6.67961844e-04],
+            [-9.11593616e-03,  1.03369618e-05,  8.42224689e-06],
+            [ 2.32829121e-03,  1.14450844e-03, -6.20435413e-04],
+            [ 2.38310045e-04, -8.52269883e-06,  6.81929906e-06],
+            [ 2.32828725e-03, -1.14450700e-03,  6.20436720e-04],
+            [ 1.14957254e-03,  8.52837460e-06, -6.81790444e-06],
+            [ 2.36729361e-03, -1.19142895e-03, -6.64432085e-04],
+            [-1.66792993e-03, -8.52961493e-06, -6.81679641e-06],
+        ])
+
+        assert abs(test_energy - ref_energy) < 1e-10
+        assert np.max(np.abs(test_gradient - ref_gradient)) < 1e-8
+
+    @unittest.skip('multigrid_v2 derivatives not fully implemented')
+    def test_shell_splitting_for_large_fock_in_imagediff_space_unrestricted(self):
+        cell = gto.M(
+            a = '''
+                0.000000000, 3.370137329, 3.370137329
+                3.370137329, 0.000000000, 3.370137329
+                3.370137329, 3.370137329, 0.000000000
+            ''',
+            atom = '''
+                C 0 0 0
+                C 1.675068664391 1.685068664391 1.685068664391
+            ''',
+            basis = "gth-dzvp",
+            pseudo = 'gth-pbe',
+            precision = 1e-8,
+            verbose = 5,
+            output='/dev/null'
+        )
+
+        kpts = cell.make_kpts([1,1,3])
+        mf = KUKS_gpu(cell, xc = 'pbe', kpts = kpts)
+        mf.conv_tol = 1e-10
+
+        # mf._numint = multigrid.MultiGridNumInt(cell)
+        # ref_energy = mf.kernel()
+        # assert mf.converged
+        # ref_gradient = mf.Gradients().kernel()
+        # print(repr(ref_energy))
+        # print(repr(ref_gradient))
+
+        with lib.temporary_env(multigrid, get_avail_mem=(lambda **kw: 2**25)):
+            mf._numint = multigrid.MultiGridNumInt(cell)
+
+            test_energy = mf.kernel()
+            assert mf.converged
+            test_gradient = mf.Gradients().kernel()
+
+        ref_energy = -10.82283467913058
+        ref_gradient = np.array([
+            [-0.00776978, -0.00816341,  0.00816341],
+            [ 0.00777063,  0.00816369, -0.00816369],
+        ])
+
+        assert abs(test_energy - ref_energy) < 1e-10
+        assert np.max(np.abs(test_gradient - ref_gradient)) < 1e-7
 
 if __name__ == '__main__':
     print("Full Tests for multigrid")

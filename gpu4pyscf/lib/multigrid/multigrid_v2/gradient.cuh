@@ -314,7 +314,19 @@ __global__ void evaluate_xc_kernel(
               j_cartesian_gradient, j_cartesian, x - j_x, y - j_y, z - j_z,
               j_exponent);
 
-          const KernelType gaussian = gaussian_x * gaussian_y * gaussian_z;
+          KernelType gaussian = gaussian_x * gaussian_y * gaussian_z;
+          if constexpr (sizeof(KernelType) == 4) {
+            const KernelType px = start_position_x + a_index * dxyz_dabc[0] +
+                b_index * dxyz_dabc[3] + c_index * dxyz_dabc[6] - pair_x;
+            const KernelType py = start_position_y + a_index * dxyz_dabc[1] +
+                b_index * dxyz_dabc[4] + c_index * dxyz_dabc[7] - pair_y;
+            const KernelType pz = start_position_z + a_index * dxyz_dabc[2] +
+                b_index * dxyz_dabc[5] + c_index * dxyz_dabc[8] - pair_z;
+            gaussian = is_valid_pair
+                ? expf(-(ij_exponent_in_prefactor +
+                         ij_exponent * (px * px + py * py + pz * pz)))
+                : KernelType(0);
+          }
 #pragma unroll
           for (int i_channel = 0; i_channel < n_channels; i_channel++) {
             xc_value =
@@ -391,7 +403,7 @@ __global__ void evaluate_xc_kernel(
 
 #define xc_gradient_kernel_macro(li, lj)                                       \
   evaluate_xc_kernel<KernelType, n_channels, li, lj, is_non_orthogonal>        \
-      <<<block_grid, block_size>>>(                                            \
+      <<<block_grid, block_size, 0, stream>>>(                                 \
           gradient, xc_weights, density_matrices, non_trivial_pairs, i_shells, \
           j_shells, n_j_shells, shell_to_ao_indices, n_i_functions,            \
           n_j_functions, sorted_pairs_per_local_grid,                          \
@@ -418,7 +430,7 @@ int evaluate_xc_driver(
     const int *image_indices, const double *vectors_to_neighboring_images,
     const int n_images, const int *image_pair_difference_index,
     const int n_difference_images, const int *mesh, const int *atm,
-    const int *bas, const double *env) {
+    const int *bas, const double *env, cudaStream_t stream) {
   dim3 block_size(BLOCK_DIM_XYZ, BLOCK_DIM_XYZ, BLOCK_DIM_XYZ);
   int mesh_a = mesh[0];
   int mesh_b = mesh[1];
@@ -764,7 +776,19 @@ __global__ void evaluate_xc_with_tau_kernel(
               j_cartesian_second_derivative, x - j_x, y - j_y, z - j_z,
               j_exponent);
 
-          const KernelType gaussian = gaussian_x * gaussian_y * gaussian_z;
+          KernelType gaussian = gaussian_x * gaussian_y * gaussian_z;
+          if constexpr (sizeof(KernelType) == 4) {
+            const KernelType px = start_position_x + a_index * dxyz_dabc[0] +
+                b_index * dxyz_dabc[3] + c_index * dxyz_dabc[6] - pair_x;
+            const KernelType py = start_position_y + a_index * dxyz_dabc[1] +
+                b_index * dxyz_dabc[4] + c_index * dxyz_dabc[7] - pair_y;
+            const KernelType pz = start_position_z + a_index * dxyz_dabc[2] +
+                b_index * dxyz_dabc[5] + c_index * dxyz_dabc[8] - pair_z;
+            gaussian = is_valid_pair
+                ? expf(-(ij_exponent_in_prefactor +
+                         ij_exponent * (px * px + py * py + pz * pz)))
+                : KernelType(0);
+          }
 #pragma unroll
           for (int i_channel = 0; i_channel < n_channels; i_channel++) {
             const KernelType xc_rho_value =
@@ -965,7 +989,7 @@ __global__ void evaluate_xc_with_tau_kernel(
 
 #define xc_with_tau_gradient_kernel_macro(li, lj)                              \
   evaluate_xc_with_tau_kernel<KernelType, n_channels, li, lj,                  \
-                              is_non_orthogonal><<<block_grid, block_size>>>(  \
+                              is_non_orthogonal><<<block_grid, block_size, 0, stream>>>(\
       gradient, xc_weights, density_matrices, non_trivial_pairs, i_shells,     \
       j_shells, n_j_shells, shell_to_ao_indices, n_i_functions, n_j_functions, \
       sorted_pairs_per_local_grid, accumulated_n_pairs_per_local_grid,         \
@@ -991,7 +1015,7 @@ int evaluate_xc_with_tau_driver(
     const int *image_indices, const double *vectors_to_neighboring_images,
     const int n_images, const int *image_pair_difference_index,
     const int n_difference_images, const int *mesh, const int *atm,
-    const int *bas, const double *env) {
+    const int *bas, const double *env, cudaStream_t stream) {
   dim3 block_size(BLOCK_DIM_XYZ, BLOCK_DIM_XYZ, BLOCK_DIM_XYZ);
   int mesh_a = mesh[0];
   int mesh_b = mesh[1];

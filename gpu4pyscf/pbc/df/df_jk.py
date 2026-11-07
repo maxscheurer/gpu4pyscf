@@ -27,8 +27,8 @@ from pyscf.pbc.tools import k2gamma
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib import multi_gpu
 from gpu4pyscf.lib.cupy_helper import contract, unpack_tril, ndarray
-from gpu4pyscf.df.df_jk import factorize_dm
-from gpu4pyscf.pbc.df.fft_jk import _ewald_exxdiv_for_G0, _format_dms, _format_jks
+from gpu4pyscf.pbc.df.fft_jk import (
+    _ewald_exxdiv_for_G0, _format_dms, _format_jks, _factorize_dm)
 from gpu4pyscf.pbc.df import rsdf_builder
 from gpu4pyscf.pbc.lib.kpts_helper import (
     kk_adapted_iter, fft_matrix, conj_images_in_bvk_cell)
@@ -75,24 +75,24 @@ def get_j_kpts(mydf, dm_kpts, hermi=1, kpts=None, kpts_band=None):
     # Alter the contraction order for
     # rho = einsum('piLj,LK,Kji->p', cderi, expLk, dm)
     # dm_sparse = einsum('LK,Kji->iLj', expLk, dm)[cderi_idx]
+    pair_address, _ = mydf._cderi_idx
+    pair_address = cp.asarray(pair_address, dtype=np.int32)
     expLk = fft_matrix(mydf.kmesh)
     dm_sparse = contract('LK,nKji->niLj', expLk, dms)
     contract('LK,nKji->njLi', expLk.conj(), dms, beta=1, out=dm_sparse)
     dm_sparse = dm_sparse.reshape(nset, -1)
-    ao_pair_mapping, diag = mydf._cderi_idx
-    dm_sparse = dm_sparse[:,ao_pair_mapping]
-    dm_sparse[:,diag] *= .5
+    dm_sparse = dm_sparse[:,pair_address]
 
     mem_free = cp.cuda.runtime.memGetInfo()[0]
     avail_mem = int(mem_free * .8)
-    npairs = len(ao_pair_mapping)
+    npairs = len(pair_address)
     blksize = avail_mem // ((nkpts+1)*npairs * 16)
     if blksize < 16:
         raise RuntimeError('Insufficient GPU memory')
     blksize = min(int(blksize), mydf.blockdim)
     logger.debug2(mydf, 'max_memory %d MB, blksize %d', avail_mem*1e-6, blksize)
     naux = mydf.get_naoaux()
-    aux_iter = iter((0, p0, p1) for p0, p1 in lib.prange(0, naux, blksize))
+    aux_iter = iter([(0, p0, p1) for p0, p1 in lib.prange(0, naux, blksize)])
 
     def proc():
         _dm_sparse = cp.asarray(dm_sparse)
@@ -109,7 +109,6 @@ def get_j_kpts(mydf, dm_kpts, hermi=1, kpts=None, kpts_band=None):
 
     kj_idx = np.arange(nkpts)
     conj_mapping = conj_images_in_bvk_cell(mydf.kmesh)
-    pair_address = cp.asarray(mydf._cderi_idx[0], dtype=np.int32)
     # The ao-pair in vj_packed has the same storage order like the ao-pair in
     # cderi tensor. It can be unpacked using rsdf_builder.unpack_cderi. This
     # function returns a tensor sorted as [nkpt,naux,nao,nao]. vj for multiple
@@ -139,14 +138,14 @@ def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=None, kpts_band=None,
     t0 = (logger.process_clock(), logger.perf_counter())
     assert kpts_band is None or kpts_band is kpts
     assert mydf.has_kpts(kpts)
-    if mydf._cderi is None:
-        mydf.build(kpts_band=kpts_band)
+    # J-only integrals omit the k-point pairs required for exchange.
+    if mydf._cderi is None or mydf._j_only:
+        mydf.build(j_only=False, kpts_band=kpts_band)
         t0 = log.timer_debug1('Init get_k_kpts', *t0)
 
     kpts_band, input_band = _format_kpts_band(kpts_band, kpts), kpts_band
     nband = len(kpts_band)
 
-    dm_kpts = cp.asarray(dm_kpts, order='C')
     dms = _format_dms(dm_kpts, kpts)
     nset, nkpts, nao = dms.shape[:3]
 
@@ -188,19 +187,23 @@ def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=None, kpts_band=None,
 
     mem_free = cp.cuda.runtime.memGetInfo()[0]
     avail_mem = int(mem_free * .8)
-    blksize = avail_mem // (nkpts*nao**2*3 * 16)
+    unit = 3 * nao**2
+    blksize = avail_mem // (nkpts*unit * 16)
     if blksize < 16:
         raise RuntimeError('Insufficient GPU memory')
     blksize = min(int(blksize), mydf.blockdim)
     logger.debug1(mydf, 'max_memory %d MB, blksize %d', avail_mem*1e-6, blksize)
     naux = mydf.get_naoaux()
-    aux_iter = iter((kp, p0, p1)
+    aux_iter = iter([(kp, p0, p1)
                     for p0, p1 in lib.prange(0, naux, blksize)
-                    for kp in mydf._cderi)
+                    for kp in mydf._cderi])
     k_adapt_dic = {}
     for kp, kp_conj, ki_idx, kj_idx in kk_adapted_iter(mydf.kmesh):
         # ki_idx is already sorted
         k_adapt_dic[kp] = kp_conj, kj_idx
+
+    assert len(mydf._cderi) == len(k_adapt_dic), \
+            'cderi should be initialized with j_only=False'
 
     if (is_zero(kpts) and is_zero(kpts_band) and
         not np.iscomplexobj(dm_kpts)):
@@ -226,24 +229,15 @@ def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=None, kpts_band=None,
         contract('nikL,nlkL->nil', piL, piL_conj, alpha=sign, beta=1, out=vk)
 
         if kp != kp_conj:
-            if orbr is None:
-                piL = contract('nijL,nil->njlL', pqL, orbl.conj(), out=buf)
-                piL_conj = cp.conjugate(piL, out=pqL_conj_buf)
-            else:
-                piL = contract('nijL,nil->njlL', pqL, orbl.conj(), out=buf)
-                piL_conj = cp.conjugate(piL, out=pqL_conj_buf)
+            piL = contract('nijL,nil->njlL', pqL, orbl.conj(), out=buf)
+            piL_conj = cp.conjugate(piL, out=pqL_conj_buf)
+            if orbr is not None:
                 piL = contract('nijL,nil->njlL', pqL, orbr, out=buf)
             vk[kj_idx] += contract('nklL,njlL->nkj', piL_conj, piL, alpha=sign)
 
     def proc():
-        orbl, orbr = factorize_dm(dm_kpts)
-        if orbl.ndim == 2:
-            orbl = orbl[None,None]
-        elif orbl.ndim == 3:
-            orbl = orbl[None]
-        if orbr is not None:
-            orbr = orbr.reshape(orbl.shape)
-        else:
+        orbl, orbr = _factorize_dm(dm_kpts, kpts)
+        if orbr is None:
             orbr = [None] * nset # to support indexing orbr[i] below
         vk = cp.zeros(dms.shape, dtype=dtype)
         buf = cp.empty((3, nkpts*blksize*nao**2), dtype=dtype)
@@ -287,7 +281,7 @@ def get_jk(mydf, dm, hermi=1, kpt=np.zeros(3),
         raise NotImplementedError(f'get_jk for single k-point {kpt}')
 
     if mydf._cderi is None:
-        mydf.build()
+        mydf.build(j_only=not with_k)
 
     if dm.dtype == np.float64:
         return df_jk_real.get_jk(mydf, dm, hermi, with_j, with_k, exxdiv)

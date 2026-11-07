@@ -17,10 +17,11 @@ import cupy as cp
 from pyscf import lib
 from gpu4pyscf.tdscf._lr_eig import eigh as lr_eigh
 from gpu4pyscf.dft.rks import KohnShamDFT
-from gpu4pyscf.lib.cupy_helper import contract, tag_array, transpose_sum
+from gpu4pyscf.lib.cupy_helper import contract, transpose_sum
 from gpu4pyscf.lib import logger
 from gpu4pyscf.tdscf import rhf as tdhf_gpu
 from gpu4pyscf import dft
+from gpu4pyscf.df.df_jk import _make_factorized_dm
 
 __all__ = [
     'TDA', 'TDDFT', 'TDRKS', 'CasidaTDDFT', 'TDDFTNoHybrid',
@@ -43,9 +44,18 @@ class TDA(tdhf_gpu.TDA):
             from gpu4pyscf.nac import tdrks
             return tdrks.NAC(self)
 
+    def NACGradients(self):
+        if getattr(self._scf, 'with_df', None):
+            from gpu4pyscf.df.nac import tdrks_grad_nacv
+            return tdrks_grad_nacv.NAC_multistates(self)
+        else:
+            from gpu4pyscf.nac import tdrks_grad_nacv
+            return tdrks_grad_nacv.NAC_multistates(self)
+
 class TDDFT(tdhf_gpu.TDHF):
     Gradients = TDA.Gradients
     NAC = TDA.NAC
+    NACGradients = TDA.NACGradients
 
 TDRKS = TDDFT
 
@@ -81,9 +91,10 @@ class CasidaTDDFT(TDDFT):
             # *2 for double occupancy
             mo1 = contract('xov,pv->xpo', zs*(d_ia*2), orbv)
             dms = contract('xpo,qo->xpq', mo1, orbo)
-            # +cc for A+B and K_{ai,jb} in A == K_{ai,bj} in B
-            dms = transpose_sum(dms)
-            dms = tag_array(dms, mo1=mo1, occ_coeff=orbo)
+            # Setting symmetrize=1 triggers dms+dms.T for A+B, given the
+            # equality between A and B:
+            # K_{ai,jb} in A == K_{ai,bj} in B
+            dms = _make_factorized_dm(mo1, orbo, symmetrize=1)
             v1ao = vresp(dms)
             v1mo = contract('xpq,qo->xpo', v1ao, orbo)
             v1mo = contract('xpo,pv->xov', v1mo, orbv)
@@ -93,12 +104,28 @@ class CasidaTDDFT(TDDFT):
 
         return vind, hdiag
 
+    def _transfer_initial_guess(self, xy, mo_coeff, mo_occ):
+        x0 = TDDFT._transfer_initial_guess(self, xy, mo_coeff, mo_occ)
+        mf = self._scf
+        mo_energy = mf.mo_energy
+        mo_occ = mf.mo_occ
+        occidx = mo_occ == 2
+        viridx = mo_occ == 0
+        e_ia = mo_energy[viridx] - mo_energy[occidx,None]
+        e_ia = e_ia**.5
+        nov = e_ia.size
+        x0 = (x0[:,:nov] + x0[:,nov:]) / e_ia.ravel()
+        return x0
+
     def kernel(self, x0=None, nstates=None):
         '''TDDFT diagonalization solver
         '''
         log = logger.new_logger(self)
         cpu0 = log.init_timer()
         mf = self._scf
+        if mf.mo_energy is None:
+            mf.run()
+
         if mf._numint.libxc.is_hybrid_xc(mf.xc):
             raise RuntimeError('%s cannot be used with hybrid functional'
                                % self.__class__)
@@ -109,37 +136,42 @@ class CasidaTDDFT(TDDFT):
         else:
             self.nstates = nstates
 
-        vind, hdiag = self.gen_vind(self._scf)
+        vind, hdiag = self.gen_vind(mf)
         precond = self.get_precond(hdiag)
 
         def pickeig(w, v, nroots, envs):
             idx = cp.where(w > self.positive_eig_threshold)[0]
             return w[idx], v[:,idx], idx
 
+        mo_energy = mf.mo_energy
+        mo_occ = mf.mo_occ
+        occidx = mo_occ == 2
+        viridx = mo_occ == 0
+        e_ia = mo_energy[viridx] - mo_energy[occidx,None]
+        e_ia = cp.asarray(e_ia**.5)
+
         x0sym = None
         if x0 is None:
-            x0 = self.init_guess()
+            if self.xy is None:
+                x0 = self.init_guess()
+            else: # Reuse the previous step for initial guess 
+                x0 = self.xy
+
+        if isinstance(x0, list):
+            # Convert the self.xy storage to the initial guess format
+            x0 = cp.stack([(cp.asarray(x+y)/e_ia).ravel() for x, y in x0])
 
         self.converged, w2, x1 = lr_eigh(
             vind, x0, precond, tol_residual=self.conv_tol, lindep=self.lindep,
             nroots=nstates, x0sym=x0sym, pick=pickeig, max_cycle=self.max_cycle,
             max_memory=self.max_memory, verbose=log)
 
-        mo_energy = self._scf.mo_energy
-        mo_occ = self._scf.mo_occ
-        occidx = mo_occ == 2
-        viridx = mo_occ == 0
-        e_ia = mo_energy[viridx] - mo_energy[occidx,None]
-        e_ia = e_ia**.5
-        if isinstance(e_ia, cp.ndarray):
-            e_ia = e_ia.get()
-
         def norm_xy(w, z):
             zp = e_ia * z.reshape(e_ia.shape)
             zm = w/e_ia * z.reshape(e_ia.shape)
             x = (zp + zm) * .5
             y = (zp - zm) * .5
-            norm = lib.norm(x)**2 - lib.norm(y)**2
+            norm = cp.linalg.norm(x)**2 - cp.linalg.norm(y)**2
             norm = abs(.5/norm)**.5  # normalize to 0.5 for alpha spin
             return (x*norm, y*norm)
 

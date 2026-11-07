@@ -17,43 +17,46 @@ import numpy as np
 import cupy as cp
 from pyscf import lib
 from gpu4pyscf.lib import logger
-from gpu4pyscf.lib.cupy_helper import contract, asarray, ndarray
+from gpu4pyscf.lib.utils import splits_by_blocksize
+from gpu4pyscf.lib.cupy_helper import contract, asarray, ndarray, get_avail_mem
 from gpu4pyscf.grad import uhf as uhf_grad
 from gpu4pyscf.df.grad.rhf import (
-    int3c2e_scheme, _j_energy_per_atom, factorize_dm, _gen_metric_solver)
+    int3c2e_scheme, _factorize_dm, _gen_metric_solver)
 from gpu4pyscf.df.int3c2e_bdiv import (
-    _split_l_ctr_pattern, argsort_aux, get_ao_pair_loc,
+    _split_l_ctr_pattern, argsort_aux, get_ao_pair_loc, int2c2e_ip1_per_atom,
     SHM_SIZE, LMAX, L_AUX_MAX, THREADS, libvhf_rys, Int3c2eOpt, int2c2e)
 from gpu4pyscf.df import df_jk
+from gpu4pyscf.gto.mole import SortedMole
+from gpu4pyscf.scf.jk import _check_rsh_factors
 
 __all__ = ['Gradients']
 
 def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
-                        auxbasis_response=True, verbose=None):
+                        auxbasis_response=True, verbose=None,
+                        omega=None, lr_factor=None, sr_factor=None):
     '''
     Computes the first-order derivatives of the energy contributions from
     J and K terms per atom.
     '''
     assert dm.ndim == 3
-    from gpu4pyscf.pbc.df.int2c2e import int2c2e_ip1_per_atom
     if hermi == 2:
         j_factor = 0
     if k_factor == 0:
+        from gpu4pyscf.df.grad.rhf import _j_energy_per_atom
+        assert omega is None or omega == 0
         return _j_energy_per_atom(int3c2e_opt, dm[0]+dm[1], hermi,
                                   auxbasis_response, verbose) * j_factor
+
+    if j_factor != 0 and (omega is not None and omega != 0):
+        raise RuntimeError(
+            'Cannot compute J contributions with range-separated Coulomb operator.')
 
     mol = int3c2e_opt.mol
     auxmol = int3c2e_opt.auxmol
     log = logger.new_logger(mol, verbose)
     t0 = log.init_timer()
 
-    dm_factor_l, dm_factor_r = factorize_dm(dm, hermi)
-    # transform to the AO order in sorted_cell
-    dm_factor_l = mol.apply_C_dot(dm_factor_l, axis=1)
-    if dm_factor_r is None:
-        dm_factor_r = dm_factor_l
-    else:
-        dm_factor_r = mol.apply_C_dot(dm_factor_r, axis=1)
+    dm_factor_l, dm_factor_r = _factorize_dm(mol, dm, hermi)
     nao, nocc = dm_factor_l.shape[1:]
     log.debug1('dm_factor shape %s', dm_factor_l.shape)
 
@@ -63,14 +66,18 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
     nao_pair = len(pair_addresses)
     naux = auxmol.nao
 
-    mem_free = cp.cuda.runtime.memGetInfo()[0]
+    omega, lr_factor, sr_factor = _check_rsh_factors(mol, omega, lr_factor, sr_factor)
+
+    mem_free = get_avail_mem(exclude_memory_pool=True)
     mem_avail = mem_free - 2*naux*nocc**2*8 - nao**2*8
     batch_size = max(1, min(naux, int(mem_avail*.5/(nao_pair*8))))
     eval_j3c, aux_sorting, _, aux_offsets = int3c2e_opt.int3c2e_evaluator(
-        aux_batch_size=batch_size, reorder_aux=True, cart=True)
+        aux_batch_size=batch_size, reorder_aux=True, cart=True,
+        omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
+    batch_size = min(batch_size, int((aux_offsets[1:]-aux_offsets[:-1]).max()))
     aux_batches = len(aux_offsets) - 1
 
-    blksize = max(1, min(naux, int(mem_avail*.4/(nao*(nao+2*nocc)*8))//8*8))
+    blksize = max(1, min(batch_size, int(mem_avail*.4/(nao*nao*2*8))//8*8))
     log.debug1('%.3f GB free memory. nao_pair=%d naux=%d batch_size=%d blksize=%d',
                mem_free*1e-9, nao_pair, naux, batch_size, blksize)
 
@@ -100,47 +107,40 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
     aux_coeff[aux_sorting] = tmp
     tmp = None
 
-    j2c = int2c2e(auxmol)
+    j2c = int2c2e(auxmol, omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
     if mol.omega <= 0 and not auxmol.mol.cart:
-        metric = aux_coeff.dot(cp.linalg.solve(j2c, aux_coeff.T))
+        metric_solve = _gen_metric_solver(j2c, 'CD')
     else:
-        metric = aux_coeff.dot(_gen_metric_solver(j2c, 'ED')(aux_coeff.T))
-    j2c = aux_coeff = None
-    dm_oo = contract('uv,nvij->nuij', metric, j3c_oo)
-    metric = j3c_oo = None
+        metric_solve = _gen_metric_solver(j2c, 'ED')
+    j2c = None
+
+    dm_oo = j3c_oo
+    j3c_oo = j3c_oo.reshape(2, naux, nocc**2)
+    pair_blksize = min(nocc**2, int(mem_avail*.4/(naux*4*8)))
+    assert pair_blksize > 0
+    buf = cp.empty((aux_coeff.shape[1], pair_blksize), order='F')
+    for spin in range(2):
+        for p0, p1 in lib.prange(0, nocc**2, pair_blksize):
+            tmp = buf[:,:p1-p0]
+            contract('uv,up->vp', aux_coeff, j3c_oo[spin,:,p0:p1], out=tmp)
+            tmp = metric_solve(tmp, overwrite=True)
+            contract('uv,vp->up', aux_coeff, tmp, out=j3c_oo[spin,:,p0:p1])
+    metric_solve = j3c_oo = aux_coeff = buf = tmp = None
     if j_factor != 0:
         auxvec = dm_oo.trace(axis1=2, axis2=3).sum(axis=0)
 
-    # (d/dX P|Q) contributions
-    if auxbasis_response:
-        if j_factor == 0:
-            dm_aux = None
-        else:
-            dm_aux = auxvec[:,None] * auxvec
-        if hasattr(dm, 'mo_coeff'):
-            dm_aux = contract('nrij,nsij->rs', dm_oo, dm_oo,
-                              alpha=-k_factor, beta=j_factor, out=dm_aux)
-        else:
-            dm_aux = contract('nrij,nsji->rs', dm_oo, dm_oo,
-                              alpha=-k_factor, beta=j_factor, out=dm_aux)
-        dm_aux = dm_aux[aux_sorting[:,None], aux_sorting]
-        ejk_aux = cp.asarray(int2c2e_ip1_per_atom(auxmol, dm_aux))
-        ejk_aux *= -.5
-        t0 = log.timer_debug1('contract int2c2e_ip1', *t0)
-        ejk_aux_ptr = ctypes.cast(ejk_aux.data.ptr, ctypes.c_void_p)
-        dm_aux = None
-    else:
-        ejk_aux_ptr = lib.c_null_ptr()
-
     # contract the derivatives and the pseudo DM/rho
-    nsp_per_block, gout_stride, shm_size = int3c2e_scheme(mol.omega, 54)
+    nsp_per_block, gout_stride, shm_size = int3c2e_scheme(
+        short_range=omega<0, gout_width=54, deriv=(1,0,0))
     gout_stride = cp.asarray(gout_stride, dtype=np.int32)
     lmax = mol.uniq_l_ctr[:,0].max()
     laux = auxmol.uniq_l_ctr[:,0].max()
     shm_size_max = shm_size[:laux+1,:lmax+1,:lmax+1].max()
 
+    pair_batch_size = np.minimum(nsp_per_block[0]*4,
+                                 np.maximum(nsp_per_block[0]//4, 16))
     bas_ij_idx, shl_pair_offsets = mol.aggregate_shl_pairs(
-        int3c2e_opt.bas_ij_cache, nsp_per_block[0]*4)
+        int3c2e_opt.bas_ij_cache, pair_batch_size)
     ao_pair_loc = get_ao_pair_loc(mol.uniq_l_ctr[:,0], int3c2e_opt.bas_ij_cache)
     aux_loc = auxmol.ao_loc
 
@@ -149,59 +149,95 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
         l_ctr_aux_offsets, auxmol.uniq_l_ctr, batch_size)
     ksh_offsets_cpu = l_ctr_aux_offsets
     ksh_offsets_gpu = cp.asarray(ksh_offsets_cpu+mol.nbas, dtype=np.int32)
-    l_ctr_aux_counts = l_ctr_aux_offsets[1:] - l_ctr_aux_offsets[:-1]
+    aux_offsets = aux_loc[ksh_offsets_cpu]
+    aux_batches = len(aux_offsets) - 1
 
     if j_factor != 0:
         dm = mol.apply_C_mat_CT(dm[0]+dm[1])
 
     int3c2e_envs = int3c2e_opt.int3c2e_envs
-    kern = libvhf_rys.ejk_int3c2e_ip1
-    l = np.arange(laux+1)
-    nf = (l + 1) * (l + 2) // 2
+    kern = libvhf_rys.sum_ejk_int3c2e_ip1
     aux0 = aux1 = 0
     buf = cp.empty((nao_pair*batch_size))
-    buf2 = cp.empty((blksize, nao, nao))
-    buf1 = cp.empty((2, blksize, nao, nocc))
+    buf1 = cp.empty((blksize, nao, nao))
+    # Non-Hermitian densities also use this buffer for an AO-sized transpose.
+    buf2 = cp.empty(blksize*nao*(2*nocc if hermi == 1 else max(2*nocc, nao)))
     ejk = cp.zeros((mol.natm, 3))
-    for kbatch, lk, in enumerate(uniq_l_ctr_aux[:,0]):
-        naux_in_batch = nf[lk] * l_ctr_aux_counts[kbatch]
+    ejk_aux = cp.zeros((mol.natm, 3))
+    aux_splits = splits_by_blocksize(aux_offsets, batch_size)
+    for kbatch, kend in zip(aux_splits[:-1], aux_splits[1:]):
+        naux_in_batch = aux_offsets[kend] - aux_offsets[kbatch]
         aux_ao_offset = aux_loc[ksh_offsets_cpu[kbatch]]
         compressed = ndarray((nao_pair, naux_in_batch), buffer=buf)
         for k0, k1 in lib.prange(0, naux_in_batch, blksize):
             dk = k1 - k0
             aux0, aux1 = aux1, aux1 + dk
-            dm_tensor = ndarray((nao,nao,dk), buffer=buf2)
-            tmp = ndarray((2,nocc,nao,dk), buffer=buf1)
+            dm_tensor = ndarray((nao,nao,dk), buffer=buf1)
+            tmp = ndarray((2,nocc,nao,dk), buffer=buf2)
             beta = 0
             if j_factor != 0:
                 cp.multiply(dm[:,:,None], auxvec[aux0:aux1], out=dm_tensor)
                 beta = j_factor
             contract('nrji,nqj->niqr', dm_oo[:,aux0:aux1], dm_factor_l, out=tmp)
             contract('niqr,npi->pqr', tmp, dm_factor_r, -k_factor, beta, out=dm_tensor)
-            cp.take(dm_tensor.reshape(-1,dk), pair_addresses, axis=0, out=compressed[:,k0:k1])
+            if hermi == 1:
+                cp.take(dm_tensor.reshape(-1,dk), pair_addresses, axis=0,
+                        out=compressed[:,k0:k1])
+            else:
+                dm_tensor1 = ndarray((nao,nao,dk), buffer=buf2)
+                dm_tensor1[:] = dm_tensor.transpose(1,0,2)
+                dm_tensor1[:] += dm_tensor
+                cp.take(dm_tensor1.reshape(-1,dk), pair_addresses, axis=0,
+                        out=compressed[:,k0:k1])
         err = kern(
-            ctypes.cast(ejk.data.ptr, ctypes.c_void_p), ejk_aux_ptr,
+            ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
+            ctypes.cast(ejk_aux.data.ptr, ctypes.c_void_p),
             ctypes.cast(compressed.data.ptr, ctypes.c_void_p),
             lib.c_null_ptr(),
             ctypes.c_int(1),
+            ctypes.c_double(omega),
+            ctypes.c_double(lr_factor),
+            ctypes.c_double(sr_factor),
             ctypes.byref(int3c2e_envs),
             ctypes.c_int(shm_size_max),
             ctypes.c_int(len(shl_pair_offsets) - 1),
-            ctypes.c_int(1),
+            ctypes.c_int(kend-kbatch),
             ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
             ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
             ctypes.cast(ksh_offsets_gpu[kbatch:].data.ptr, ctypes.c_void_p),
             ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
             ctypes.cast(ao_pair_loc.data.ptr, ctypes.c_void_p),
             ctypes.c_int(aux_ao_offset),
-            ctypes.c_int(nao_pair),
-            ctypes.c_int(naux_in_batch))
+            ctypes.c_int(nao), ctypes.c_int(nao_pair),
+            ctypes.c_int(naux_in_batch), ctypes.c_int(mol.natm),
+            ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
         if err != 0:
             raise RuntimeError('int3c2e_ejk_ip1 failed')
-    if auxbasis_response:
-        ejk += ejk_aux
-    ejk = ejk.get()
+    buf = buf1 = buf2 = compressed = dm_tensor = dm_tensor1 = tmp = None
+    if hermi == 1:
+        ejk *= 2
+        ejk_aux *= 2
     t0 = log.timer_debug1('contract int3c2e_ejk_ip1', *t0)
+
+    if auxbasis_response:
+        # (d/dX P|Q) contributions
+        if j_factor == 0:
+            dm_aux = None
+        else:
+            dm_aux = auxvec[:,None] * auxvec
+        if dm_factor_l is dm_factor_r:
+            dm_aux = contract('nrij,nsij->rs', dm_oo, dm_oo,
+                              alpha=-k_factor, beta=j_factor, out=dm_aux)
+        else:
+            dm_aux = contract('nrij,nsji->rs', dm_oo, dm_oo,
+                              alpha=-k_factor, beta=j_factor, out=dm_aux)
+        dm_aux = dm_aux[aux_sorting[:,None], aux_sorting]
+        ejk_aux -= cp.asarray(
+            int2c2e_ip1_per_atom(auxmol, dm_aux, omega, lr_factor, sr_factor))
+        t0 = log.timer_debug1('contract int2c2e_ip1', *t0)
+        ejk += ejk_aux
+
+    ejk = ejk.get()
     return ejk
 
 class Gradients(uhf_grad.Gradients):
@@ -214,24 +250,27 @@ class Gradients(uhf_grad.Gradients):
     def check_sanity(self):
         assert isinstance(self.base, df_jk._DFHF)
 
-    def get_veff(self, mol=None, dm=None, verbose=None):
-        '''
-        Computes the first-order derivatives of the energy contributions from
-        Veff per atom, corresponding to contracting dm with Veff:
-        [np.einsum('xpq,pq->x', veff[:,AO_idx_for_atom], dm[AO_idx_for_atom]) for all atoms]
-        This contraction is equal to 1/2 of the nuclear derivatives of the
-        two-electron potential.
+    def energy_ee(self, mol, dm):
+        return self.jk_energy_per_atom(dm, hermi=1)
 
-        NOTE: This function is incompatible to the one implemented in PySCF CPU version.
-        In the CPU version, get_veff returns the first order derivatives of Veff matrix.
+    def jk_energy_per_atom(self, dm=None, j_factor=1, k_factor=1, *,
+                           omega=None, lr_factor=None, sr_factor=None,
+                           hermi=0, verbose=None):
         '''
-        if mol is None: mol = self.mol
+        Computes the first-order derivatives of the energy per atom for
+        j_factor * J_derivatives - k_factor * K_derivatives
+        '''
         mf = self.base
-        mf.with_df.reset() # Release GPU memory
         if dm is None: dm = mf.make_rdm1()
-        int3c2e_opt = Int3c2eOpt(mf.mol, mf.with_df.auxmol).build()
+        mol = mf.with_df.mol
+        auxmol = mf.with_df.auxmol
+        mf.with_df.reset() # Release GPU memory
+        with mol.with_range_coulomb(omega), auxmol.with_range_coulomb(omega):
+            sorted_mol = SortedMole.from_mol(mol, decontract=True)
+            int3c2e_opt = Int3c2eOpt(sorted_mol, auxmol).build()
         return _jk_energy_per_atom(
-            int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=1,
-            auxbasis_response=self.auxbasis_response, verbose=verbose) * .5
+            int3c2e_opt, dm, j_factor, k_factor, hermi=hermi,
+            auxbasis_response=self.auxbasis_response, verbose=verbose,
+            omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
 
 Grad = Gradients

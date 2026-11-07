@@ -29,21 +29,19 @@ __all__ = [
 def prune_small_rho_grids_(ks, mol, dm, grids):
     '''Prune grids if the electron density on the grid is small'''
     threshold = ks.small_rho_cutoff
-    if threshold == 0:
-        return grids
     rho = ks._numint.get_rho(mol, dm, grids, ks.max_memory, verbose=ks.verbose)
     return grids.prune_by_density_(rho, threshold)
 
 def initialize_grids(ks, mol=None, dm=None):
     # Initialize self.grids the first time call get_veff
     if mol is None: mol = ks.mol
+    ground_state = getattr(dm, 'ndim', 0) == 2
     if ks.grids.coords is None:
         t0 = logger.init_timer(ks)
         ks.grids.build()
         #ks.grids.build(with_non0tab=True)
         ks.grids.weights = asarray(ks.grids.weights)
         ks.grids.coords = asarray(ks.grids.coords)
-        ground_state = getattr(dm, 'ndim', 0) == 2
         if ks.small_rho_cutoff > 1e-20 and ground_state:
             # Filter grids the first time setup grids
             ks.grids = prune_small_rho_grids_(ks, ks.mol, dm, ks.grids)
@@ -61,7 +59,7 @@ def initialize_grids(ks, mol=None, dm=None):
         t0 = logger.timer_debug1(ks, 'setting up nlc grids', *t0)
     return ks
 
-def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
+def get_veff(ks, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
     '''Coulomb + XC functionals
     .. note::
         This function will modify the input ks object.
@@ -89,7 +87,8 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
 
     if mol is None: mol = ks.mol
     if dm is None: dm = ks.make_rdm1()
-    t0 = logger.init_timer(ks)
+    log = logger.new_logger(ks)
+    t0 = log.init_timer()
     initialize_grids(ks, mol, dm)
 
     ni = ks._numint
@@ -107,44 +106,38 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
 
             exc += enlc
             vxc += vnlc
-        logger.debug(ks, 'nelec by numeric integration = %s', n)
-    t0 = logger.timer(ks, 'vxc', *t0)
+        log.debug('nelec by numeric integration = %s', n)
+    t1 = log.timer('vxc', *t0)
 
-    dm_orig = dm
+    dm_orig = dm = cupy.asarray(dm)
     vj_last = getattr(vhf_last, 'vj', None)
     if vj_last is not None:
-        dm = asarray(dm) - asarray(dm_last)
-    vj = ks.get_j(mol, dm, hermi)
-    if vj_last is not None:
-        vj += asarray(vj_last)
-    vxc += vj
-    ecoul = float(cupy.einsum('ij,ij', dm_orig, vj).real) * .5
+        dm_last = cupy.asarray(dm_last)
+        dm = dm - dm_last
+    else:
+        dm_last = None
+    vhf = vj = ks.get_j(mol, dm, hermi)
+    ecoul = hf._trace_ecoul(vj, dm, dm_last, vhf_last)
+    cput2 = log.timer_debug1('vj', *t1)
 
-    vk = None
     if ni.libxc.is_hybrid_xc(ks.xc):
         omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks.xc, spin=mol.spin)
-        if omega == 0:
-            vk = ks.get_k(mol, dm, hermi)
-            vk *= hyb
-        elif alpha == 0: # LR=0, only SR exchange
-            vk = ks.get_k(mol, dm, hermi, omega=-omega)
-            vk *= hyb
-        elif hyb == 0: # SR=0, only LR exchange
-            vk = ks.get_k(mol, dm, hermi, omega=omega)
-            vk *= alpha
-        else: # SR and LR exchange with different ratios
-            vk = ks.get_k(mol, dm, hermi)
-            vk *= hyb
-            vklr = ks.get_k(mol, dm, hermi, omega=omega)
-            vklr *= (alpha - hyb)
-            vk += vklr
+        vk = ks.get_k(mol, dm, hermi, omega, alpha, hyb)
         vk *= .5
+        vhf -= vk
         if vj_last is not None:
-            vk += asarray(vhf_last.vk)
-        vxc -= vk
-        exc -= float(cupy.einsum('ij,ij', dm_orig, vk).real) * .5
-    t0 = logger.timer(ks, 'veff', *t0)
-    vxc = tag_array(vxc, ecoul=ecoul, exc=exc, vj=vj, vk=vk)
+            vhf += asarray(vhf_last.vj)
+        vxc += vhf
+        exc += float(cupy.einsum('ij,ji', dm_orig, vhf).real.get()) * .5
+        if ecoul is not None:
+            exc -= ecoul
+        log.timer_debug1('vk', *cput2)
+    else:
+        if vj_last is not None:
+            vhf += asarray(vhf_last.vj)
+        vxc += vhf
+    t0 = log.timer('veff', *t0)
+    vxc = tag_array(vxc, ecoul=ecoul, exc=exc, vj=vhf)
     return vxc
 
 def energy_elec(ks, dm=None, h1e=None, vhf=None):
@@ -165,36 +158,106 @@ def energy_elec(ks, dm=None, h1e=None, vhf=None):
     '''
     if dm is None: dm = ks.make_rdm1()
     if h1e is None: h1e = ks.get_hcore()
-    if vhf is None: vhf = ks.get_veff(ks.mol, dm)
-    e1 = cupy.einsum('ij,ji->', h1e, dm).get()[()].real
+    if vhf is None or getattr(vhf, 'ecoul', None) is None:
+        vhf = ks.get_veff(ks.mol, dm)
+    e1 = float(cupy.einsum('ij,ji->', h1e, dm).real.get())
     ecoul = vhf.ecoul.real
     exc = vhf.exc.real
-    if isinstance(ecoul, cupy.ndarray):
-        ecoul = ecoul.get()[()]
-    if isinstance(exc, cupy.ndarray):
-        exc = exc.get()[()]
     e2 = ecoul + exc
     ks.scf_summary['e1'] = e1
+    ks.scf_summary['e2'] = e2
     ks.scf_summary['coul'] = ecoul
     ks.scf_summary['exc'] = exc
-    logger.debug(ks, 'E1 = %s  Ecoul = %s  Exc = %s', e1, ecoul, exc)
+    logger.debug(ks, 'E1 = %s  E2 = %s  Ecoul = %s  Exc = %s', e1, e2, ecoul, exc)
     return e1+e2, e2
 
-# Inherit pyscf KohnShamDFT class since this is tested in the pyscf dispersion code
+# Inherit pyscf KohnShamDFT class since this is tested in the pyscf dispersion code.
+# Note: This class inherits from pyscf.dft.rks.KohnShamDFT and uses its do_nlc method,
+# which relies on pyscf.scf.dispersion.parse_dft. It does NOT use gpu4pyscf.scf.dispersion.parse_dft.
 class KohnShamDFT(rks.KohnShamDFT):
 
     _keys = {'cphf_grids', *rks.KohnShamDFT._keys}
 
-    to_rhf = NotImplemented
-    to_uhf = NotImplemented
-    to_ghf = NotImplemented
-    to_hf  = NotImplemented
-    to_rks = NotImplemented
-    to_uks = NotImplemented
-    to_gks = NotImplemented
+    def to_rhf(self):
+        '''Convert the input mean-field object to a RHF/ROHF object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        return self.to_rks().to_hf()
+
+    def to_uhf(self):
+        '''Convert the input mean-field object to a UHF object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        return self.to_uks().to_hf()
+
+    def to_ghf(self):
+        '''Convert the input mean-field object to a GHF object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        return self.to_gks().to_hf()
+
+    def to_hf(self):
+        '''Convert the input KS object to the associated HF object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        raise NotImplementedError
+
+    def to_rks(self, xc=None):
+        '''Convert the input mean-field object to a RKS/ROKS object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        from gpu4pyscf.scf import addons
+        mf = addons.convert_to_rhf(self)
+        if xc is not None:
+            mf.xc = xc
+        mf.converged = xc == self.xc and mf.converged
+        return mf
+
+    def to_uks(self, xc=None):
+        '''Convert the input mean-field object to a UKS object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        from gpu4pyscf.scf import addons
+        mf = addons.convert_to_uhf(self)
+        if xc is not None:
+            mf.xc = xc
+        mf.converged = xc == self.xc and mf.converged
+        return mf
+
+    def to_gks(self, xc=None):
+        '''Convert the input mean-field object to a GKS object.
+
+        Note this conversion only changes the class of the mean-field object.
+        The total energy and wave-function are the same as them in the input
+        mean-field object.
+        '''
+        from gpu4pyscf.scf import addons
+        mf = addons.convert_to_ghf(self)
+        if xc is not None:
+            mf.xc = xc
+        mf.converged = xc == self.xc and mf.converged
+        return mf
 
     # Use rho to filter grids
-    small_rho_cutoff = getattr(__config__, 'dft_rks_RKS_small_rho_cutoff', 1e-7)
+    small_rho_cutoff = getattr(__config__, 'dft_rks_RKS_small_rho_cutoff', 0)
 
     def __init__(self, xc='LDA,VWN'):
         self.xc = xc
@@ -290,5 +353,8 @@ class RKS(KohnShamDFT, hf.RHF):
     energy_elec = energy_elec
     energy_tot = hf.RHF.energy_tot
     get_veff = get_veff
-    to_hf = NotImplemented
-    init_guess_by_vsap = rks.init_guess_by_vsap
+    def to_hf(self):
+        '''Convert to RHF object.'''
+        from gpu4pyscf import scf
+        return self._transfer_attrs_(scf.RHF(self.mol))
+

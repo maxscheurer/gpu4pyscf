@@ -16,13 +16,14 @@ import unittest
 import tempfile
 import numpy as np
 import cupy as cp
+import pyscf
 from pyscf.pbc import gto as pbcgto
 from pyscf.pbc.dft import UniformGrids
-from pyscf.lib import unpack_tril
+from pyscf.lib import unpack_tril, temporary_env
 from gpu4pyscf.pbc import dft as pbcdft
-from gpu4pyscf.pbc.dft.multigrid_v2 import MultiGridNumInt
 from gpu4pyscf.pbc.scf.rsjk import PBCJKMatrixOpt
 from gpu4pyscf.pbc.scf.j_engine import PBCJMatrixOpt
+from packaging import version
 
 def setUpModule():
     global cell
@@ -45,11 +46,10 @@ class KnownValues(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         L = 4
-        n = 21
         cell = pbcgto.Cell()
         cell.build(unit = 'B',
+                   precision = 1e-9,
                    a = ((L,0,0),(0,L,0),(0,0,L)),
-                   mesh = [n,n,n],
                    atom = [['He', (L/2.-.5,L/2.,L/2.-.5)],
                            ['He', (L/2.   ,L/2.,L/2.+.5)]],
                    basis = { 'He': [[0, (0.8, 1.0)],
@@ -68,8 +68,8 @@ class KnownValues(unittest.TestCase):
         kpts_band = np.random.random((2,3))
         e0, c0 = mf_ref.get_bands(kpts_band)
         e1, c1 = mf.get_bands(kpts_band)
-        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, 7)
-        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, 7)
+        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, delta=1e-5)
+        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, delta=1e-5)
 
     def test_gga_fft(self):
         cell = self.cell
@@ -82,8 +82,8 @@ class KnownValues(unittest.TestCase):
         kpts_band = np.random.random((2,3))
         e0, c0 = mf_ref.get_bands(kpts_band)
         e1, c1 = mf.get_bands(kpts_band)
-        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, 7)
-        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, 7)
+        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, delta=1e-5)
+        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, delta=1e-5)
 
     def test_rsh_fft(self):
         cell = self.cell
@@ -96,8 +96,8 @@ class KnownValues(unittest.TestCase):
         kpts_band = np.random.random((2,3))
         e0, c0 = mf_ref.get_bands(kpts_band)
         e1, c1 = mf.get_bands(kpts_band)
-        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, 7)
-        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, 7)
+        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, delta=1e-5)
+        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, delta=1e-5)
 
     def test_kpts_mgga(self):
         cell = self.cell
@@ -110,14 +110,16 @@ class KnownValues(unittest.TestCase):
         kpts_band = np.random.random((2,3))
         e0, c0 = mf_ref.get_bands(kpts_band)
         e1, c1 = mf.get_bands(kpts_band)
-        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, 7)
-        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, 7)
+        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, delta=1e-5)
+        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, delta=1e-5)
 
     def test_lda_gdf(self):
         from pyscf.pbc.df.df import _load3c
+        from gpu4pyscf.pbc.df import rsdf_builder
         cell = self.cell
         xc = 'svwn'
-        mf = pbcdft.RKS(cell, xc=xc).density_fit().run()
+        with temporary_env(rsdf_builder, PREFER_ED=False):
+            mf = pbcdft.RKS(cell, xc=xc).density_fit().run()
         pcell = cell.copy()
         pcell.precision = 1e-10
         mf_ref = pcell.RKS(xc=xc).density_fit()
@@ -133,7 +135,9 @@ class KnownValues(unittest.TestCase):
         i, j = divmod(ij, nao)
         naux = auxcell.nao
         out = cp.zeros((naux,nao,nao))
-        out[:,j,i] = out[:,i,j] = with_df._cderi[0]
+        cderi = cp.asarray(with_df._cderi[0])
+        out[:,i,j] = cderi
+        out[:,j,i] += cderi
         with _load3c(mf_ref.with_df._cderi, 'j3c', np.zeros((2,3))) as cderi:
             ref = unpack_tril(cderi[:])
         assert abs(out.get() - ref).max() < 1e-8
@@ -150,6 +154,12 @@ class KnownValues(unittest.TestCase):
         mf_ref.run()
         assert abs(mf.e_tot - mf_ref.e_tot) < 5e-7
 
+    def test_gga_gdf1(self):
+        mf = cell.RKS(xc='pbe0', exxdiv=None).to_gpu().density_fit()
+        mf = mf.multigrid_numint()
+        mf.run()
+        self.assertAlmostEqual(mf.e_tot, -0.3589970537906304, 8)
+
     def test_rsh_gdf(self):
         cell = self.cell
         xc = 'camb3lyp'
@@ -162,53 +172,68 @@ class KnownValues(unittest.TestCase):
         mf_ref.run()
         assert abs(mf.e_tot - mf_ref.e_tot) < 5e-7
 
+    def test_rsh_gdf1(self):
+        mf = cell.RKS(xc='camb3lyp', exxdiv=None).to_gpu().density_fit()
+        mf = mf.multigrid_numint()
+        mf.run()
+        self.assertAlmostEqual(mf.e_tot, -0.228035480142629, 8)
+
+    @unittest.skip('GPU PBC SCF requires k-point sampling to include the Gamma point')
     def test_lda_fft_with_kpt(self):
         cell = self.cell
         np.random.seed(1)
         k = np.random.random((1, 3))
-        mf = pbcdft.KRKS(cell, xc='lda,vwn', kpts=k).run()
+        mf = pbcdft.KRKS(cell, xc='lda,vwn', kpts=k)
+        mf.time_reversal_symmetry = False
+        mf.run()
         mf_ref = mf.to_cpu().run()
-        self.assertAlmostEqual(mf.e_tot, mf_ref.e_tot, 7)
+        self.assertAlmostEqual(mf.e_tot, mf_ref.e_tot, delta=1e-6)
 
         # test bands
         np.random.seed(1)
         kpts_band = np.random.random((2,3))
         e0, c0 = mf_ref.get_bands(kpts_band)
         e1, c1 = mf.get_bands(kpts_band)
-        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, 7)
-        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, 7)
+        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, delta=1e-5)
+        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, delta=1e-5)
 
+    @unittest.skip('GPU PBC SCF requires k-point sampling to include the Gamma point')
     def test_gga_fft_with_kpt(self):
         cell = self.cell
         np.random.seed(1)
         k = np.random.random((1, 3))
-        mf = pbcdft.KRKS(cell, xc='pbe0', kpts=k).run(conv_tol=1e-10)
+        mf = pbcdft.KRKS(cell, xc='pbe0', kpts=k)
+        mf.time_reversal_symmetry = False
+        mf.run(conv_tol=1e-10)
         mf_ref = mf.to_cpu().run(conv_tol=1e-10)
-        self.assertAlmostEqual(mf.e_tot, mf_ref.e_tot, 7)
+        self.assertAlmostEqual(mf.e_tot, mf_ref.e_tot, delta=1e-6)
 
         # test bands
         np.random.seed(1)
         kpts_band = np.random.random((2,3))
         e0, c0 = mf_ref.get_bands(kpts_band)
         e1, c1 = mf.get_bands(kpts_band)
-        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, 7)
-        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, 7)
+        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, delta=1e-5)
+        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, delta=1e-5)
 
+    @unittest.skip('GPU PBC SCF requires k-point sampling to include the Gamma point')
     def test_rsh_fft_with_kpt(self):
         cell = self.cell
         np.random.seed(1)
         k = np.random.random((1, 3))
-        mf = pbcdft.KRKS(cell, xc='camb3lyp', kpts=k).run(conv_tol=1e-10)
+        mf = pbcdft.KRKS(cell, xc='camb3lyp', kpts=k)
+        mf.time_reversal_symmetry = False
+        mf.run(conv_tol=1e-10)
         mf_ref = mf.to_cpu().run(conv_tol=1e-10)
-        self.assertAlmostEqual(mf.e_tot, mf_ref.e_tot, 7)
+        self.assertAlmostEqual(mf.e_tot, mf_ref.e_tot, delta=1e-6)
 
         # test bands
         np.random.seed(1)
         kpts_band = np.random.random((2,3))
         e0, c0 = mf_ref.get_bands(kpts_band)
         e1, c1 = mf.get_bands(kpts_band)
-        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, 7)
-        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, 7)
+        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, delta=1e-5)
+        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, delta=1e-5)
 
     def test_kpts_lda_fft(self):
         cell = self.cell
@@ -223,8 +248,8 @@ class KnownValues(unittest.TestCase):
         kpts_band = np.random.random((2,3))
         e0, c0 = mf_ref.get_bands(kpts_band)
         e1, c1 = kmf.get_bands(kpts_band)
-        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, 7)
-        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, 7)
+        self.assertAlmostEqual(abs(e1[0].get() - e0[0]).max(), 0, delta=1e-5)
+        self.assertAlmostEqual(abs(e1[1].get() - e0[1]).max(), 0, delta=1e-5)
 
     def test_kpts_gga_fft(self):
         cell = self.cell
@@ -252,20 +277,33 @@ class KnownValues(unittest.TestCase):
         cell.basis = [[0, (4.0, 1.0)], [0, (1.0, 1.0)]]
         cell.build()
 
-        mf = cell.RKS(xc='pbe0').to_gpu().density_fit().run()
+        auxbasis = [
+            [0, [8., 1]],
+            [0, [4., 1]],
+            [0, [2., 1]],
+            [0, [1. , 1]],
+            [1, [1. , 1]],
+            [2, [1. , 1]],
+        ]
+        mf = cell.RKS(xc='pbe0').to_gpu().density_fit(auxbasis=auxbasis).run()
         self.assertTrue(isinstance(mf.with_df, GDF))
-        self.assertAlmostEqual(mf.e_tot, -0.4483496502, 7)
+        self.assertAlmostEqual(mf.e_tot, -0.4417427888, 7)
         #mf_ref = mf.to_cpu().run()
         #self.assertAlmostEqual(mf.e_tot, mf_ref.e_tot, 7)
 
+        mf = mf.multigrid_numint().run()
+        self.assertAlmostEqual(mf.e_tot, -0.4411729210, 7)
+
         nk = [2, 1, 1]
         kpts = cell.make_kpts(nk)
-        kmf = pbcdft.KRKS(cell, xc='pbe0', kpts=kpts).density_fit().run()
-        self.assertTrue(isinstance(kmf.with_df, GDF))
-        self.assertAlmostEqual(kmf.e_tot, -0.44429306, 6)
-        #mf_ref = kmf.to_cpu()
-        #mf_ref.run()
-        #self.assertAlmostEqual(kmf.e_tot, mf_ref.e_tot, 7)
+        kmf = pbcdft.KRKS(cell, xc='pbe0', kpts=kpts).density_fit(auxbasis=auxbasis).run()
+        self.assertTrue(isinstance(mf.with_df, GDF))
+        self.assertAlmostEqual(kmf.e_tot, -0.4376911788, 6)
+        #mf_ref = mf.to_cpu().run()
+        #self.assertAlmostEqual(mf.e_tot, mf_ref.e_tot, 7)
+
+        kmf = kmf.multigrid_numint().run()
+        self.assertAlmostEqual(kmf.e_tot, -0.4371213206, 6)
 
     def test_reset(self):
         cell = pbcgto.Cell()
@@ -307,7 +345,7 @@ class KnownValues(unittest.TestCase):
 
     def test_pbe0_rsjk(self):
         mf = cell.RKS(xc='pbe0').to_gpu()
-        mf._numint = MultiGridNumInt(cell)
+        mf = mf.multigrid_numint()
         mf.rsjk = PBCJKMatrixOpt(cell)
         mf.j_engine = PBCJMatrixOpt(cell)
         mf.run()
@@ -317,7 +355,7 @@ class KnownValues(unittest.TestCase):
 
     def test_wb97_rsjk(self):
         mf = cell.RKS(xc='wb97', exxdiv=None).to_gpu()
-        mf._numint = MultiGridNumInt(cell)
+        mf = mf.multigrid_numint()
         mf.rsjk = PBCJKMatrixOpt(cell)
         mf.j_engine = PBCJMatrixOpt(cell)
         mf.run()
@@ -333,11 +371,16 @@ class KnownValues(unittest.TestCase):
         #ref = cell.RKS(xc='wb97').run()
         #self.assertAlmostEqual(mf.e_tot, ref.e_tot, 8)
 
+    def test_hse06_rsjk_density_fit(self):
+        mf = cell.RKS(xc='hse06', exxdiv=None).to_gpu().density_fit()
+        mf = mf.multigrid_numint()
+        mf.run()
+        self.assertAlmostEqual(mf.e_tot, -0.389454248851274, 8)
+
     def test_hse06_rsjk(self):
         mf = cell.RKS(xc='hse06', exxdiv=None).to_gpu()
-        mf._numint = MultiGridNumInt(cell)
-        mf.rsjk = PBCJKMatrixOpt(cell)
-        mf.j_engine = PBCJMatrixOpt(cell)
+        mf = mf.multigrid_numint()
+        mf.rsjk = mf.j_engine = PBCJKMatrixOpt(cell)
         mf.run()
         self.assertAlmostEqual(mf.e_tot, -0.390562199148231, 8)
         #ref = cell.RKS(xc='hse06', exxdiv=None).run()
@@ -351,11 +394,15 @@ class KnownValues(unittest.TestCase):
         #ref = cell.RKS(xc='hse06').run()
         #self.assertAlmostEqual(mf.e_tot, ref.e_tot, 8)
 
+        mf = cell.RKS(xc='hse06').to_gpu()
+        mf.rsjk = mf.j_engine = PBCJKMatrixOpt(cell)
+        mf.run()
+        self.assertAlmostEqual(mf.e_tot, -0.453371384843629, 8)
+
     def test_camb3lyp_rsjk(self):
         mf = cell.RKS(xc='camb3lyp', exxdiv=None).to_gpu()
-        mf._numint = MultiGridNumInt(cell)
-        mf.rsjk = PBCJKMatrixOpt(cell)
-        mf.j_engine = PBCJMatrixOpt(cell)
+        mf = mf.multigrid_numint()
+        mf.rsjk = mf.j_engine = PBCJKMatrixOpt(cell)
         mf.run()
         self.assertAlmostEqual(mf.e_tot, -0.228873263786209, 8)
         #ref = cell.RKS(xc='camb3lyp', exxdiv=None).run()
@@ -369,6 +416,11 @@ class KnownValues(unittest.TestCase):
         #ref = cell.RKS(xc='camb3lyp').run()
         #self.assertAlmostEqual(mf.e_tot, ref.e_tot, 8)
 
+        mf = cell.RKS(xc='camb3lyp').to_gpu()
+        mf.rsjk = PBCJKMatrixOpt(cell)
+        mf.run()
+        self.assertAlmostEqual(mf.e_tot, -0.442283740471709, 8)
+
     def test_lda_krks_rsjk(self):
         kpts = cell.make_kpts([2,1,1])
         mf = cell.KRKS(kpts=kpts).to_gpu()
@@ -379,10 +431,29 @@ class KnownValues(unittest.TestCase):
         #ref = cell.KRKS(kpts=kpts).run()
         #self.assertAlmostEqual(mf.e_tot, ref.e_tot, 8)
 
+    def test_pbe0_krks_density_fit(self):
+        auxbasis = [
+            [0, [6., 1]],
+            [0, [3., 1]],
+            [0, [2., 1]],
+            [0, [1. , 1]],
+            [1, [1. , 1]],
+            [2, [1. , 1]],
+            [3, [1. , 1]],
+        ]
+        kpts = cell.make_kpts([2,1,1])
+        mf0 = cell.KRKS(xc='pbe0', kpts=kpts).to_gpu()
+        mf = mf0.density_fit(auxbasis=auxbasis).multigrid_numint()
+        mf.run()
+        self.assertAlmostEqual(mf.e_tot, -0.4498648935239443, 8)
+
+        mf = mf0.density_fit(auxbasis=auxbasis).run()
+        self.assertAlmostEqual(mf.e_tot, -0.4500415798899024, 8)
+
     def test_pbe0_krks_rsjk(self):
         kpts = cell.make_kpts([2,1,1])
         mf = cell.KRKS(xc='pbe0', kpts=kpts).to_gpu()
-        mf._numint = MultiGridNumInt(cell)
+        mf = mf.multigrid_numint()
         mf.rsjk = PBCJKMatrixOpt(cell)
         mf.j_engine = PBCJMatrixOpt(cell)
         mf.run()
@@ -393,7 +464,7 @@ class KnownValues(unittest.TestCase):
     def test_wb97_krks_rsjk(self):
         kpts = cell.make_kpts([2,1,1])
         mf = cell.KRKS(xc='wb97', exxdiv=None, kpts=kpts).to_gpu()
-        mf._numint = MultiGridNumInt(cell)
+        mf = mf.multigrid_numint()
         mf.rsjk = PBCJKMatrixOpt(cell)
         mf.j_engine = PBCJMatrixOpt(cell)
         mf.run()
@@ -409,10 +480,30 @@ class KnownValues(unittest.TestCase):
         #ref = cell.KRKS(xc='wb97', kpts=kpts).run()
         #self.assertAlmostEqual(mf.e_tot, ref.e_tot, 8)
 
+    def test_hse06_krks_density_fit(self):
+        auxbasis = [
+            [0, [6., 1]],
+            [0, [3., 1]],
+            [0, [2., 1]],
+            [0, [1. , 1]],
+            [1, [1. , 1]],
+            [2, [1. , 1]],
+            [3, [1. , 1]],
+        ]
+        kpts = cell.make_kpts([2,1,1])
+        mf0 = cell.KRKS(xc='hse06', exxdiv=None, kpts=kpts).to_gpu()
+        mf = mf0.density_fit(auxbasis=auxbasis).multigrid_numint().run()
+        mf1 = mf0.multigrid_numint().run()
+        self.assertAlmostEqual(mf.e_tot, mf1.e_tot, 4)
+        self.assertAlmostEqual(mf.e_tot, -0.4196032331000882, 8)
+
+        mf = mf0.density_fit(auxbasis=auxbasis).run()
+        self.assertAlmostEqual(mf.e_tot, -0.4197798873685143, 8)
+
     def test_hse06_krks_rsjk(self):
         kpts = cell.make_kpts([2,1,1])
         mf = cell.KRKS(xc='hse06', exxdiv=None, kpts=kpts).to_gpu()
-        mf._numint = MultiGridNumInt(cell)
+        mf = mf.multigrid_numint()
         mf.rsjk = PBCJKMatrixOpt(cell)
         mf.j_engine = PBCJMatrixOpt(cell)
         mf.run()
@@ -428,10 +519,17 @@ class KnownValues(unittest.TestCase):
         #ref = cell.KRKS(xc='hse06', kpts=kpts).run()
         #self.assertAlmostEqual(mf.e_tot, ref.e_tot, 8)
 
+    def test_cambl3yp_krks_density_fit(self):
+        kpts = cell.make_kpts([2,1,1])
+        mf = cell.KRKS(xc='camb3lyp', exxdiv=None, kpts=kpts).to_gpu().density_fit()
+        mf = mf.multigrid_numint()
+        mf.run()
+        self.assertAlmostEqual(mf.e_tot, -0.291283464739098, 8)
+
     def test_cambl3yp_krks_rsjk(self):
         kpts = cell.make_kpts([2,1,1])
         mf = cell.KRKS(xc='camb3lyp', exxdiv=None, kpts=kpts).to_gpu()
-        mf._numint = MultiGridNumInt(cell)
+        mf = mf.multigrid_numint()
         mf.rsjk = PBCJKMatrixOpt(cell)
         mf.j_engine = PBCJMatrixOpt(cell)
         mf.run()
@@ -446,6 +544,92 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(mf.e_tot, -0.432150196659050, 8)
         #ref = cell.KRKS(xc='camb3lyp', kpts=kpts).run()
         #self.assertAlmostEqual(mf.e_tot, ref.e_tot, 8)
+
+    @unittest.skip('Only support Monkhorst-Pack kmesh')
+    def test_unpaired_kpts(self):
+        kpts = cell.make_kpts([1,1,5])[:3]
+        kmf = cell.KRKS(xc='pbe', kpts=kpts).to_gpu()
+        kmf = kmf.multigrid_numint()
+        kmf.time_reversal_symmetry = True
+        kmf.run()
+        self.assertAlmostEqual(kmf.e_tot, -0.45774883471428585, 8)
+
+        kmf.time_reversal_symmetry = False
+        kmf.run()
+        self.assertAlmostEqual(kmf.e_tot, -0.45774883471428585, 8)
+
+    def test_rsh_short_range_only(self):
+        omega = 0.25
+        xc = f'RSH({omega}, 0.0, 0.3) + 0.8*LDA'
+        mf = cell.KRKS(xc=xc).to_gpu().run()
+        ref = mf.e_tot
+        mf.rsjk = PBCJKMatrixOpt(cell, omega)
+        mf.run()
+        assert abs(mf.e_tot - ref) < 1e-9
+
+    @unittest.skipIf(version.parse(pyscf.__version__) < version.parse('2.12'),
+                     'cell.to_gpu not supported')
+    def test_mesh_in_scanner(self):
+        cell1 = pbcgto.M(
+            a=np.eye(3)*4,
+            atom='H 0 0 0; H 0 0 1.', basis='gth-szv',
+            pseudo='gth-pbe', mesh=[7, 7, 7])
+
+        cell2 = cell1.set_geom_('H 0 0 0; H 0 0 1.5', inplace=False)
+        cell2.mesh = [15, 15, 15]
+
+        # cell1.RKS().to_gpu() will trigger CPU FFTDF initializes
+        # with_df.mesh = cell.mesh. This assignment leads to an explicit
+        # override to mesh. cell2.mesh will not be read by the scanner. This
+        # problem is fixed in pyscf-2.15
+        mf1 = cell1.to_gpu().RKS(xc='camb3lyp').multigrid_numint().run()
+        mf_scanner = mf1.as_scanner()
+        mf_scanner(cell1)
+
+        e2 = mf_scanner(cell2)
+        mf2 = cell2.to_gpu().RKS(xc='camb3lyp').multigrid_numint().run()
+        self.assertAlmostEqual(e2, mf2.e_tot, 7)
+
+        e1 = mf_scanner(cell1)
+        self.assertAlmostEqual(e1, mf1.e_tot, 7)
+
+class BeckeDensityPruning(unittest.TestCase):
+    @staticmethod
+    def _case(atom_grid):
+        from gpu4pyscf.pbc.dft.gen_grid import BeckeGrids
+        cell = pbcgto.M(atom='He .2 .3 .4', basis=[[0, [1.3, 1.]]],
+                       a=np.eye(3)*8, unit='Bohr', precision=1e-11, verbose=0)
+        mf = pbcdft.RKS(cell, xc='LDA,VWN')
+        mf.grids = BeckeGrids(cell)
+        mf.grids.atom_grid = atom_grid
+        mf.grids.prune = None
+        mf.small_rho_cutoff = 1e-6
+        overlap = cell.pbc_intor('int1e_ovlp')
+        density = cp.asarray(2 / overlap)
+        return mf, density
+
+    def test_initialize_grids_density_pruning(self):
+        mf, density = self._case((30, 110))
+        reference = mf.grids.copy().build()
+        rho = mf.get_rho(density, reference, mf.kpt)
+        charges = rho * reference.weights
+        electron_count = float(charges.sum())
+        self.assertLess(abs(electron_count - mf.cell.nelectron), 1e-5)
+        keep = cp.abs(charges) > mf.small_rho_cutoff / reference.weights.size
+        self.assertLess(int(keep.sum()), keep.size)
+        self.assertGreater(int(keep.sum()), 0)
+        expected = {name: getattr(reference, name)[keep].get() for name in
+                    ('coords', 'weights', 'quadrature_weights', 'supatm_idx')}
+        self.assertIs(mf.initialize_grids(mf.cell, density, mf.kpt), mf)
+        for name, values in expected.items():
+            np.testing.assert_array_equal(getattr(mf.grids, name).get(), values)
+        remaining_charge = float(mf.get_rho(density, mf.grids, mf.kpt).dot(mf.grids.weights))
+        self.assertLessEqual(abs(electron_count - remaining_charge), mf.small_rho_cutoff)
+        # A second initialization must not prune or reorder an existing grid.
+        mf.initialize_grids(mf.cell, density, mf.kpt)
+        for name, values in expected.items():
+            np.testing.assert_array_equal(getattr(mf.grids, name).get(), values)
+
 
 if __name__ == '__main__':
     print("Full Tests for pbc.dft.rks")

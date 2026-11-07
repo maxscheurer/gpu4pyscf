@@ -26,6 +26,7 @@ import gpu4pyscf
 from gpu4pyscf.lib import utils, logger
 from gpu4pyscf.gto.int3c1e import int1e_grids
 from gpu4pyscf.gto.int3c1e_ip import int1e_grids_ip1, int1e_grids_ip2
+from gpu4pyscf.grad.rhf import contract_h1e_dm
 
 
 def add_mm_charges(scf_method, atoms_or_coords, charges, radii=None, unit=None):
@@ -45,6 +46,7 @@ def qmmm_for_scf(method, mm_mol):
 
     if isinstance(method, QMMM):
         method.mm_mol = mm_mol
+        method._e_nuc_ext = None
         return method
 
     cls = QMMMSCF
@@ -64,6 +66,8 @@ class QMMMSCF(QMMM):
         if mm_mol is None:
             mm_mol = gto.Mole()
         self.mm_mol = mm_mol
+        # A bare method returned by undo_qmmm may still carry an old private cache.
+        self._e_nuc_ext = None
 
     def undo_qmmm(self):
         obj = lib.view(self, lib.drop_class(self.__class__, QMMM))
@@ -86,30 +90,29 @@ class QMMMSCF(QMMM):
         if mol is None:
             mol = self.mol
         h1e = super().get_hcore(mol)
-
-        mm_mol = self.mm_mol
-        coords = mm_mol.atom_coords()
-        charges = mm_mol.atom_charges()
-        if mm_mol.charge_model == 'gaussian':
-            expnts = mm_mol.get_zetas()
-        else:
-            expnts = None
-        h1e -= int1e_grids(mol, coords, charges = charges, charge_exponents = expnts)
+        h1e -= _mm_charge_integrals(self.mm_mol, mol, int1e_grids)
         return h1e
 
     def energy_nuc(self):
         # interactions between QM nuclei and MM particles
         nuc = super().energy_nuc()
 
-        assert self.mm_mol.charge_model == 'point' # TODO: support Gaussian charge, same as the one in PCM
-        coords = self.mm_mol.atom_coords()
-        charges = self.mm_mol.atom_charges()
-        nuclear_charges = self.mol.atom_charges()
-        nuclear_coords = self.mol.atom_coords()
-        r_nuc_ext = np.linalg.norm(nuclear_coords[None, :, :] - coords[:, None, :], axis = 2)
-        e_nuc_ext = np.einsum("qA->", (nuclear_charges[None, :] * charges[:, None]) / r_nuc_ext)
+        e_nuc_ext = getattr(self, '_e_nuc_ext', None)
+        if e_nuc_ext is None:
+            assert self.mm_mol.charge_model == 'point' # TODO: support Gaussian charge, same as the one in PCM
+            coords = self.mm_mol.atom_coords()
+            charges = self.mm_mol.atom_charges()
+            nuclear_charges = self.mol.atom_charges()
+            nuclear_coords = self.mol.atom_coords()
+            r_nuc_ext = np.linalg.norm(nuclear_coords[None, :, :] - coords[:, None, :], axis = 2)
+            e_nuc_ext = np.einsum("qA->", (nuclear_charges[None, :] * charges[:, None]) / r_nuc_ext)
+            self._e_nuc_ext = e_nuc_ext
         nuc += e_nuc_ext
         return nuc
+
+    def reset(self, mol=None):
+        self._e_nuc_ext = None
+        return super().reset(mol)
 
     to_gpu = utils.to_gpu
     def to_cpu(self):
@@ -131,7 +134,8 @@ def add_mm_charges_grad(scf_grad, atoms_or_coords, charges, radii=None, unit=Non
     mm_mol = mm_mole.create_mm_mol(atoms_or_coords, charges,
                                    radii=radii, unit=unit)
     mm_grad = qmmm_grad_for_scf(scf_grad)
-    mm_grad.base.mm_mol = mm_mol
+    # Reuse the SCF update path so the nuclear/MM energy cache is invalidated.
+    qmmm_for_scf(mm_grad.base, mm_mol)
     return mm_grad
 
 mm_charge_grad = add_mm_charges_grad
@@ -149,6 +153,16 @@ def qmmm_grad_for_scf(scf_grad):
            isinstance(scf_grad.base, QMMM))
 
     return scf_grad.view(lib.make_class((QMMMGrad, scf_grad.__class__)))
+
+def _mm_charge_integrals(mm_mol, mol, integral_fn):
+    '''Using the specified integral_fn to compute MM charge integrals for a QM molecule.'''
+    coords = mm_mol.atom_coords()
+    charges = mm_mol.atom_charges()
+    if mm_mol.charge_model == 'gaussian':
+        expnts = mm_mol.get_zetas()
+    else:
+        expnts = None
+    return integral_fn(mol, coords, charges = charges, charge_exponents = expnts)
 
 class QMMMGrad:
     __name_mixin__ = 'QMMM'
@@ -173,17 +187,18 @@ class QMMMGrad:
         if mol is None:
             mol = self.mol
         g_qm = super().get_hcore(mol, exclude_ecp)
-
-        mm_mol = self.base.mm_mol
-        coords = mm_mol.atom_coords()
-        charges = mm_mol.atom_charges()
-        if mm_mol.charge_model == 'gaussian':
-            expnts = mm_mol.get_zetas()
-        else:
-            expnts = None
-
-        g_qm += int1e_grids_ip1(mol, coords, charges = charges, charge_exponents = expnts)
+        g_qm += _mm_charge_integrals(self.base.mm_mol, mol, int1e_grids_ip1)
         return g_qm
+
+    def extra_force(self, atom_id=None):
+        assert atom_id is None
+        h1 = _mm_charge_integrals(self.base.mm_mol, self.mol, int1e_grids_ip1)
+        dm = self.base.make_rdm1()
+        if dm.ndim == 3: #UHF
+            dm = dm[0] + dm[1]
+        e1_grad = contract_h1e_dm(self.mol, h1, dm, hermi=1)
+        e1_grad += super().extra_force()
+        return e1_grad
 
     def grad_hcore_mm(self, dm, mol=None):
         r'''Nuclear gradients of the electronic energy

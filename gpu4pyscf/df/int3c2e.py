@@ -19,9 +19,10 @@ import numpy as np
 import cupy
 from pyscf import gto, df, lib
 from pyscf.scf import _vhf
-from gpu4pyscf.scf.int4c2e import BasisProdCache, libgvhf, libgint
+from gpu4pyscf.scf.int4c2e import BasisProdCache
 from gpu4pyscf.lib.cupy_helper import (block_c2s_diag, cart2sph, contract, get_avail_mem,
                                        reduce_to_device, copy_array, transpose_sum)
+from gpu4pyscf.lib.cupy_helper import load_library
 from gpu4pyscf.lib import logger
 from gpu4pyscf.gto.mole import basis_seg_contraction
 from gpu4pyscf.__config__ import num_devices
@@ -31,6 +32,9 @@ FREE_CUPY_CACHE = True
 STACK_SIZE_PER_THREAD = 8192 * 4
 BLKSIZE = 256
 NROOT_ON_GPU = 7
+
+libgvhf = load_library('libgvhf')
+libgint = load_library('libgint')
 
 def make_fake_mol():
     '''
@@ -270,7 +274,8 @@ class VHFOpt(_vhf.VHFOpt):
                     self.bas_pairs_locs.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(ncptype),
                     _tot_mol._atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(_tot_mol.natm),
                     _tot_mol._bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(_tot_mol.nbas),
-                    _tot_mol._env.ctypes.data_as(ctypes.c_void_p))
+                    _tot_mol._env.ctypes.data_as(ctypes.c_void_p),
+                    ctypes.c_void_p(cupy.cuda.get_current_stream().ptr))
                 self._bpcache[device_id] = bpcache
                 cput0 = log.timer_debug1(f'Initialize GPU cache on Device {device_id}', *cput0)
         bpcache = self._bpcache[device_id]
@@ -348,80 +353,14 @@ class VHFOpt(_vhf.VHFOpt):
             self._aux_coeff = self.unsort_orbitals(self.aux_cart2sph, aux_axis=[1])
         return self._aux_coeff
 
-def get_int3c2e_wjk(mol, auxmol, dm0_tag, thred=1e-12, omega=None, with_j=True, with_k=True):
-    log = logger.new_logger(mol, mol.verbose)
-    intopt = VHFOpt(mol, auxmol, 'int2e')
-    intopt.build(thred, diag_block_with_triu=True, aosym=True,
-                 group_size=BLKSIZE, group_size_aux=BLKSIZE)
-    orbo = dm0_tag.occ_coeff
-    nao = mol.nao
-    naux = auxmol.nao
-    nocc = orbo.shape[1]
-
-    wj = None
-    if with_j:
-        wj = cupy.empty([naux])
-
-    wk = None
-    if with_k:
-        avail_mem = get_avail_mem()
-        use_gpu_memory = True
-        if naux*nao*nocc*8 < 0.4*avail_mem:
-            try:
-                wk = cupy.empty([naux,nao,nocc])
-            except Exception:
-                use_gpu_memory = False
-        else:
-            use_gpu_memory = False
-
-        if not use_gpu_memory:
-            log.debug('Saving int3c2e_wjk on CPU memory')
-            mem = cupy.cuda.alloc_pinned_memory(naux*nao*nocc*8)
-            wk = np.ndarray([naux,nao,nocc], dtype=np.float64, order='C', buffer=mem)
-
-    # TODO: async data transfer
-    for cp_kl_id, _ in enumerate(intopt.aux_log_qs):
-        k0 = intopt.aux_ao_loc[cp_kl_id]
-        k1 = intopt.aux_ao_loc[cp_kl_id+1]
-        if with_j:
-            rhoj_tmp = cupy.zeros([k1-k0], order='C')
-        if with_k:
-            rhok_tmp = cupy.zeros([k1-k0, nao, nocc], order='C')
-
-        for cp_ij_id, _ in enumerate(intopt.log_qs):
-            cpi = intopt.cp_idx[cp_ij_id]
-            cpj = intopt.cp_jdx[cp_ij_id]
-            li = intopt.angular[cpi]
-            lj = intopt.angular[cpj]
-            int3c_blk = get_int3c2e_slice(intopt, cp_ij_id, cp_kl_id, omega=omega)
-            if not intopt.mol.cart:
-                int3c_blk = cart2sph(int3c_blk, axis=1, ang=lj)
-                int3c_blk = cart2sph(int3c_blk, axis=2, ang=li)
-            i0, i1 = intopt.ao_loc[cpi], intopt.ao_loc[cpi+1]
-            j0, j1 = intopt.ao_loc[cpj], intopt.ao_loc[cpj+1]
-            if with_j:
-                tmp = contract('Lji,ij->L', int3c_blk, dm0_tag[i0:i1,j0:j1])
-                rhoj_tmp += tmp
-                if cpi != cpj:
-                    rhoj_tmp += tmp
-            if with_k:
-                rhok_tmp[:,j0:j1] += contract('Lji,io->Ljo', int3c_blk, orbo[i0:i1])
-                if cpi != cpj:
-                    rhok_tmp[:,i0:i1] += contract('Lji,jo->Lio', int3c_blk, orbo[j0:j1])
-        if with_j:
-            wj[k0:k1] = rhoj_tmp
-        if with_k:
-            if isinstance(wk, cupy.ndarray):
-                wk[k0:k1] = rhok_tmp
-            else:
-                #rhok_tmp.get(out=wk[k0:k1])
-                copy_array(rhok_tmp, wk[k0:k1])
-    return wj, wk
-
 def get_int3c2e_ip_jk(intopt, cp_aux_id, ip_type, rhoj, rhok, dm, omega=None, stream=None):
     '''
     build jk with int3c2e slice (sliced in k dimension)
     '''
+    raise DeprecationWarning(
+        'get_int3c2e_ip_jk is deprecated. '
+        'Use the df.grad._jk_energy_per_atom function instead')
+
     if omega is None: omega = 0.0
     if stream is None: stream = cupy.cuda.get_current_stream()
 
@@ -460,7 +399,6 @@ def get_int3c2e_ip_jk(intopt, cp_aux_id, ip_type, rhoj, rhok, dm, omega=None, st
     ntasks_kl = len(log_q_kl)
     ncp_ij = len(intopt.log_qs)
     err = fn(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         intopt.bpcache,
         ej_ptr,
         ek_ptr,
@@ -475,7 +413,8 @@ def get_int3c2e_ip_jk(intopt, cp_aux_id, ip_type, rhoj, rhok, dm, omega=None, st
         ctypes.c_int(ntasks_kl),
         ctypes.c_int(ncp_ij),
         ctypes.c_int(cp_kl_id),
-        ctypes.c_double(omega))
+        ctypes.c_double(omega),
+        ctypes.cast(stream.ptr, ctypes.c_void_p))
     if err != 0:
         raise RuntimeError(f'GINT_getjk_int2e_ip failed, err={err}')
     return ej, ek
@@ -542,7 +481,6 @@ def loop_int3c2e_general(intopt, task_list=None, ip_type='', omega=None, stream=
         if (li + lj + lk + order)//2 + 1 < NROOT_ON_GPU:
             int3c_blk = cupy.zeros([comp, nk, nj, ni], order='C', dtype=np.float64)
             err = fn(
-                ctypes.cast(stream.ptr, ctypes.c_void_p),
                 intopt.bpcache,
                 ctypes.cast(int3c_blk.data.ptr, ctypes.c_void_p),
                 ctypes.c_int(norb),
@@ -553,7 +491,8 @@ def loop_int3c2e_general(intopt, task_list=None, ip_type='', omega=None, stream=
                 ctypes.c_int(nbins),
                 ctypes.c_int(cp_ij_id),
                 ctypes.c_int(cp_kl_id),
-                ctypes.c_double(omega))
+                ctypes.c_double(omega),
+                ctypes.cast(stream.ptr, ctypes.c_void_p))
             if err != 0:
                 raise RuntimeError(f'GINT_fill_int3c2e general failed, err={err}')
         else:
@@ -582,90 +521,6 @@ def loop_int3c2e_general(intopt, task_list=None, ip_type='', omega=None, stream=
 
         yield i0,i1,j0,j1,k0,k1,int3c_blk
 
-def loop_aux_jk(intopt, ip_type='', omega=None, stream=None):
-    '''
-    **** deprecated **********
-    loop over all int3c2e blocks
-    - outer loop for k
-    - inner loop for ij pair
-    '''
-    fn = getattr(libgint, 'GINTfill_int3c2e_' + ip_type)
-    if ip_type == '':       order = 0
-    if ip_type == 'ip1':    order = 1
-    if ip_type == 'ip2':    order = 1
-    if ip_type == 'ipip1':  order = 2
-    if ip_type == 'ip1ip2': order = 2
-    if ip_type == 'ipvip1': order = 2
-    if ip_type == 'ipip2':  order = 2
-
-    if omega is None: omega = 0.0
-    if stream is None: stream = cupy.cuda.get_current_stream()
-    assert omega >= 0
-
-    nao = intopt.mol.nao
-    nao_cart = intopt._sorted_mol.nao
-    naux_cart = intopt._sorted_auxmol.nao
-    norb_cart = nao_cart + naux_cart + 1
-    ao_loc = intopt.ao_loc
-    aux_ao_loc = intopt.aux_ao_loc
-    comp = 3**order
-
-    nbins = 1
-    for aux_id, log_q_kl in enumerate(intopt.aux_log_qs):
-        cp_kl_id = aux_id + len(intopt.log_qs)
-        k0, k1 = intopt.aux_ao_loc[aux_id], intopt.aux_ao_loc[aux_id+1]
-        lk = intopt.aux_angular[aux_id]
-
-        ints_slices = cupy.zeros([comp, k1-k0, nao, nao])
-        for cp_ij_id, log_q_ij in enumerate(intopt.log_qs):
-            cpi = intopt.cp_idx[cp_ij_id]
-            cpj = intopt.cp_jdx[cp_ij_id]
-            li = intopt.angular[cpi]
-            lj = intopt.angular[cpj]
-
-            i0, i1 = intopt.cart_ao_loc[cpi], intopt.cart_ao_loc[cpi+1]
-            j0, j1 = intopt.cart_ao_loc[cpj], intopt.cart_ao_loc[cpj+1]
-            k0, k1 = intopt.cart_aux_loc[aux_id], intopt.cart_aux_loc[aux_id+1]
-            ni = i1 - i0
-            nj = j1 - j0
-            nk = k1 - k0
-
-            bins_locs_ij = np.array([0, len(log_q_ij)], dtype=np.int32)
-            bins_locs_kl = np.array([0, len(log_q_kl)], dtype=np.int32)
-
-            ao_offsets = np.array([i0,j0,nao_cart+1+k0,nao_cart], dtype=np.int32)
-            strides = np.array([1, ni, ni*nj, ni*nj*nk], dtype=np.int32)
-
-            int3c_blk = cupy.zeros([comp, nk, nj, ni], order='C', dtype=np.float64)
-            err = fn(
-                ctypes.cast(stream.ptr, ctypes.c_void_p),
-                intopt.bpcache,
-                ctypes.cast(int3c_blk.data.ptr, ctypes.c_void_p),
-                ctypes.c_int(norb_cart),
-                strides.ctypes.data_as(ctypes.c_void_p),
-                ao_offsets.ctypes.data_as(ctypes.c_void_p),
-                bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
-                bins_locs_kl.ctypes.data_as(ctypes.c_void_p),
-                ctypes.c_int(nbins),
-                ctypes.c_int(cp_ij_id),
-                ctypes.c_int(cp_kl_id),
-                ctypes.c_double(omega))
-            if err != 0:
-                raise RuntimeError(f'GINT_fill_int3c2e general failed, err={err}')
-
-            if not intopt._auxmol.cart:
-                int3c_blk = cart2sph(int3c_blk, axis=1, ang=lk)
-            if not intopt._mol.cart:
-                int3c_blk = cart2sph(int3c_blk, axis=2, ang=lj)
-                int3c_blk = cart2sph(int3c_blk, axis=3, ang=li)
-
-            i0, i1 = ao_loc[cpi], ao_loc[cpi+1]
-            j0, j1 = ao_loc[cpj], ao_loc[cpj+1]
-            k0, k1 = aux_ao_loc[aux_id], aux_ao_loc[aux_id+1]
-            ints_slices[:, :, j0:j1, i0:i1] = int3c_blk
-        int3c_blk = None
-        yield aux_id, ints_slices
-
 def get_ao2atom(intopt, aoslices):
     nao = intopt.mol.nao
     ao2atom = cupy.zeros([nao, len(aoslices)])
@@ -686,6 +541,9 @@ def get_j_int3c2e_pass1(intopt, dm0, sort_j=True, stream=None):
     '''
     get rhoj pass1 for int3c2e
     '''
+    raise DeprecationWarning(
+        'get_j_int3c2e_pass1 is deprecated. '
+        'Use int3c2e_bdiv.contract_int3c2e_dm function instead')
     if stream is None: stream = cupy.cuda.get_current_stream()
 
     n_dm = 1
@@ -710,7 +568,6 @@ def get_j_int3c2e_pass1(intopt, dm0, sort_j=True, stream=None):
     rhoj = cupy.zeros([naux])
 
     err = libgvhf.GINTbuild_j_int3c2e_pass1(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         intopt.bpcache,
         ctypes.cast(dm_cart.data.ptr, ctypes.c_void_p),
         ctypes.cast(rhoj.data.ptr, ctypes.c_void_p),
@@ -720,7 +577,8 @@ def get_j_int3c2e_pass1(intopt, dm0, sort_j=True, stream=None):
         bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
         bins_locs_kl.ctypes.data_as(ctypes.c_void_p),
         ctypes.c_int(ncp_ij),
-        ctypes.c_int(ncp_kl))
+        ctypes.c_int(ncp_kl),
+        ctypes.cast(stream.ptr, ctypes.c_void_p))
     if err != 0:
         raise RuntimeError('CUDA error in get_j_pass1')
 
@@ -733,6 +591,10 @@ def get_j_int3c2e_pass2(intopt, rhoj, stream=None):
     '''
     get vj pass2 for int3c2e
     '''
+    raise DeprecationWarning(
+        'get_j_int3c2e_pass2 is deprecated. '
+        'Use int3c2e_bdiv.contract_int3c2e_auxvec function instead')
+
     if stream is None: stream = cupy.cuda.get_current_stream()
 
     n_dm = 1
@@ -754,7 +616,6 @@ def get_j_int3c2e_pass2(intopt, rhoj, stream=None):
         rhoj = intopt.aux_cart2sph @ rhoj
 
     err = libgvhf.GINTbuild_j_int3c2e_pass2(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         intopt.bpcache,
         ctypes.cast(vj.data.ptr, ctypes.c_void_p),
         ctypes.cast(rhoj.data.ptr, ctypes.c_void_p),
@@ -764,7 +625,8 @@ def get_j_int3c2e_pass2(intopt, rhoj, stream=None):
         bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
         bins_locs_kl.ctypes.data_as(ctypes.c_void_p),
         ctypes.c_int(ncp_ij),
-        ctypes.c_int(ncp_kl))
+        ctypes.c_int(ncp_kl),
+        ctypes.cast(stream.ptr, ctypes.c_void_p))
 
     if err != 0:
         raise RuntimeError('CUDA error in get_j_pass2')
@@ -935,6 +797,8 @@ def _int3c2e_ip1_vjk_task(intopt, task_k_list, rhoj, rhok, dm0, orbo, device_id=
 
 def get_int3c2e_ip1_vjk(intopt, rhoj, rhok, dm0_tag, aoslices, with_j=True,
                         with_k=True, omega=None):
+    raise DeprecationWarning(
+        'get_int3c2e_ip1_vjk is deprecated. Use df.hessian.rhf._get_veff instead.')
     orbo = cupy.asarray(dm0_tag.occ_coeff, order='C')
     futures = []
 
@@ -1221,7 +1085,6 @@ def get_int3c2e_ip_slice(intopt, cp_aux_id, ip_type, out=None, omega=None, strea
     for cp_ij_id, log_q_ij in enumerate(intopt.log_qs):
         bins_locs_ij = np.array([0, len(log_q_ij)], dtype=np.int32)
         err = fn(
-            ctypes.cast(stream.ptr, ctypes.c_void_p),
             intopt.bpcache,
             ctypes.cast(int3c_blk.data.ptr, ctypes.c_void_p),
             ctypes.c_int(norb),
@@ -1232,7 +1095,8 @@ def get_int3c2e_ip_slice(intopt, cp_aux_id, ip_type, out=None, omega=None, strea
             ctypes.c_int(nbins),
             ctypes.c_int(cp_ij_id),
             ctypes.c_int(cp_kl_id),
-            ctypes.c_double(omega))
+            ctypes.c_double(omega),
+            ctypes.cast(stream.ptr, ctypes.c_void_p))
 
         if err != 0:
             raise RuntimeError(f'GINT_fill_int2e_ip failed, err={err}')
@@ -1288,7 +1152,6 @@ def get_int3c2e_ip(mol, auxmol=None, ip_type=1, auxbasis='weigend+etb', direct_s
 
             int3c_blk = cupy.zeros([3, nk, nj, ni], order='C', dtype=np.float64)
             err = fn(
-                ctypes.cast(stream.ptr, ctypes.c_void_p),
                 intopt.bpcache,
                 ctypes.cast(int3c_blk.data.ptr, ctypes.c_void_p),
                 ctypes.c_int(norb_cart),
@@ -1299,7 +1162,8 @@ def get_int3c2e_ip(mol, auxmol=None, ip_type=1, auxbasis='weigend+etb', direct_s
                 ctypes.c_int(nbins),
                 ctypes.c_int(cp_ij_id),
                 ctypes.c_int(cp_kl_id),
-                ctypes.c_double(omega))
+                ctypes.c_double(omega),
+                ctypes.cast(stream.ptr, ctypes.c_void_p))
 
             if err != 0:
                 raise RuntimeError("int3c2e_ip failed\n")
@@ -1377,7 +1241,6 @@ def get_int3c2e_general(mol, auxmol=None, ip_type='', auxbasis='weigend+etb', di
             if (li + lj + lk + order)//2 + 1 < NROOT_ON_GPU:
                 int3c_blk = cupy.zeros([comp, nk, nj, ni], order='C', dtype=np.float64)
                 err = fn(
-                    ctypes.cast(stream.ptr, ctypes.c_void_p),
                     intopt.bpcache,
                     ctypes.cast(int3c_blk.data.ptr, ctypes.c_void_p),
                     ctypes.c_int(norb_cart),
@@ -1388,7 +1251,8 @@ def get_int3c2e_general(mol, auxmol=None, ip_type='', auxbasis='weigend+etb', di
                     ctypes.c_int(nbins),
                     ctypes.c_int(cp_ij_id),
                     ctypes.c_int(cp_kl_id),
-                    ctypes.c_double(omega))
+                    ctypes.c_double(omega),
+                    ctypes.cast(stream.ptr, ctypes.c_void_p))
                 if err != 0:
                     raise RuntimeError("int3c2e failed\n")
             else:
@@ -1455,7 +1319,7 @@ def get_d2h1e(mol, dm0):
     aoslices = mol.aoslice_by_atom()
     ao2atom = get_ao2atom(intopt, aoslices)
     d2h1e = contract('aix,ib->abx', d2h1e_offdiag, ao2atom)
-    d2h1e[np.diag_indices(natm), :] += d2h1e_diag
+    d2h1e[cupy.diag_indices(natm), :] += d2h1e_diag
     return 2.0 * contract('abx,a->xab', d2h1e, charges)
 
 def get_int3c2e_slice(intopt, cp_ij_id, cp_aux_id, cart=False, aosym=None, out=None, omega=None, stream=None):
@@ -1506,7 +1370,6 @@ def get_int3c2e_slice(intopt, cp_ij_id, cp_aux_id, cart=False, aosym=None, out=N
         strides = np.array([s[2]//8 ,s[1]//8, s[0]//8, 1], dtype=np.int32)
 
     err = libgint.GINTfill_int3c2e(
-        ctypes.cast(stream.ptr, ctypes.c_void_p),
         intopt.bpcache,
         ctypes.cast(int3c_blk.data.ptr, ctypes.c_void_p),
         ctypes.c_int(norb_cart),
@@ -1517,7 +1380,8 @@ def get_int3c2e_slice(intopt, cp_ij_id, cp_aux_id, cart=False, aosym=None, out=N
         ctypes.c_int(nbins),
         ctypes.c_int(cp_ij_id),
         ctypes.c_int(cp_kl_id),
-        ctypes.c_double(omega))
+        ctypes.c_double(omega),
+        ctypes.cast(stream.ptr, ctypes.c_void_p))
 
     if err != 0:
         raise RuntimeError('GINT_fill_int2e failed')
@@ -1561,7 +1425,12 @@ def get_int3c2e(mol, auxmol=None, auxbasis='weigend+etb', direct_scf_tol=1e-13, 
             int3c_slice = cart2sph(int3c_slice, axis=2, ang=li)
         int3c[:, j0:j1, i0:i1] = int3c_slice
     if aosym:
-        row, col = np.tril_indices(nao)
+        # Symmetrize: fill lower triangle from the upper. Indices are built on
+        # device (cupy) to avoid an implicit host->device copy when indexing the
+        # GPU tensor, and kept int32 (nao << 2^31, no overflow) to halve their
+        # footprint. Note: the dominant cost here is the RHS gather int3c[:,col,row],
+        # not the index arrays.
+        row, col = (idx.astype(cupy.int32) for idx in cupy.tril_indices(nao))
         int3c[:, row, col] = int3c[:, col, row]
     int3c = intopt.unsort_orbitals(int3c, aux_axis=[0], axis=[1,2])
     return int3c.transpose([2,1,0])

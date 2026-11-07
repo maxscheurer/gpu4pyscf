@@ -21,6 +21,8 @@ from gpu4pyscf import tdscf, nac
 import gpu4pyscf
 import pytest
 from gpu4pyscf.lib.multi_gpu import num_devices
+from gpu4pyscf.df.tests.test_df_tdrhf_grad import diagonalize_tda
+
 
 atom = """
 O       0.0000000000     0.0000000000     0.0000000000
@@ -40,21 +42,6 @@ def tearDownModule():
     global mol
     mol.stdout.close()
     del mol
-
-
-def diagonalize_tda(a, nroots=5):
-    nocc, nvir = a.shape[:2]
-    nov = nocc * nvir
-    a = a.reshape(nov, nov)
-    e, xy = np.linalg.eig(np.asarray(a))
-    sorted_indices = np.argsort(e)
-
-    e_sorted = e[sorted_indices]
-    xy_sorted = xy[:, sorted_indices]
-
-    e_sorted_final = e_sorted[e_sorted > 1e-3]
-    xy_sorted = xy_sorted[:, e_sorted > 1e-3]
-    return e_sorted_final[:nroots], xy_sorted[:, :nroots]
 
 
 class KnownValues(unittest.TestCase):
@@ -307,6 +294,41 @@ class KnownValues(unittest.TestCase):
         fdiff_nac = nac.finite_diff.get_nacv_ee(nac1, (xI, xI*0.0), (xJ, xJ*0.0), nstateJ, delta=delta)
         assert np.linalg.norm(np.abs(ana_nac[1]) - np.abs(fdiff_nac)) < 5.0E-5
 
+    def test_get_nacv_ee(self):
+        mol = pyscf.M(
+            atom = '''
+            O   0.000   -0.    0.1174
+            H  -0.757    4.   -0.4696
+            H   0.757    4.   -0.4696
+            C   3.      1.    0.
+            ''',
+            basis='def2-tzvp',
+            unit='B',)
+        mf = mol.RHF().to_gpu()
+        nao = mol.nao
+        # Backend-independent input: np.random (MT19937) is identical on
+        # every host, unlike cp.random (cuRAND on CUDA, oneMKL on SYCL).
+        np.random.seed(1)
+        c = cp.asarray(np.random.rand(nao, nao)) - .5
+        s = mf.get_ovlp()
+        diag = cp.einsum('pi,pq,qi->i', c, s, c)
+        mf.mo_coeff = c / diag**.5
+        mf.mo_energy = cp.arange(nao)*3.
+        mf.mo_occ = cp.zeros(nao)
+        nocc = 5
+        nvir = nao - nocc
+        mf.mo_occ[:nocc] = 2
+        xyI, xyJ = cp.asarray(np.random.rand(2, 2, nocc, nvir)) - .5
+        xyI /= cp.linalg.norm(xyI)
+        td_nac = mf.TDHF().NAC()
+        td_nac.cphf_max_cycle = 1
+        td_nac.cphf_conv_tol = 1e-2
+        EI, EJ = 1.5, 3.3
+        dat = td_nac.get_nacv_ge(xyI, EI, singlet=True)
+        self.assertAlmostEqual(lib.fp(dat), -1.562561372977336, 12)
+
+        dat = td_nac.get_nacv_ee(xyI, xyJ, EI, EJ, singlet=True)
+        self.assertAlmostEqual(lib.fp(dat), 95.843655417449554, 11)
 
 if __name__ == "__main__":
     print("Full Tests for TD-RHF nonadiabatic coupling vectors between excited states.")

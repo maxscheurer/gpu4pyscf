@@ -19,12 +19,21 @@ from .import hf
 from . import uhf
 from . import khf
 from . import kuhf
+from . import ghf
+from . import kghf
 
 rhf = hf
 krhf = khf
 
 KRHF = krhf.KRHF
 KUHF = kuhf.KUHF
+KGHF = kghf.KGHF
+
+def GHF(cell, *args, **kwargs):
+    '''Generalized HF at one k-point, or KGHF when kpts is supplied.'''
+    if 'kpts' in kwargs:
+        return KGHF(cell, *args, **kwargs)
+    return ghf.GHF(cell, *args, **kwargs)
 
 def RHF(cell, *args, **kwargs):
     if 'kpts' in kwargs:
@@ -44,3 +53,10 @@ def HF(cell, *args, **kwargs):
         return RHF(cell, *args, **kwargs)
     else:
         return UHF(cell, *args, **kwargs)
+
+def KHF(cell, *args, **kwargs):
+    '''K-point HF, restricted for spin zero and unrestricted otherwise.'''
+    if cell.spin == 0:
+        return KRHF(cell, *args, **kwargs)
+    else:
+        return KUHF(cell, *args, **kwargs)

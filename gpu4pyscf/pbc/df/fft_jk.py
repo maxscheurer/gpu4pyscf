@@ -29,6 +29,7 @@ from pyscf.pbc.df.df_jk import _format_kpts_band
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import contract
 from gpu4pyscf.pbc import tools
+from gpu4pyscf.pbc.tools.k2gamma import kpts_to_kmesh
 
 def get_j_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None):
     '''Get the Coulomb (J) AO matrix at sampled k-points.
@@ -61,22 +62,16 @@ def get_j_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None):
     coulG = tools.get_coulG(cell, mesh=mesh)
     ngrids = len(coulG)
 
-    if hermi == 1 or is_zero(kpts):
-        vR = cp.zeros((nset,ngrids))
-        ao_ks = ni.eval_ao(cell, mydf.grids.coords, kpts)
+    deriv = 0
+    p0 = p1 = 0
+    rhoR = cp.zeros((nset,ngrids))
+    for ao_ks, weight, coords in ni.block_loop(cell, mydf.grids, deriv, kpts):
+        p0, p1 = p1, p1 + coords.shape[0]
         for i in range(nset):
-            rhoR = ni.eval_rho(cell, ao_ks, dms[i], hermi=hermi).real
-            rhoG = tools.fft(rhoR, mesh)
-            vG = coulG * rhoG
-            vR[i] = tools.ifft(vG, mesh).real
-    else:
-        vR = cp.zeros((nset,ngrids), dtype=np.complex128)
-        ao_ks = ni.eval_ao(cell, mydf.grids.coords, kpts)
-        for i in range(nset):
-            rhoR = ni.eval_rho(cell, ao_ks, dms[i], hermi=hermi)
-            rhoG = tools.fft(rhoR, mesh)
-            vG = coulG * rhoG
-            vR[i] = tools.ifft(vG, mesh)
+            rhoR[i,p0:p1] = ni.eval_rho(cell, ao_ks, dms[i], hermi=hermi).real
+    rhoG = tools.fft(rhoR, mesh)
+    vG = coulG * rhoG
+    vR = tools.ifft(vG, mesh).real
 
     vR *= cell.vol / ngrids
     kpts_band, input_band = _format_kpts_band(kpts_band, kpts), kpts_band
@@ -86,16 +81,19 @@ def get_j_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None):
     else:
         vj_kpts = cp.zeros((nset,nband,nao,nao), dtype=np.complex128)
 
-    if input_band is not None:
-        ao_ks = ni.eval_ao(cell, mydf.grids.coords, kpts_band)
-    for k, ao in enumerate(ao_ks):
-        for i in range(nset):
-            aow = ao * vR[i,:,None]
-            vj_kpts[i,k] += ao.conj().T.dot(aow)
+    if input_band is None:
+        kpts_band = kpts
+    p0 = p1 = 0
+    for ao_ks, weight, coords in ni.block_loop(cell, mydf.grids, deriv, kpts_band):
+        p0, p1 = p1, p1 + coords.shape[0]
+        for k, ao in enumerate(ao_ks):
+            for i in range(nset):
+                aow = ao * vR[i,p0:p1,None]
+                vj_kpts[i,k] += ao.conj().T.dot(aow)
 
     return _format_jks(vj_kpts, dm_kpts, input_band, kpts)
 
-def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None,
+def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=None, kpts_band=None,
                exxdiv=None):
     '''Get the Coulomb (J) and exchange (K) AO matrices at sampled k-points.
 
@@ -133,7 +131,11 @@ def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None,
         mo_coeff = None
 
     ni = mydf._numint
-    kpts = np.asarray(kpts)
+    if kpts is None:
+        kpts = np.zeros((1, 3))
+    else:
+        kpts = np.asarray(kpts).reshape(-1, 3)
+
     dm_kpts = cp.asarray(dm_kpts, order='C')
     dms = _format_dms(dm_kpts, kpts)
     nset, nkpts, nao = dms.shape[:3]
@@ -177,7 +179,7 @@ def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None,
         for k1, ao1 in enumerate(ao1_kpts):
             ao1T = ao1.T
             kpt1 = kpts_band[k1]
-            coulG = tools.get_coulG(cell, kpt2-kpt1, exxdiv, mesh, kpts=kpts)
+            coulG = tools.get_coulG(cell, kpt2-kpt1, exxdiv, mesh=mesh, kpts=kpts)
             if is_zero(kpt1-kpt2):
                 expmikr = cp.array(1.)
             else:
@@ -304,7 +306,9 @@ def get_k(mydf, dm, hermi=1, kpt=np.zeros(3), kpts_band=None, exxdiv=None):
     return vk
 
 def get_j_e1_kpts(mydf, dm_kpts, kpts=None):
-    '''Derivatives of Coulomb (J) AO matrix at sampled k-points.
+    '''Atom-resolved Coulomb-energy derivatives for each input density matrix.
+
+    Return (natm, 3) for one density matrix or (nset, natm, 3) for a batch.
     '''
     cell = mydf.cell
     mesh = mydf.mesh
@@ -312,9 +316,9 @@ def get_j_e1_kpts(mydf, dm_kpts, kpts=None):
     assert cell.dimension > 1
 
     if kpts is None:
-        kpts = np.zeros((1, 3))
-    else:
-        kpts = kpts.reshape(-1, 3)
+        # FFTDF exposes this function directly, so honor its configured k-points.
+        kpts = mydf.kpts
+    kpts = kpts.reshape(-1, 3)
     is_gamma_point = is_zero(kpts)
     ni = mydf._numint
     dm_kpts = cp.asarray(dm_kpts, order='C')
@@ -354,20 +358,18 @@ def get_j_e1_kpts(mydf, dm_kpts, kpts=None):
     ej = ej.get()
     ej = np.array([ej[:,:,p0:p1].sum(axis=2) for p0, p1 in aoslices[:,2:]])
     ej = ej.transpose(1,0,2)
-    if not is_gamma_point:
-        ej /= nkpts
+    ej *= 2/nkpts
     if nset == 1:
         ej = ej[0]
     return ej
 
-def get_k_e1_kpts(mydf, dm_kpts, kpts=np.zeros((1,3)), exxdiv=None):
+def get_k_e1_kpts(mydf, dm_kpts, kpts=None, exxdiv=None):
     raise NotImplementedError
 
 def _ewald_exxdiv_for_G0(cell, kpts, dms, vk, kpts_band=None):
-    from pyscf.pbc.tools.pbc import madelung
     from gpu4pyscf.pbc.gto.int1e import int1e_ovlp
     s = int1e_ovlp(cell, kpts=kpts)
-    m = madelung(cell, kpts)
+    m = tools.madelung(cell, kpts)
     if kpts is None:
         for i,dm in enumerate(dms):
             vk[i] += m * s.dot(dm).dot(s)
@@ -401,29 +403,36 @@ def _format_jks(v_kpts, dm_kpts, kpts_band, kpts):
     if kpts_band is kpts or kpts_band is None:
         return v_kpts.reshape(dm_kpts.shape)
     else:
-        assert v_kpts.ndim == 4 # (Ndm,Nk,Nao,Nao)
-        # dm_kpts.shape     kpts.shape     nset
-        # (Nao,Nao)         (1 ,3)         None
-        # (Ndm,Nao,Nao)     (1 ,3)         Ndm
-        # (Nk,Nao,Nao)      (Nk,3)         None
-        # (Ndm,Nk,Nao,Nao)  (Nk,3)         Ndm
-        if kpts_band.ndim == 1:
-            assert dm_kpts.ndim <= 3
-            v_kpts = v_kpts[:,0]
-            if dm_kpts.ndim < 3: # RHF dm
-                v_kpts = v_kpts[0]
+        nkpts_band = len(kpts_band)
+        nao = dm_kpts.shape[-1]
+        if dm_kpts.ndim == v_kpts.ndim:
+            assert v_kpts.shape[-3:] == (nkpts_band, nao, nao)
+            return v_kpts
+
+        is_single_kpt = kpts is not None and kpts.ndim == 1
+        if is_single_kpt:
+            is_rhf = dm_kpts.ndim == 2
         else:
-            if kpts is None or kpts.ndim == 1 or (kpts.ndim == 2 and kpts.shape[0] == 1):
-                nkpts = 1
-                if dm_kpts.ndim == 2:
-                    dm_kpts = dm_kpts[None,:,:]
-            else:
-                nkpts = len(kpts)
-            assert kpts.ndim == 2
             assert dm_kpts.ndim >= 3
-            if dm_kpts.ndim == 3: # KRHF dms
-                assert len(dm_kpts) == nkpts
-                v_kpts = v_kpts[0]
-            else:  # KUHF dms
-                assert v_kpts.shape[1] == len(kpts_band)
+            is_rhf = dm_kpts.ndim == 3
+        if is_rhf:
+            v_kpts = v_kpts.reshape(nkpts_band, nao, nao)
+        else:  # KUHF dms
+            v_kpts = v_kpts.reshape(2, nkpts_band, nao, nao)
         return v_kpts
+
+def _factorize_dm(dm_kpts, kpts=None):
+    from gpu4pyscf.df.df_jk import factorize_dm
+    if kpts is None or kpts.ndim == 1:
+        nkpts = 1
+    else:
+        nkpts = len(kpts)
+    orbl, orbr = factorize_dm(dm_kpts)
+    if orbl.size == 0:
+        nset = dm_kpts.size // (nkpts * dm_kpts.shape[-1]**2)
+        orbl = cp.asarray(orbl.reshape((nset, nkpts) + orbl.shape[-2:]))
+    else:
+        orbl = cp.asarray(orbl.reshape((-1, nkpts) + orbl.shape[-2:]))
+    if orbr is not None:
+        orbr = cp.asarray(orbr.reshape(orbl.shape))
+    return orbl, orbr

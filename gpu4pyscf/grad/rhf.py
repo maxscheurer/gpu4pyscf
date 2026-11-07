@@ -1,4 +1,4 @@
-# Copyright 2021-2024 The PySCF Developers. All Rights Reserved.
+# Copyright 2021-2026 The PySCF Developers. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,26 +18,23 @@ import math
 import numpy as np
 import cupy as cp
 import cupy
-import numpy
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from pyscf import lib, gto
 from pyscf.grad import rhf as rhf_grad_cpu
-from pyscf.grad.dispersion import get_dispersion
+from gpu4pyscf.grad.dispersion import get_dispersion
 from gpu4pyscf.gto.ecp import get_ecp_ip
 from gpu4pyscf.lib import utils
-from gpu4pyscf.scf.hf import KohnShamDFT
 from gpu4pyscf.lib.cupy_helper import (
-    tag_array, contract, condense, reduce_to_device, transpose_sum, ensure_numpy)
+    tag_array, contract, condense, transpose_sum, get_avail_mem, ndarray)
 from gpu4pyscf.__config__ import props as gpu_specs
-from gpu4pyscf.df import int3c2e      #TODO: move int3c2e to out of df
+from gpu4pyscf.df import int3c2e_bdiv
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib import multi_gpu
-from gpu4pyscf.scf import jk
 from gpu4pyscf.scf.jk import (
     LMAX, QUEUE_DEPTH, SHM_SIZE, THREADS, libvhf_rys, _VHFOpt,
-    _make_tril_pair_mappings, _nearest_power2)
-from gpu4pyscf.gto.mole import groupby
+    _nearest_power2, _TimingCollector, _check_rsh_factors)
+from gpu4pyscf.gto.mole import groupby, extract_pgto_params, SortedMole
+from gpu4pyscf.df.int3c2e_bdiv import (
+    Int3c2eOpt, _int3c2e_ip1_evaluator, int3c2e_scheme, int3c2e_scheme_ip1)
 
 __all__ = [
     'SCF_GradScanner',
@@ -57,26 +54,22 @@ libvhf_rys.RYS_per_atom_jk_ip1.restype = ctypes.c_int
 #     nf = (li+1)*(li+2) * (lj+1)*(lj+2) * (lk+1)*(lk+2) * (ll+1)*(ll+2) // 16
 #     g_size = (li+2)*(lj+1)*(lk+2)*(ll+1)
 #     dd_cache_size = nf * min(THREADS, _nearest_power2(SHM_SIZE//(g_size*3*8)))
-DD_CACHE_MAX = 101250 * (SHM_SIZE//48000)
+DD_CACHE_MAX = 101250 * (SHM_SIZE//(45*1024))
 
-libvhf_rys.RYS_build_vjk_ip1_init(ctypes.c_int(SHM_SIZE))
-
-def _jk_energy_per_atom(mol, dm, vhfopt=None,
-                        j_factor=1., k_factor=1., verbose=None):
+def _jk_energy_per_atom(vhfopt, dm, j_factor=1., k_factor=1.,
+                        omega=None, lr_factor=None, sr_factor=None,
+                        verbose=None):
     '''
     Computes the first-order derivatives of the energy per atom for
     j_factor * J_derivatives - k_factor * K_derivatives
     '''
-    log = logger.new_logger(mol, verbose)
+    assert lr_factor is None and sr_factor is None
+    log = logger.new_logger(vhfopt.mol, verbose)
     cput0 = log.init_timer()
-    if vhfopt is None:
-        vhfopt = _VHFOpt(mol, tile=1).build()
-    assert vhfopt.tile == 1
-
     mol = vhfopt.sorted_mol
-    nao_orig = vhfopt.mol.nao
 
     dm = cp.asarray(dm, order='C')
+    nao_orig = dm.shape[-1]
     dms = dm.reshape(-1,nao_orig,nao_orig)
 
     #:dms = cp.einsum('pi,nij,qj->npq', vhfopt.coeff, dms, vhfopt.coeff)
@@ -84,106 +77,105 @@ def _jk_energy_per_atom(mol, dm, vhfopt=None,
     n_dm, nao = dms.shape[:2]
     assert n_dm <= 2
 
+    omega, lr_factor, sr_factor = _check_rsh_factors(mol, omega, lr_factor, sr_factor)
+
     ao_loc = mol.ao_loc
-    uniq_l_ctr = vhfopt.uniq_l_ctr
+    uniq_l_ctr = mol.uniq_l_ctr
     uniq_l = uniq_l_ctr[:,0]
-    l_ctr_bas_loc = vhfopt.l_ctr_offsets
+    l_ctr_bas_loc = np.append(0, np.cumsum(mol.l_ctr_counts))
     l_symb = [lib.param.ANGULAR[i] for i in uniq_l]
     assert uniq_l.max() <= LMAX
 
+    log_cutoff = math.log(vhfopt.direct_scf_tol)
+    dm_penalty = 0
+    diffuse_exps, diffuse_ctr_coef = extract_pgto_params(mol, 'diffuse')
+
     n_groups = len(uniq_l_ctr)
-    tasks = ((i, j, k, l)
+    tasks = [(i, j, k, l)
              for i in range(n_groups)
              for j in range(i+1)
              for k in range(i+1)
-             for l in range(k+1))
+             for l in range(k+1)]
+    schemes = {t: _ejk_quartets_scheme(mol, uniq_l_ctr[list(t)]) for t in tasks}
+    tasks = iter(tasks)
 
     def proc():
         device_id = cp.cuda.device.get_device_id()
         log = logger.new_logger(mol, verbose)
         cput0 = log.init_timer()
 
-        timing_counter = Counter()
+        timing_collection = _TimingCollector(log.timer_debug1)
         kern_counts = 0
         kern = libvhf_rys.RYS_per_atom_jk_ip1
 
         _dms = cp.asarray(dms, order='C')
-        s_ptr = lib.c_null_ptr()
-        if mol.omega < 0:
-            s_ptr = ctypes.cast(vhfopt.s_estimator.data.ptr, ctypes.c_void_p)
-
         ejk = cp.zeros((mol.natm, 3))
 
         dm_cond = cp.log(condense('absmax', _dms, ao_loc) + 1e-300).astype(np.float32)
-        q_cond = cp.asarray(vhfopt.q_cond)
-        log_max_dm = float(dm_cond.max())
-        log_cutoff = math.log(vhfopt.direct_scf_tol)
-        pair_mappings = _make_tril_pair_mappings(
-            l_ctr_bas_loc, q_cond, log_cutoff-log_max_dm, tile=6)
+        _diffuse_exps = cp.asarray(diffuse_exps, dtype=np.float32)
+        bas_pair_cache = {k: [cp.asarray(x) for x in v]
+                          for k, v in vhfopt.bas_pair_cache.items()}
+
         rys_envs = vhfopt.rys_envs
         workers = gpu_specs['multiProcessorCount']
-        # An additional integer to count for the proccessed pair_ijs 
+        # An additional integer to count for the proccessed pair_ijs
         pool = cp.empty(workers*QUEUE_DEPTH+1, dtype=np.int32)
         dd_pool = cp.empty((workers, DD_CACHE_MAX), dtype=np.float64)
         t1 = log.timer_debug1(f'q_cond and dm_cond on Device {device_id}', *cput0)
 
-        for i, j, k, l in tasks:
+        for task in tasks:
+            i, j, k, l = task
             shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1, k, k+1, l, l+1]]
-            llll = f'({l_symb[i]}{l_symb[j]}|{l_symb[k]}{l_symb[l]})'
-            pair_ij_mapping = pair_mappings[i,j]
-            pair_kl_mapping = pair_mappings[k,l]
+            pair_ij_mapping, q_cond_ij, s_cond_ij = bas_pair_cache[i,j]
+            pair_kl_mapping, q_cond_kl, s_cond_kl = bas_pair_cache[k,l]
             npairs_ij = pair_ij_mapping.size
             npairs_kl = pair_kl_mapping.size
             if npairs_ij == 0 or npairs_kl == 0:
                 continue
-            scheme = _ejk_quartets_scheme(mol, uniq_l_ctr[[i, j, k, l]])
-            for pair_kl0, pair_kl1 in lib.prange(0, npairs_kl, QUEUE_DEPTH):
-                _pair_kl_mapping = pair_kl_mapping[pair_kl0:]
-                _npairs_kl = pair_kl1 - pair_kl0
-                err = kern(
-                    ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
-                    ctypes.c_double(j_factor), ctypes.c_double(k_factor),
-                    ctypes.cast(_dms.data.ptr, ctypes.c_void_p),
-                    ctypes.c_int(n_dm), ctypes.c_int(nao),
-                    rys_envs, (ctypes.c_int*2)(*scheme),
-                    (ctypes.c_int*8)(*shls_slice),
-                    ctypes.c_int(npairs_ij), ctypes.c_int(_npairs_kl),
-                    ctypes.cast(pair_ij_mapping.data.ptr, ctypes.c_void_p),
-                    ctypes.cast(_pair_kl_mapping.data.ptr, ctypes.c_void_p),
-                    ctypes.cast(q_cond.data.ptr, ctypes.c_void_p),
-                    s_ptr,
-                    ctypes.cast(dm_cond.data.ptr, ctypes.c_void_p),
-                    ctypes.c_float(log_cutoff),
-                    ctypes.cast(pool.data.ptr, ctypes.c_void_p),
-                    ctypes.cast(dd_pool.data.ptr, ctypes.c_void_p),
-                    mol._atm.ctypes, ctypes.c_int(mol.natm),
-                    mol._bas.ctypes, ctypes.c_int(mol.nbas), mol._env.ctypes)
-                if err != 0:
-                    raise RuntimeError(f'RYS_per_atom_jk_ip1 kernel for {llll} failed')
+            llll = f'({l_symb[i]}{l_symb[j]}|{l_symb[k]}{l_symb[l]})'
+            scheme = schemes[task]
+            err = kern(
+                ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
+                ctypes.c_double(j_factor), ctypes.c_double(k_factor),
+                ctypes.cast(_dms.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(n_dm), ctypes.c_int(nao),
+                ctypes.c_double(omega),
+                ctypes.c_double(lr_factor),
+                ctypes.c_double(sr_factor),
+                rys_envs, (ctypes.c_int*2)(*scheme),
+                (ctypes.c_int*8)(*shls_slice),
+                ctypes.c_int(npairs_ij), ctypes.c_int(npairs_kl),
+                ctypes.cast(pair_ij_mapping.data.ptr, ctypes.c_void_p),
+                ctypes.cast(pair_kl_mapping.data.ptr, ctypes.c_void_p),
+                ctypes.cast(q_cond_ij.data.ptr, ctypes.c_void_p),
+                ctypes.cast(q_cond_kl.data.ptr, ctypes.c_void_p),
+                ctypes.cast(s_cond_ij.data.ptr, ctypes.c_void_p),
+                ctypes.cast(s_cond_kl.data.ptr, ctypes.c_void_p),
+                ctypes.cast(_diffuse_exps.data.ptr, ctypes.c_void_p),
+                ctypes.cast(dm_cond.data.ptr, ctypes.c_void_p),
+                ctypes.c_float(log_cutoff),
+                ctypes.c_float(dm_penalty),
+                ctypes.cast(pool.data.ptr, ctypes.c_void_p),
+                ctypes.cast(dd_pool.data.ptr, ctypes.c_void_p),
+                mol._atm.ctypes, ctypes.c_int(mol.natm),
+                mol._bas.ctypes, ctypes.c_int(mol.nbas), mol._env.ctypes,
+                ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
+            if err != 0:
+                raise RuntimeError(f'RYS_per_atom_jk_ip1 kernel for {llll} failed')
+            kern_counts += 1
             if log.verbose >= logger.DEBUG1:
                 ntasks = npairs_ij * npairs_kl
                 msg = f'processing {llll} on Device {device_id} tasks ~= {ntasks}'
-                t1, t1p = log.timer_debug1(msg, *t1), t1
-                timing_counter[llll] += t1[1] - t1p[1]
-                kern_counts += 1
-        return ejk, kern_counts, timing_counter
+                t1 = timing_collection.collect(llll, t1, msg)
+        return ejk, kern_counts, timing_collection
 
     results = multi_gpu.run(proc, non_blocking=True)
-
-    kern_counts = 0
-    timing_collection = Counter()
-    ejk_dist = []
-    for ejk, counts, counter in results:
-        kern_counts += counts
-        timing_collection += counter
-        ejk_dist.append(ejk)
+    ejk = multi_gpu.array_reduce([x[0] for x in results], inplace=True)
 
     if log.verbose >= logger.DEBUG1:
-        log.debug1('kernel launches %d', kern_counts)
-        for llll, t in timing_collection.items():
-            log.debug1('%s wall time %.2f', llll, t)
+        log.debug1('kernel launches %d', sum(x[1] for x in results))
+        _TimingCollector.summary(log.debug1, (x[2] for x in results))
 
-    ejk = reduce_to_device(ejk_dist, inplace=True)
     log.timer_debug1('grad jk energy', *cput0)
     return ejk.get()
 
@@ -219,15 +211,103 @@ def get_hcore(mf, mol, exclude_ecp=False):
     '''
     Nuclear gradients of core Hamiltonian
     '''
-    h = mol.intor('int1e_ipkin', comp=3)
+    from gpu4pyscf.pbc.gto.int1e import int1e_ipkin
     if mol._pseudo:
         NotImplementedError('Nuclear gradients for GTH PP')
-    else:
-        h += mol.intor('int1e_ipnuc', comp=3)
-    h = cupy.asarray(h)
+
+    if getattr(mf, 'with_x2c', None):
+        raise NotImplementedError('X2C gradients')
+
+    sorted_mol = SortedMole.from_mol(mol, decontract=True)
+    h = int1e_ipkin(sorted_mol)
+    h += int1e_ipnuc(sorted_mol)
     if not exclude_ecp and len(mol._ecpbas) > 0:
         h += get_ecp_ip(mol).sum(axis=0)
     return -h
+
+def int1e_ipnuc(mol):
+    '''
+    cp.array(mol.intor('int1e_ipnuc'))
+    '''
+    coords = mol.atom_coords()
+    charges = cp.asarray(mol.atom_charges(), dtype=np.float64)
+    fakemol = gto.fakemol_for_charges(coords)
+
+    sorted_mol = SortedMole.from_mol(mol, decontract=True)
+    opt = Int3c2eOpt(sorted_mol, fakemol).build(tril=False)
+    batch_size = 32
+    omega = 0.
+    eval_ip1, _, aux_offsets = _int3c2e_ip1_evaluator(
+        opt, int3c2e_scheme_ip1(omega, 27), batch_size, 'fill_int3c2e_ip1', omega)
+    ipnuc = 0
+    for batch_id, (p0, p1) in enumerate(zip(aux_offsets[:-1], aux_offsets[1:])):
+        ipnuc += cp.einsum('xpk,k->xp', eval_ip1(batch_id), -charges[p0:p1])
+
+    pair_addresses = opt.pair_and_diag_indices(cart=True, original_ao_order=False)[0]
+    nao = sorted_mol.nao
+    out = cp.zeros([3, nao*nao])
+    out[:,pair_addresses] = ipnuc
+    out = sorted_mol.apply_CT_mat_C(out.reshape(3, nao, nao))
+    return out
+
+def _grad_nuc_without_ecp(mol, dm0):
+    from gpu4pyscf.pbc.gto.int1e import int1e_ipkin
+    coords = mol.atom_coords()
+    charges = cp.asarray(-mol.atom_charges(), dtype=np.float64)
+    fakemol = gto.fakemol_for_charges(coords)
+
+    sorted_mol = SortedMole.from_mol(mol, decontract=True)
+    int3c2e_opt = Int3c2eOpt(sorted_mol, fakemol).build()
+    dm = sorted_mol.apply_C_mat_CT(dm0)
+
+    nsp_per_block, gout_stride, shm_size = int3c2e_scheme(
+        short_range=False, gout_width=54, deriv=(1,0,0))
+    lmax = sorted_mol.uniq_l_ctr[:,0].max()
+    shm_size_max = shm_size[0,:lmax+1,:lmax+1].max()
+    bas_ij_idx, shl_pair_offsets = sorted_mol.aggregate_shl_pairs(
+        int3c2e_opt.bas_ij_cache, nsp_per_block[0]*16)
+    auxmol = int3c2e_opt.auxmol
+    ksh_offsets_cpu = np.append(0, np.cumsum(auxmol.l_ctr_counts))
+    ksh_offsets_gpu = cp.asarray(ksh_offsets_cpu+sorted_mol.nbas, dtype=np.int32)
+
+    omega, lr_factor, sr_factor = 0., 1., 1.
+
+    int3c2e_envs = int3c2e_opt.int3c2e_envs
+    kern = libvhf_rys.sum_ejk_int3c2e_ip1
+    de = cp.zeros((mol.natm, 3))
+    # de_aux * 2 is identical to the results of int3c2e.get_dh1e
+    de_aux = cp.zeros((mol.natm, 3))
+    err = kern(
+        ctypes.cast(de.data.ptr, ctypes.c_void_p),
+        ctypes.cast(de_aux.data.ptr, ctypes.c_void_p),
+        ctypes.cast(dm.data.ptr, ctypes.c_void_p),
+        ctypes.cast(charges.data.ptr, ctypes.c_void_p),
+        ctypes.c_int(1),
+        ctypes.c_double(omega),
+        ctypes.c_double(lr_factor),
+        ctypes.c_double(sr_factor),
+        ctypes.byref(int3c2e_envs),
+        ctypes.c_int(shm_size_max),
+        ctypes.c_int(len(shl_pair_offsets) - 1),
+        ctypes.c_int(len(ksh_offsets_gpu) - 1),
+        ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
+        ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
+        ctypes.cast(ksh_offsets_gpu.data.ptr, ctypes.c_void_p),
+        ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
+        lib.c_null_ptr(),
+        ctypes.c_int(0),
+        ctypes.c_int(0), ctypes.c_int(0),
+        ctypes.c_int(mol.natm), ctypes.c_int(mol.natm),
+        ctypes.c_void_p(cp.cuda.get_current_stream().ptr))
+    if err != 0:
+        raise RuntimeError('int3c2e_ejk_ip1 failed')
+    de += de_aux
+    de *= 2
+    de = de.get()
+
+    t = int1e_ipkin(sorted_mol)
+    de -= contract_h1e_dm(mol, t, dm0, hermi=1)
+    return de
 
 def grad_elec(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
     '''
@@ -237,8 +317,6 @@ def grad_elec(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
     '''
     mf = mf_grad.base
     mol = mf_grad.mol
-    if atmlst is None:
-        atmlst = range(mol.natm)
 
     if mo_energy is None: mo_energy = mf.mo_energy
     if mo_occ is None:    mo_occ = mf.mo_occ
@@ -252,46 +330,40 @@ def grad_elec(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
     dm0 = mf.make_rdm1(mo_coeff, mo_occ)
     dme0 = mf_grad.make_rdm1e(mo_energy, mo_coeff, mo_occ)
 
-    # (\nabla i | hcore | j) - (\nabla i | j)
-    h1 = cupy.asarray(mf_grad.get_hcore(mol, exclude_ecp=True))
-    s1 = cupy.asarray(mf_grad.get_ovlp(mol))
+    e1_grad = mf_grad._hcore_energy(dm0, dme0)
+    t3 = log.timer_debug1('gradients of h1e', *t3)
 
-    # (i | \nabla hcore | j)
-    dh1e = int3c2e.get_dh1e(mol, dm0)
+    log.debug('Computing Gradients of NR-HF Coulomb repulsion')
+    e2_grad = mf_grad.energy_ee(mol, dm0)
+    log.timer_debug1('gradients of 2e part', *t3)
 
-    # Calculate ECP contributions in (i | \nabla hcore | j) and 
-    # (\nabla i | hcore | j) simultaneously
-    if len(mol._ecpbas) > 0:
-        # TODO: slice ecp_atoms
-        ecp_atoms = sorted(set(mol._ecpbas[:,gto.ATOM_OF]))
-        h1_ecp = get_ecp_ip(mol, ecp_atoms=ecp_atoms)
-        h1 -= h1_ecp.sum(axis=0)
+    de = e1_grad + e2_grad
+    de += cupy.asnumpy(mf_grad.extra_force())
+    log.timer_debug1('gradients of electronic part', *t0)
+    if atmlst is not None:
+        de = de[list(atmlst)]
+    return de
 
-        dh1e[ecp_atoms] += 2.0 * contract('nxij,ij->nx', h1_ecp, dm0)
-
+def _hcore_energy(mf_grad, dm0, dme0):
+    mol = mf_grad.mol
     if mol._pseudo:
         raise NotImplementedError("Pseudopotential gradient not supported for molecular system yet")
 
-    t3 = log.timer_debug1('gradients of h1e', *t3)
+    # dh = (\nabla i | hcore | j) + (i | \nabla Vnuc | j)
+    dh = _grad_nuc_without_ecp(mol, dm0)
 
-    dvhf = mf_grad.get_veff(mol, dm0)
-    log.timer_debug1('gradients of veff', *t3)
-    log.debug('Computing Gradients of NR-HF Coulomb repulsion')
+    # Calculate ECP contributions in (i | \nabla hcore | j) and
+    # (\nabla i | hcore | j) simultaneously
+    if len(mol._ecpbas) > 0:
+        # TODO: slice ecp_atoms
+        ecp_atoms = np.unique(mol._ecpbas[:,gto.ATOM_OF])
+        h1_ecp = get_ecp_ip(mol, ecp_atoms=ecp_atoms)
+        dh -= contract_h1e_dm(mol, h1_ecp.sum(axis=0), dm0, hermi=1)
+        dh[ecp_atoms] += 2.0 * contract('nxij,ij->nx', h1_ecp, dm0).get()
 
-    dm0 = tag_array(dm0, mo_coeff=mo_coeff, mo_occ=mo_occ)
-    extra_force = np.zeros((len(atmlst),3))
-    for k, ia in enumerate(atmlst):
-        extra_force[k] += ensure_numpy(mf_grad.extra_force(ia, locals()))
-
-    log.timer_debug1('gradients of 2e part', *t3)
-
-    dh = contract_h1e_dm(mol, h1, dm0, hermi=1)
-    ds = contract_h1e_dm(mol, s1, dme0, hermi=1)
-    de = dh - ds + 2 * dvhf
-    de += ensure_numpy(dh1e)
-    de += extra_force
-    log.timer_debug1('gradients of electronic part', *t0)
-    return de
+    s1 = cupy.asarray(mf_grad.get_ovlp(mol))
+    dh -= contract_h1e_dm(mol, s1, dme0, hermi=1)
+    return dh
 
 def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
     '''
@@ -300,28 +372,42 @@ def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
     mf = mf_grad.base
     mol = mf.mol
     natm = mol.natm
-    nao = mol.nao
     if mo_coeff is None: mo_coeff = cupy.asarray(mf.mo_coeff)
     if mo_occ is None: mo_occ = mf.mo_occ
 
+    if getattr(mf, 'with_x2c', None):
+        raise NotImplementedError('X2C gradients')
+
     orbo = mo_coeff[:,mo_occ>0]
+    nmo = mo_coeff.shape[1]
     nocc = orbo.shape[1]
+    dh1e = cupy.empty([natm,3,nmo,nocc])
 
     # derivative w.r.t nuclie position
-    dh1e = cupy.zeros([natm,3,nao,nocc])
     coords = mol.atom_coords()
     charges = cupy.asarray(mol.atom_charges(), dtype=np.float64)
     fakemol = gto.fakemol_for_charges(coords)
-    intopt = int3c2e.VHFOpt(mol, fakemol, 'int2e')
-    intopt.build(1e-14, diag_block_with_triu=True, aosym=False,
-                 group_size=int3c2e.BLKSIZE, group_size_aux=int3c2e.BLKSIZE)
-    orbo_sorted = intopt.sort_orbitals(orbo, axis=[0])
-    mo_coeff_sorted = intopt.sort_orbitals(mo_coeff, axis=[0])
-    for i0,i1,j0,j1,k0,k1,int3c_blk in int3c2e.loop_int3c2e_general(intopt, ip_type='ip1'):
-        dh1e[k0:k1,:,j0:j1,:] += contract('xkji,io->kxjo', int3c_blk, orbo_sorted[i0:i1])
-        dh1e[k0:k1,:,i0:i1,:] += contract('xkji,jo->kxio', int3c_blk, orbo_sorted[j0:j1])
-    dh1e = contract('kxjo,k->kxjo', dh1e, -charges)
-    dh1e = contract('kxjo,jp->kxpo', dh1e, mo_coeff_sorted)
+    sorted_mol = SortedMole.from_mol(mol, decontract=True)
+    mo_sorted = sorted_mol.apply_C_dot(mo_coeff, axis=0)
+    orbo_sorted = mo_sorted[:,mo_occ>0]
+
+    opt = Int3c2eOpt(sorted_mol, fakemol).build(tril=False)
+    batch_size = min(32, natm)
+    omega = 0.
+    eval_ip1, _, aux_offsets = _int3c2e_ip1_evaluator(
+        opt, int3c2e_scheme_ip1(omega, 27), batch_size, 'fill_int3c2e_ip1', omega)
+    pair_addresses = opt.pair_and_diag_indices(cart=True, original_ao_order=False)[0]
+    nao1 = sorted_mol.nao
+    work = cp.zeros([batch_size,3,nao1*nao1])
+    for batch_id, (p0, p1) in enumerate(zip(aux_offsets[:-1], aux_offsets[1:])):
+        tmp = eval_ip1(batch_id)
+        tmp *= -charges[p0:p1]
+        h1 = work[:p1-p0]
+        h1[:,:,pair_addresses] = tmp.transpose(2,0,1)
+        h1 = transpose_sum(h1.reshape((p1-p0)*3, nao1, nao1))
+        tmp = contract('kxpq,qj->kxpj', h1.reshape(p1-p0,3,nao1,nao1), orbo_sorted)
+        contract('kxpj,pi->kxij', tmp, mo_sorted, out=dh1e[p0:p1])
+    work = h1 = tmp = None
 
     # derivative w.r.t. atomic orbitals
     h1 = cupy.asarray(mf_grad.get_hcore(mol))
@@ -336,7 +422,7 @@ def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
 
     # Contributions due to ECP
     if len(mol._ecpbas) > 0:
-        ecp_atoms = sorted(set(mol._ecpbas[:,gto.ATOM_OF]))
+        ecp_atoms = np.unique(mol._ecpbas[:,gto.ATOM_OF])
         h1_ecp = get_ecp_ip(mol, ecp_atoms=ecp_atoms)
         h1_ecp = h1_ecp + h1_ecp.transpose([0,1,3,2])
         h1mo = contract('nxij,jo->nxio', h1_ecp, orbo)
@@ -413,39 +499,74 @@ class GradientsBase(lib.StreamObject):
     dump_flags  = rhf_grad_cpu.GradientsBase.dump_flags
 
     reset       = rhf_grad_cpu.GradientsBase.reset
-    get_hcore   = get_hcore
-    get_ovlp    = rhf_grad_cpu.GradientsBase.get_ovlp
     get_jk      = NotImplemented
     get_j       = NotImplemented
     get_k       = NotImplemented
     get_veff    = NotImplemented
-    make_rdm1e  = rhf_grad_cpu.GradientsBase.make_rdm1e
+    make_rdm1e  = NotImplemented
     grad_nuc    = rhf_grad_cpu.GradientsBase.grad_nuc
     grad_elec   = NotImplemented
     optimizer   = rhf_grad_cpu.GradientsBase.optimizer
-    extra_force = rhf_grad_cpu.GradientsBase.extra_force
-    kernel      = rhf_grad_cpu.GradientsBase.kernel
     grad        = rhf_grad_cpu.GradientsBase.grad
     _finalize   = rhf_grad_cpu.GradientsBase._finalize
     _write      = rhf_grad_cpu.GradientsBase._write
     as_scanner  = as_scanner
-    _tag_rdm1   = rhf_grad_cpu.GradientsBase._tag_rdm1
 
+    get_hcore   = get_hcore
     get_dispersion = get_dispersion
+    _hcore_energy = _hcore_energy
 
-    @property
-    def grad_disp(self):
-        logger.warn(self, 'Attributes grad_disp and grad_mf are deprecated. '
-                    'They will be removed in the future')
-        g_disp = 0
-        mf = self.base
-        if hasattr(mf, 'disp') and mf.disp is not None:
-            g_disp = self.get_dispersion()
-        return g_disp
+    def get_ovlp(self, mol):
+        from gpu4pyscf.pbc.gto.int1e import int1e_ipovlp
+        return -int1e_ipovlp(mol)
 
-    @property
-    def grad_mf(self):
-        return self.de - self.grad_disp
+    def kernel(self, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
+        log = logger.new_logger(self)
+        t0 = log.init_timer()
+        if mo_energy is None:
+            if self.base.mo_energy is None:
+                self.base.run()
+            mo_energy = self.base.mo_energy
+        if mo_coeff is None: mo_coeff = self.base.mo_coeff
+        if mo_occ is None: mo_occ = self.base.mo_occ
+        if atmlst is None:
+            atmlst = self.atmlst
+        else:
+            self.atmlst = atmlst
+
+        if self.verbose >= logger.WARN:
+            self.check_sanity()
+        if self.verbose >= logger.INFO:
+            self.dump_flags()
+
+        de = self.grad_elec(mo_energy, mo_coeff, mo_occ)
+        self.de = de + self.grad_nuc()
+        if self.mol.symmetry:
+            self.de = self.symmetrize(self.de)
+        if self.base.do_disp():
+            self.de += self.get_dispersion()
+        # Keep all contributions on the full molecule, then select rows once.
+        if atmlst is not None:
+            self.de = self.de[list(atmlst)]
+        log.timer('SCF gradients', *t0)
+        self._finalize()
+        return self.de
+
+    def jk_energy_per_atom(self, dm=None, j_factor=1, k_factor=1, omega=0,
+                           hermi=0, verbose=None):
+        '''
+        Computes the first-order derivatives of the energy per atom for
+        j_factor * J_derivatives - k_factor * K_derivatives
+        '''
+        raise NotImplementedError
+
+    def extra_force(self, atom_id=None):
+        '''Hook for additional contributions to the analytical gradients.
+
+        `atom_id` is the index of the atom for which to compute the force.
+        If not provided, the contribution for all atoms is returned.
+        '''
+        return 0
 
 
 class Gradients(GradientsBase):
@@ -468,12 +589,63 @@ class Gradients(GradientsBase):
         NOTE: This function is incompatible to the one implemented in PySCF CPU version.
         In the CPU version, get_veff returns the first order derivatives of Veff matrix.
         '''
-        if mol is None: mol = self.mol
+        raise DeprecationWarning
+
+    def energy_ee(self, mol, dm):
+        return self.jk_energy_per_atom(dm)
+
+    def jk_energy_per_atom(self, dm=None, j_factor=1, k_factor=1,
+                           omega=None, lr_factor=None, sr_factor=None,
+                           hermi=0, verbose=None):
+        r'''Compute the first-order derivatives of the Coulomb and exchange
+        energies with respect to atomic positions.
+
+            j_factor * dE_J / dR - k_factor * dE_K / dR
+
+        Parameters
+        ----------
+        dm : ndarray or sequence of ndarray, optional
+            Density matrix or (for UKS) a sequence of density matrices.
+        j_factor : float, optional
+            Scaling factor applied to the Coulomb (J) contribution.
+        k_factor : float, optional
+            Scaling factor applied to the exchange (K) contribution.
+        omega : float, optional
+            Range-separation parameter. Together with ``lr_factor`` and
+            ``sr_factor``, defines the range-separated Coulomb operator used in
+            exchange (K) matrix evaluation:
+                lr_factor * erf(omega * r) / r + sr_factor * erfc(omega * r) / r.
+        lr_factor : float, optional
+            Scaling factor for the long-range interaction,
+        sr_factor : float, optional
+            Scaling factor for the short-range interaction,
+        hermi : int, optional
+            Symmetry of the density matrix:
+            - ``0``: no symmetry
+            - ``1``: Hermitian
+            - ``2``: anti-Hermitian
+
+        Notes
+        -----
+        When omega, lr_factor, and sr_factor parameters are specified, the K
+        contribution is evaluated using the attenuated Coulomb operator.
+
+        Returns
+        -------
+        Array of shape ``(natm, 3)`` containing the derivative of the weighted
+        Coulomb and exchange energy with respect to the Cartesian coordinates of
+        each atom.
+        '''
         if dm is None: dm = self.base.make_rdm1()
-        vhfopt = self.base._opt_gpu.get(mol.omega)
-        ejk = _jk_energy_per_atom(mol, dm, vhfopt, verbose=verbose)
-        # Scale .5 to match the value of the contraction of dm and Veff
-        ejk *= .5
-        return ejk
+        mf = self.base
+        vhfopt = mf._opt_gpu.get(omega)
+        if vhfopt is None:
+            # For LDA and GGA, only mf._opt_jengine is initialized
+            mol = mf.mol
+            with mol.with_range_coulomb(omega):
+                vhfopt = mf._opt_gpu[omega] = _VHFOpt(
+                    mol, mf.direct_scf_tol).build()
+        return _jk_energy_per_atom(vhfopt, dm, j_factor, k_factor,
+                                   omega, lr_factor, sr_factor, verbose)
 
 Grad = Gradients

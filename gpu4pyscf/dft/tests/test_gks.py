@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import unittest
+from packaging.version import Version
+import cupy as cp
+import pyscf
 from pyscf import gto
 from pyscf import lib
 from gpu4pyscf.dft import gks
@@ -61,101 +64,190 @@ class KnownValues(unittest.TestCase):
         mf_gpu.xc = 'lda,'
         mf_gpu.collinear = 'mcol'
         mf_gpu._numint.spin_samples = 6
-        eks4_gpu = mf_gpu.kernel()
-        self.assertAlmostEqual(eks4_gpu, -74.0600297733097, 6)
+        e_gpu = mf_gpu.kernel()
+        self.assertAlmostEqual(e_gpu, -74.0600297733097, 6)
         self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), -26.421986983504258, 5)
 
         mf_gpu = gks.GKS(mol1)
         mf_gpu.xc = 'lda,vwn'
         mf_gpu.collinear = 'mcol'
         mf_gpu._numint.spin_samples = 50
-        eks4_gpu = mf_gpu.kernel()
-        self.assertAlmostEqual(eks4_gpu, -74.3741809222222, 6)
+        e_gpu = mf_gpu.kernel()
+        self.assertAlmostEqual(e_gpu, -74.3741809222222, 6)
         self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), -27.63368769213053, 5)
 
+    @unittest.skipIf(mcfun is None, "mcfun library not installed.")
     def test_mcol_gks_gga(self):
 
         mf_gpu = gks.GKS(mol)
         mf_gpu.xc = 'pbe'
         mf_gpu.collinear = 'mcol'
         mf_gpu._numint.spin_samples = 6
-        eks4_gpu = mf_gpu.kernel()
-        self.assertAlmostEqual(eks4_gpu, -75.2256398121708, 6)
+        e_gpu = mf_gpu.kernel()
+        self.assertAlmostEqual(e_gpu, -75.2256398121708, 6)
         self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), -26.81184613393452, 5)
 
         mf_gpu = gks.GKS(mol1)
         mf_gpu.xc = 'pbe'
         mf_gpu.collinear = 'mcol'
         mf_gpu._numint.spin_samples = 50
-        eks4_gpu = mf_gpu.kernel()
-        self.assertAlmostEqual(eks4_gpu, -74.869954771937, 6) # pyscf result
+        e_gpu = mf_gpu.kernel()
+        self.assertAlmostEqual(e_gpu, -74.869954771937, 6) # pyscf result
         self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), -27.92164954706164, 5) # pyscf result
 
+    @unittest.skipIf(mcfun is None, "mcfun library not installed.")
     def test_mcol_gks_hyb(self):
         mf_gpu = gks.GKS(mol)
         mf_gpu.xc = 'b3lyp'
         mf_gpu.collinear = 'mcol'
         mf_gpu._numint.spin_samples = 6
-        eks4_gpu = mf_gpu.kernel()
-        self.assertAlmostEqual(eks4_gpu, -75.312587317089, 6) # pyscf result
+        e_gpu = mf_gpu.kernel()
+        self.assertAlmostEqual(e_gpu, -75.312587317089, 6) # pyscf result
         self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), -27.2469582128507, 5) # pyscf result
 
         mf_gpu = gks.GKS(mol1)
         mf_gpu.xc = 'b3lyp'
         mf_gpu.collinear = 'mcol'
         mf_gpu._numint.spin_samples = 50
-        eks4_gpu = mf_gpu.kernel()
-        self.assertAlmostEqual(eks4_gpu, -74.9528036305753, 6) # pyscf result
+        e_gpu = mf_gpu.kernel()
+        self.assertAlmostEqual(e_gpu, -74.9528036305753, 6) # pyscf result
         self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), -28.49145406025193, 5) # pyscf result
 
+    @unittest.skipIf(mcfun is None, "mcfun library not installed.")
     def test_mcol_gks_mgga(self):
         mf_gpu = gks.GKS(mol)
         mf_gpu.xc = 'm06l'
         mf_gpu.collinear = 'mcol'
         mf_gpu._numint.spin_samples = 6
-        eks4_gpu = mf_gpu.kernel()
-        self.assertAlmostEqual(eks4_gpu, -75.3053691716776, 6) # pyscf result
+        e_gpu = mf_gpu.kernel()
+        self.assertAlmostEqual(e_gpu, -75.3053691716776, 6) # pyscf result
         self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), -27.03099891671804, 5) # pyscf result
 
         mf_gpu = gks.GKS(mol1)
         mf_gpu.xc = 'm06l'
         mf_gpu.collinear = 'mcol'
         mf_gpu._numint.spin_samples = 50
-        eks4_gpu = mf_gpu.kernel()
-        self.assertAlmostEqual(eks4_gpu, -74.9468853267496, 6) # pyscf result
+        e_gpu = mf_gpu.kernel()
+        self.assertAlmostEqual(e_gpu, -74.9468853267496, 6) # pyscf result
         self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), -28.188215296679516, 5) # pyscf result
 
-    @unittest.skipIf(mcfun is None, "mcfun library not found.")
+    @unittest.skipIf(mcfun is None, "mcfun library not installed.")
     def test_to_cpu(self):
         mf_gpu = gks.GKS(mol1)
         mf_gpu.xc = 'lda,vwn'
         mf_gpu.collinear = 'mcol'
         mf_gpu._numint.spin_samples = 50
-        eks4_gpu = mf_gpu.kernel()
+        e_gpu = mf_gpu.kernel()
 
         mf_cpu = mf_gpu.to_cpu()
-        eks4_cpu = mf_cpu.kernel()
+        e_cpu = mf_cpu.kernel()
 
-        self.assertAlmostEqual(eks4_gpu, eks4_cpu, 6)
-        self.assertAlmostEqual(eks4_gpu, -74.3741809222222, 6)
+        self.assertAlmostEqual(e_gpu, e_cpu, 6)
+        self.assertAlmostEqual(e_gpu, -74.3741809222222, 6)
         self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), lib.fp(mf_cpu.mo_energy), 5)
         self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), -27.63368769213053, 5)
 
-    @unittest.skip("NumInt2C in PySCF has no to_gpu method.")
+    @unittest.skipIf(mcfun is None, "mcfun library not installed.")
+    @unittest.skipIf(Version(pyscf.__version__) < Version('2.12'),
+                     'NumInt2C.to_gpu method is not available.')
     def test_to_gpu(self):
         mf_cpu = gks_cpu.GKS(mol1)
         mf_cpu.xc = 'lda,vwn'
         mf_cpu.collinear = 'mcol'
         mf_cpu._numint.spin_samples = 50
-        eks4_cpu = mf_cpu.kernel()
+        e_cpu = mf_cpu.kernel()
 
         mf_gpu = mf_cpu.to_gpu()
-        eks4_gpu = mf_cpu.kernel()
+        e_gpu = mf_cpu.kernel()
 
-        self.assertAlmostEqual(eks4_gpu, eks4_cpu, 6)
-        self.assertAlmostEqual(eks4_gpu, -74.3741809222222, 6)
+        self.assertAlmostEqual(e_gpu, e_cpu, 6)
+        self.assertAlmostEqual(e_gpu, -74.3741809222222, 6)
         self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), lib.fp(mf_cpu.mo_energy), 5)
         self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), -27.63368769213053, 5)
+
+    def test_mcol_x2c_gks_lda(self):
+        mf = gks.GKS(mol).x2c()
+        mf.xc = 'lda,'
+        mf.collinear = 'mcol'
+        mf._numint.spin_samples = 6
+        e = mf.kernel()
+        self.assertAlmostEqual(e, -74.09933666072668, 6)
+
+    def test_mcol_x2c_gks_pbe(self):
+        mf_gpu = gks.GKS(mol).x2c()
+        mf_gpu.xc = 'pbe,'
+        mf_gpu.collinear = 'mcol'
+        mf_gpu._numint.spin_samples = 6
+        e_gpu = mf_gpu.kernel()
+        self.assertAlmostEqual(e_gpu, -74.92169301337378, 6)
+        self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), -26.825097473946236, 5)
+        if mcfun is not None:
+            mf_cpu = gks_cpu.GKS(mol).x2c()
+            mf_cpu.xc = 'pbe,'
+            mf_cpu.collinear = 'mcol'
+            mf_cpu._numint.spin_samples = 6
+            e_cpu = mf_cpu.kernel()
+            self.assertAlmostEqual(e_gpu, e_cpu, 6)
+            self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), lib.fp(mf_cpu.mo_energy), 5)
+
+    def test_mcol_x2c_gks_b3lyp(self):
+        mf_gpu = gks.GKS(mol).x2c()
+        mf_gpu.xc = 'b3lyp'
+        mf_gpu.collinear = 'mcol'
+        mf_gpu._numint.spin_samples = 6
+        e_gpu = mf_gpu.kernel()
+        self.assertAlmostEqual(e_gpu, -75.35193243953111, 6)
+        self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), -27.27011696105704, 5)
+        if mcfun is not None:
+            mf_cpu = gks_cpu.GKS(mol).x2c()
+            mf_cpu.xc = 'b3lyp'
+            mf_cpu.collinear = 'mcol'
+            mf_cpu._numint.spin_samples = 6
+            e_cpu = mf_cpu.kernel()
+            self.assertAlmostEqual(e_gpu, e_cpu, 6)
+            self.assertAlmostEqual(lib.fp(mf_gpu.mo_energy.get()), lib.fp(mf_cpu.mo_energy), 5)
+
+    @unittest.skipIf(mcfun is None, "mcfun library not installed.")
+    @unittest.skipIf(Version(pyscf.__version__) < Version('2.12'),
+                     'NumInt2C.to_gpu method is not available.')
+    def test_get_veff_complex(self):
+        mf_cpu = mol.GKS(xc='lda,')
+        mf_cpu.collinear = 'mcol'
+        mf_cpu._numint.spin_samples = 6
+        mf_gpu = mf_cpu.to_gpu()
+        mf_gpu.collinear = 'mcol'
+        mf_gpu._numint.spin_samples = 6
+        dm = mf_cpu.get_init_guess() + mf_cpu.get_ovlp() * .1j
+        veff = mf_gpu.get_veff(mol, cp.array(dm))
+        ref = mf_cpu.get_veff(mol, dm)
+        assert abs(veff.get() - ref).max() < 1e-12
+
+        mf_cpu.xc = 'b3lyp'
+        mf_gpu.xc = 'b3lyp'
+        veff = mf_gpu.get_veff(mol, cp.array(dm))
+        ref = mf_cpu.get_veff(mol, dm)
+        assert abs(veff.get() - ref).max() < 1e-12
+
+    @unittest.skipIf(mcfun is None, "mcfun library not installed.")
+    @unittest.skipIf(Version(pyscf.__version__) < Version('2.12'),
+                     'NumInt2C.to_gpu method is not available.')
+    def test_get_veff_real(self):
+        mf_cpu = mol.GKS(xc='lda,')
+        mf_cpu.collinear = 'mcol'
+        mf_cpu._numint.spin_samples = 6
+        mf_gpu = mf_cpu.to_gpu()
+        mf_gpu.collinear = 'mcol'
+        mf_gpu._numint.spin_samples = 6
+        dm = mf_cpu.get_init_guess() + mf_cpu.get_ovlp() * .1
+        veff = mf_gpu.get_veff(mol, cp.array(dm))
+        ref = mf_cpu.get_veff(mol, dm)
+        assert abs(veff.get() - ref).max() < 1e-12
+
+        mf_cpu.xc = 'camb3lyp'
+        mf_gpu.xc = 'camb3lyp'
+        veff = mf_gpu.get_veff(mol, cp.array(dm))
+        ref = mf_cpu.get_veff(mol, dm)
+        assert abs(veff.get() - ref).max() < 1e-12
 
 
 if __name__ == "__main__":
