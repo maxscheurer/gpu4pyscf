@@ -693,7 +693,11 @@ class OverlapScreen:
     screening would also be skipped by the kernels' own cutoff test.
     """
 
-    def __init__(self, intopt, coords, exponents, cutoff):
+    # Fraction of free GPU memory the per-pair lists may use before falling
+    # back to dense mode (all points for every pair, no lists).
+    MAX_MEM_FRACTION = 0.25
+
+    def __init__(self, intopt, coords, exponents, cutoff, force_dense=False):
         coords = cp.ascontiguousarray(cp.asarray(coords, dtype=np.float64))
         exponents = cp.ascontiguousarray(cp.asarray(exponents, dtype=np.float64))
         self.intopt = intopt
@@ -735,6 +739,14 @@ class OverlapScreen:
         self.super_sphere, self.super_gamma = group(OVLP_TILES_PER_SUPER)
         self.block_sphere, self.block_gamma = group(OVLP_TILES_PER_BLOCK)
 
+        self.force_dense = force_dense
+        self.dense = True
+        self.pair_ptr = self.pair_tiles = None
+        self.nnz = None
+        if force_dense or not cutoff > 0:
+            # no screening possible (cutoff <= 0) or requested: dense mode
+            return
+
         assert OVLP_TILES_PER_BLOCK <= 32
         npairs = int(intopt.bas_pairs_locs[-1])
         thresh = 0.5 * cutoff
@@ -771,6 +783,9 @@ class OverlapScreen:
         blk_ptr = cp.zeros(npairs + 1, dtype=np.int32)
         cp.cumsum(nblk, out=blk_ptr[1:])
         nrec = max(int(blk_ptr[-1]), 1)
+        budget = self.MAX_MEM_FRACTION * get_avail_mem()
+        if nrec * 8 > budget:
+            return  # dense mode
         blk = cp.empty(nrec, dtype=np.int32)
         mask = cp.empty(nrec, dtype=np.uint32)
         counts = cp.zeros(npairs, dtype=np.int32)
@@ -778,6 +793,8 @@ class OverlapScreen:
         ptr = cp.zeros(npairs + 1, dtype=np.int32)
         cp.cumsum(counts, out=ptr[1:])
         nnz = int(ptr[-1])
+        if nnz * 4 > budget:
+            return  # dense mode
         tiles = cp.empty(max(nnz, 1), dtype=np.int32)
         err = libgint.GINTovlp_expand(
             ctypes.c_void_p(stream.ptr), ctypes.c_void_p(tiles.data.ptr),
@@ -790,17 +807,23 @@ class OverlapScreen:
         self.pair_ptr = ptr
         self.pair_tiles = tiles
         self.nnz = nnz
+        self.dense = False
 
-    def matches(self, intopt, coords, cutoff):
+    def matches(self, intopt, coords, cutoff, force_dense=False):
         return (intopt is self.intopt and cutoff == self.cutoff
-                and coords.shape[0] == self.ngrids)
+                and coords.shape[0] == self.ngrids
+                and force_dense == self.force_dense)
 
     def _launch(self, fn, *args):
         intopt = self.intopt
         libgint.GINTset_int3c_overlap_constants(intopt.bpcache, ctypes.c_double(self.cutoff))
         stream = cp.cuda.get_current_stream()
-        tail = (ctypes.c_void_p(self.pair_ptr.data.ptr),
-                ctypes.c_void_p(self.pair_tiles.data.ptr),
+        if self.dense:
+            lists = (ctypes.c_void_p(0), ctypes.c_void_p(0))
+        else:
+            lists = (ctypes.c_void_p(self.pair_ptr.data.ptr),
+                     ctypes.c_void_p(self.pair_tiles.data.ptr))
+        tail = (*lists,
                 ctypes.c_void_p(self.coords.data.ptr),
                 ctypes.c_void_p(self.exps.data.ptr),
                 ctypes.c_int(self.ngrids))

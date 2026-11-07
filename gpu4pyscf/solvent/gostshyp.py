@@ -510,10 +510,15 @@ class GOSTSHYP(lib.StreamObject):
     def get_screen(self):
         """Spatial (shell pair, grid tile) screening lists (cached)."""
         scr = self._screen
+        force_dense = getattr(self, '_force_dense', False)
         if scr is None or not scr.matches(self.intopt, self.grid_coords,
-                                          self.overlap_cutoff):
+                                          self.overlap_cutoff, force_dense):
             scr = self._screen = int3c_overlap.OverlapScreen(
-                self.intopt, self.grid_coords, self.widths, self.overlap_cutoff)
+                self.intopt, self.grid_coords, self.widths, self.overlap_cutoff,
+                force_dense=force_dense)
+            if scr.dense and not force_dense and self.overlap_cutoff > 0:
+                logger.info(self, 'GOSTSHYP: screening lists exceed the memory '
+                            'budget, using dense (unscreened-list) kernels')
         return scr
 
     @property

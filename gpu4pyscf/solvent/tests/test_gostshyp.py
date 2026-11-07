@@ -225,6 +225,25 @@ class TestGOSTSHYPSCF(unittest.TestCase):
         np.testing.assert_allclose(e_tight, e_default, atol=1e-7,
                                    err_msg="Energy with cutoff=1e-14 differs from default")
 
+    def test_dense_mode_and_zero_cutoff(self):
+        """Dense (list-free) kernels match the screened ones; cutoff=0 works."""
+        mol = gto.M(atom='O 0 0 0.1173; H 0 0.7572 -0.4692; H 0 -0.7572 -0.4692',
+                    basis='cc-pvdz', verbose=0)
+        dm = cp.asarray(converged_dm(mol))
+        results = []
+        for cutoff, dense in ((1e-14, False), (1e-14, True), (0.0, False)):
+            gost = GOSTSHYP(mol, {'overlap_cutoff': cutoff})
+            gost._force_dense = dense
+            gost.build()
+            e, v = gost.kernel(dm)
+            g = gost.grad(dm)
+            self.assertEqual(gost.get_screen().dense, dense or cutoff == 0)
+            results.append((e, cp.asnumpy(v), g))
+        for e, v, g in results[1:]:
+            np.testing.assert_allclose(e, results[0][0], atol=1e-10)
+            np.testing.assert_allclose(v, results[0][1], atol=1e-10)
+            np.testing.assert_allclose(g, results[0][2], atol=1e-9)
+
     def test_different_pressure(self):
         """Test GOSTSHYP with different pressure values."""
         mol = gto.M(

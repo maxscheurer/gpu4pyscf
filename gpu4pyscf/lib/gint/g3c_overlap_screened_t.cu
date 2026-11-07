@@ -99,8 +99,10 @@ __device__ __forceinline__ void ovlp_os1d(const double ga, const double gb,
     const double Bx = bas_x[jsh], By = bas_y[jsh], Bz = bas_z[jsh];           \
     constexpr int NI = (LI + 1) * (LI + 2) / 2;                               \
     constexpr int NJ = (LJ + 1) * (LJ + 2) / 2;                               \
-    const int t0 = pair_ptr[bas_ij];                                          \
-    const int t1 = pair_ptr[bas_ij + 1];
+    /* dense mode (pair_tiles == NULL): every point for every pair */         \
+    const int t0 = pair_tiles ? pair_ptr[bas_ij] : 0;                         \
+    const int t1 = pair_tiles ? pair_ptr[bas_ij + 1]                          \
+                              : (ngrids + OVLP_TILE - 1) / OVLP_TILE;
 
 /*
  * Density contraction, aux l = 0..KMAX (see GINTovlp_density_screened_kernel).
@@ -132,7 +134,7 @@ __global__ void GINTovlp_density_screened_t_kernel(
     }
 
     for (int t = t0 + lane / OVLP_TILE; t < t1; t += OVLP_TPW) {
-        const int grid = pair_tiles[t] * OVLP_TILE + lane % OVLP_TILE;
+        const int grid = (pair_tiles ? pair_tiles[t] : t) * OVLP_TILE + lane % OVLP_TILE;
         if (grid >= ngrids) continue;
         const double Cx = coords[grid * 3 + 0];
         const double Cy = coords[grid * 3 + 1];
@@ -209,7 +211,7 @@ __global__ void GINTovlp_grad_density_screened_t_kernel(
         }
     }
     for (int t = t0 + lane / OVLP_TILE; t < t1; t += OVLP_TPW) {
-        const int grid = pair_tiles[t] * OVLP_TILE + lane % OVLP_TILE;
+        const int grid = (pair_tiles ? pair_tiles[t] : t) * OVLP_TILE + lane % OVLP_TILE;
         if (grid >= ngrids) continue;
         const double Cx = coords[grid * 3 + 0];
         const double Cy = coords[grid * 3 + 1];
@@ -274,7 +276,7 @@ __global__ void GINTovlp_fock_sp_screened_t_kernel(
     for (int n = 0; n < NI * NJ; ++n) fock_ij[n] = 0.0;
 
     for (int t = t0 + lane / OVLP_TILE; t < t1; t += OVLP_TPW) {
-        const int grid = pair_tiles[t] * OVLP_TILE + lane % OVLP_TILE;
+        const int grid = (pair_tiles ? pair_tiles[t] : t) * OVLP_TILE + lane % OVLP_TILE;
         if (grid >= ngrids) continue;
         const double Cx = coords[grid * 3 + 0];
         const double Cy = coords[grid * 3 + 1];
@@ -354,7 +356,7 @@ __global__ void GINTovlp_ip1_sp_atoms_screened_t_kernel(
     double gB[3] = {0.0, 0.0, 0.0};
 
     for (int t = t0 + lane / OVLP_TILE; t < t1; t += OVLP_TPW) {
-        const int grid = pair_tiles[t] * OVLP_TILE + lane % OVLP_TILE;
+        const int grid = (pair_tiles ? pair_tiles[t] : t) * OVLP_TILE + lane % OVLP_TILE;
         if (grid >= ngrids) continue;
         const double Cx = coords[grid * 3 + 0];
         const double Cy = coords[grid * 3 + 1];
