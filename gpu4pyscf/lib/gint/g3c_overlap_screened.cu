@@ -20,10 +20,10 @@
  * Surface Gaussians are sorted spatially (Morton order) and grouped into tiles
  * of OVLP_TILE consecutive points. For every shell pair a list of tiles is built
  * with a rigorous upper bound of the per-primitive prefactor used by the
- * unscreened kernels,
+ * compute kernels,
  *     pref = (g/z)^{3/2} |e12| exp(-a g / z |P-C|^2),   z = a + g,
  * so a tile is dropped only if every primitive of the pair would be skipped for
- * every point of the tile by the existing `fabs(prefactor) < cutoff` test.
+ * every point of the tile by the kernels' `fabs(prefactor) < cutoff` test.
  *
  * Compute kernels map one warp to one shell pair; each lane handles one point of
  * the current tile. Included from nr_fill_ao_int3c_overlap.cu (shares constants).
@@ -34,6 +34,151 @@
 #endif
 #define OVLP_TPW (32 / OVLP_TILE)  // tiles processed concurrently per warp
 #define OVLP_WARPS_PER_BLOCK 4
+
+__device__ __forceinline__ int cart_idx3(int a, int b, int c, int stride) {
+    // 3D index into recursion buffer
+    return a * stride * stride + b * stride + c;
+}
+
+/*
+ * Compute 3-center overlap recursion for a single primitive triplet.
+ * Runtime angular momentum version - loops determined by l values at runtime.
+ */
+template <int MAX_L_TOTAL>
+__device__ void compute_3c_overlap_recursion_general(
+    const int li, const int lj, const int lk,
+    const double GA[3], const double GB[3], const double GC[3],
+    const double inv_2zeta,
+    double* __restrict__ Sx, double* __restrict__ Sy, double* __restrict__ Sz
+) {
+    constexpr int STRIDE = MAX_L_TOTAL + 2;
+
+    #define IDX(a, b, c) cart_idx3(a, b, c, STRIDE)
+
+    // Base case
+    Sx[IDX(0, 0, 0)] = 1.0;
+    Sy[IDX(0, 0, 0)] = 1.0;
+    Sz[IDX(0, 0, 0)] = 1.0;
+
+    // Build up base cases for a=1, b=1, c=1
+    if (li >= 1) {
+        Sx[IDX(1, 0, 0)] = GA[0];
+        Sy[IDX(1, 0, 0)] = GA[1];
+        Sz[IDX(1, 0, 0)] = GA[2];
+    }
+    if (lj >= 1) {
+        Sx[IDX(0, 1, 0)] = GB[0];
+        Sy[IDX(0, 1, 0)] = GB[1];
+        Sz[IDX(0, 1, 0)] = GB[2];
+    }
+    if (lk >= 1) {
+        Sx[IDX(0, 0, 1)] = GC[0];
+        Sy[IDX(0, 0, 1)] = GC[1];
+        Sz[IDX(0, 0, 1)] = GC[2];
+    }
+
+    // Upward recursion in c (aux function) for a=b=0
+    for (int c = 1; c < lk; ++c) {
+        Sx[IDX(0, 0, c + 1)] = GC[0] * Sx[IDX(0, 0, c)] + c * inv_2zeta * Sx[IDX(0, 0, c - 1)];
+        Sy[IDX(0, 0, c + 1)] = GC[1] * Sy[IDX(0, 0, c)] + c * inv_2zeta * Sy[IDX(0, 0, c - 1)];
+        Sz[IDX(0, 0, c + 1)] = GC[2] * Sz[IDX(0, 0, c)] + c * inv_2zeta * Sz[IDX(0, 0, c - 1)];
+    }
+
+    // Upward recursion in b for all c, a=0
+    if (lj >= 1) {
+        for (int c = 1; c <= lk; ++c) {
+            Sx[IDX(0, 1, c)] = GB[0] * Sx[IDX(0, 0, c)] + c * inv_2zeta * Sx[IDX(0, 0, c - 1)];
+            Sy[IDX(0, 1, c)] = GB[1] * Sy[IDX(0, 0, c)] + c * inv_2zeta * Sy[IDX(0, 0, c - 1)];
+            Sz[IDX(0, 1, c)] = GB[2] * Sz[IDX(0, 0, c)] + c * inv_2zeta * Sz[IDX(0, 0, c - 1)];
+        }
+        for (int b = 1; b < lj; ++b) {
+            Sx[IDX(0, b + 1, 0)] = GB[0] * Sx[IDX(0, b, 0)] + b * inv_2zeta * Sx[IDX(0, b - 1, 0)];
+            Sy[IDX(0, b + 1, 0)] = GB[1] * Sy[IDX(0, b, 0)] + b * inv_2zeta * Sy[IDX(0, b - 1, 0)];
+            Sz[IDX(0, b + 1, 0)] = GB[2] * Sz[IDX(0, b, 0)] + b * inv_2zeta * Sz[IDX(0, b - 1, 0)];
+
+            for (int c = 1; c <= lk; ++c) {
+                Sx[IDX(0, b + 1, c)] = GB[0] * Sx[IDX(0, b, c)] + b * inv_2zeta * Sx[IDX(0, b - 1, c)]
+                                      + c * inv_2zeta * Sx[IDX(0, b, c - 1)];
+                Sy[IDX(0, b + 1, c)] = GB[1] * Sy[IDX(0, b, c)] + b * inv_2zeta * Sy[IDX(0, b - 1, c)]
+                                      + c * inv_2zeta * Sy[IDX(0, b, c - 1)];
+                Sz[IDX(0, b + 1, c)] = GB[2] * Sz[IDX(0, b, c)] + b * inv_2zeta * Sz[IDX(0, b - 1, c)]
+                                      + c * inv_2zeta * Sz[IDX(0, b, c - 1)];
+            }
+        }
+    }
+
+    // Upward recursion in a for all b, c
+    if (li >= 1) {
+        for (int c = 1; c <= lk; ++c) {
+            Sx[IDX(1, 0, c)] = GA[0] * Sx[IDX(0, 0, c)] + c * inv_2zeta * Sx[IDX(0, 0, c - 1)];
+            Sy[IDX(1, 0, c)] = GA[1] * Sy[IDX(0, 0, c)] + c * inv_2zeta * Sy[IDX(0, 0, c - 1)];
+            Sz[IDX(1, 0, c)] = GA[2] * Sz[IDX(0, 0, c)] + c * inv_2zeta * Sz[IDX(0, 0, c - 1)];
+        }
+        for (int b = 1; b <= lj; ++b) {
+            Sx[IDX(1, b, 0)] = GA[0] * Sx[IDX(0, b, 0)] + b * inv_2zeta * Sx[IDX(0, b - 1, 0)];
+            Sy[IDX(1, b, 0)] = GA[1] * Sy[IDX(0, b, 0)] + b * inv_2zeta * Sy[IDX(0, b - 1, 0)];
+            Sz[IDX(1, b, 0)] = GA[2] * Sz[IDX(0, b, 0)] + b * inv_2zeta * Sz[IDX(0, b - 1, 0)];
+        }
+        for (int a = 1; a < li; ++a) {
+            Sx[IDX(a + 1, 0, 0)] = GA[0] * Sx[IDX(a, 0, 0)] + a * inv_2zeta * Sx[IDX(a - 1, 0, 0)];
+            Sy[IDX(a + 1, 0, 0)] = GA[1] * Sy[IDX(a, 0, 0)] + a * inv_2zeta * Sy[IDX(a - 1, 0, 0)];
+            Sz[IDX(a + 1, 0, 0)] = GA[2] * Sz[IDX(a, 0, 0)] + a * inv_2zeta * Sz[IDX(a - 1, 0, 0)];
+
+            for (int c = 1; c <= lk; ++c) {
+                Sx[IDX(a + 1, 0, c)] = GA[0] * Sx[IDX(a, 0, c)] + a * inv_2zeta * Sx[IDX(a - 1, 0, c)]
+                                      + c * inv_2zeta * Sx[IDX(a, 0, c - 1)];
+                Sy[IDX(a + 1, 0, c)] = GA[1] * Sy[IDX(a, 0, c)] + a * inv_2zeta * Sy[IDX(a - 1, 0, c)]
+                                      + c * inv_2zeta * Sy[IDX(a, 0, c - 1)];
+                Sz[IDX(a + 1, 0, c)] = GA[2] * Sz[IDX(a, 0, c)] + a * inv_2zeta * Sz[IDX(a - 1, 0, c)]
+                                      + c * inv_2zeta * Sz[IDX(a, 0, c - 1)];
+            }
+
+            for (int b = 1; b <= lj; ++b) {
+                Sx[IDX(a + 1, b, 0)] = GA[0] * Sx[IDX(a, b, 0)] + a * inv_2zeta * Sx[IDX(a - 1, b, 0)]
+                                      + b * inv_2zeta * Sx[IDX(a, b - 1, 0)];
+                Sy[IDX(a + 1, b, 0)] = GA[1] * Sy[IDX(a, b, 0)] + a * inv_2zeta * Sy[IDX(a - 1, b, 0)]
+                                      + b * inv_2zeta * Sy[IDX(a, b - 1, 0)];
+                Sz[IDX(a + 1, b, 0)] = GA[2] * Sz[IDX(a, b, 0)] + a * inv_2zeta * Sz[IDX(a - 1, b, 0)]
+                                      + b * inv_2zeta * Sz[IDX(a, b - 1, 0)];
+            }
+        }
+    }
+
+    // Fill remaining (a, b, c) with a >= 1, b >= 1, c >= 1
+    if (li >= 1 && lj >= 1 && lk >= 1) {
+        for (int b = 1; b <= lj; ++b) {
+            for (int c = 1; c <= lk; ++c) {
+                Sx[IDX(1, b, c)] = GA[0] * Sx[IDX(0, b, c)] + b * inv_2zeta * Sx[IDX(0, b - 1, c)]
+                                  + c * inv_2zeta * Sx[IDX(0, b, c - 1)];
+                Sy[IDX(1, b, c)] = GA[1] * Sy[IDX(0, b, c)] + b * inv_2zeta * Sy[IDX(0, b - 1, c)]
+                                  + c * inv_2zeta * Sy[IDX(0, b, c - 1)];
+                Sz[IDX(1, b, c)] = GA[2] * Sz[IDX(0, b, c)] + b * inv_2zeta * Sz[IDX(0, b - 1, c)]
+                                  + c * inv_2zeta * Sz[IDX(0, b, c - 1)];
+            }
+        }
+
+        for (int a = 1; a < li; ++a) {
+            for (int b = 1; b <= lj; ++b) {
+                for (int c = 1; c <= lk; ++c) {
+                    Sx[IDX(a + 1, b, c)] = GA[0] * Sx[IDX(a, b, c)]
+                                          + a * inv_2zeta * Sx[IDX(a - 1, b, c)]
+                                          + b * inv_2zeta * Sx[IDX(a, b - 1, c)]
+                                          + c * inv_2zeta * Sx[IDX(a, b, c - 1)];
+                    Sy[IDX(a + 1, b, c)] = GA[1] * Sy[IDX(a, b, c)]
+                                          + a * inv_2zeta * Sy[IDX(a - 1, b, c)]
+                                          + b * inv_2zeta * Sy[IDX(a, b - 1, c)]
+                                          + c * inv_2zeta * Sy[IDX(a, b, c - 1)];
+                    Sz[IDX(a + 1, b, c)] = GA[2] * Sz[IDX(a, b, c)]
+                                          + a * inv_2zeta * Sz[IDX(a - 1, b, c)]
+                                          + b * inv_2zeta * Sz[IDX(a, b - 1, c)]
+                                          + c * inv_2zeta * Sz[IDX(a, b, c - 1)];
+                }
+            }
+        }
+    }
+
+    #undef IDX
+}
 
 /*
  * Thread per shell pair: count (fill == 0) or write (fill == 1) the tiles that
@@ -197,8 +342,8 @@ __global__ void GINTovlp_expand_kernel(
     }
 }
 
-// Shared prologue of the per-primitive work (identical arithmetic to the
-// unscreened kernels so screening decisions match bit-for-bit).
+// Shared prologue of the per-primitive work of all compute kernels (here and in
+// g3c_overlap_screened_t.cu), so they all apply the same cutoff test.
 #define OVLP_PRIM_SETUP                                                      \
     const double alpha = c_bpcache.a1[ij];                                    \
     const double beta = c_bpcache.a2[ij];                                     \
