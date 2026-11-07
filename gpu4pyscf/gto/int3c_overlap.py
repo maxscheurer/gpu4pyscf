@@ -876,6 +876,25 @@ class OverlapScreen:
         res[self.perm] = out.T
         return res
 
+    def grad_density(self, mol, dm, normals):
+        """Per-point density contractions used by the GOSTSHYP gradient.
+
+        Returns [ngrids, 11]: s, p (3), sum_q d_xq n_q (3), tr d,
+        f-traces (f_xxx+f_xyy+f_xzz, f_xxy+f_yyy+f_yzz, f_xxz+f_yyz+f_zzz).
+        """
+        dm_c = self._sorted_cart_dm(mol, dm)
+        nao_cart = dm_c.shape[0]
+        n_s = cp.ascontiguousarray(
+            cp.asarray(normals, dtype=np.float64).reshape(-1, 3)[self.perm])
+        out = cp.zeros((11, self.ngrids))
+        self._launch(libgint.GINTovlp_grad_density_screened,
+                     ctypes.c_void_p(out.data.ptr),
+                     ctypes.c_void_p(dm_c.data.ptr), ctypes.c_int(nao_cart),
+                     ctypes.c_void_p(n_s.data.ptr))
+        res = cp.empty((self.ngrids, 11))
+        res[self.perm] = out.T
+        return res
+
     def fock_sp(self, mol, amp_s, amp_p):
         intopt = self.intopt
         amp_s = cp.ascontiguousarray(cp.asarray(amp_s, dtype=np.float64).ravel()[self.perm])

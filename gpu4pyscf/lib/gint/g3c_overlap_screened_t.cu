@@ -185,6 +185,78 @@ __global__ void GINTovlp_density_screened_t_kernel(
 }
 
 template <int LI, int LJ>
+__global__ void GINTovlp_grad_density_screened_t_kernel(
+    double* __restrict__ out,
+    const double* __restrict__ dm, const int nao,
+    const double* __restrict__ normals,
+    const int bas_ij0, const int prim_ij0, const int ntasks_ij, const int nprim_ij,
+    const int* __restrict__ pair_ptr, const int* __restrict__ pair_tiles,
+    const double* __restrict__ coords, const double* __restrict__ exps,
+    const int ngrids)
+{
+    OVLP_T_PAIR_SETUP
+    if (t0 == t1) return;
+    constexpr int NB = LJ + 1, NC = 4;
+    constexpr int SBUF = (LI + 1) * NB * NC;
+    double dmc[NI * NJ];
+    #pragma unroll
+    for (int iJ = 0; iJ < NJ; ++iJ) {
+        #pragma unroll
+        for (int iI = 0; iI < NI; ++iI) {
+            double d = dm[(ao_i + iI) * nao + ao_j + iJ];
+            if (ish != jsh) d += dm[(ao_j + iJ) * nao + ao_i + iI];
+            dmc[iJ * NI + iI] = d;
+        }
+    }
+    for (int t = t0 + lane / OVLP_TILE; t < t1; t += OVLP_TPW) {
+        const int grid = pair_tiles[t] * OVLP_TILE + lane % OVLP_TILE;
+        if (grid >= ngrids) continue;
+        const double Cx = coords[grid * 3 + 0];
+        const double Cy = coords[grid * 3 + 1];
+        const double Cz = coords[grid * 3 + 2];
+        const double gamma = exps[grid];
+        const double nx = normals[grid * 3 + 0];
+        const double ny = normals[grid * 3 + 1];
+        const double nz = normals[grid * 3 + 2];
+        double acc[OVLP_GRAD_NCOMP];
+        #pragma unroll
+        for (int c = 0; c < OVLP_GRAD_NCOMP; ++c) acc[c] = 0.0;
+        bool touched = false;
+        for (int ij = prim_ij; ij < prim_ij + nprim_ij; ++ij) {
+            OVLP_PRIM_SETUP
+            touched = true;
+            double Sx[SBUF], Sy[SBUF], Sz[SBUF];
+            ovlp_os1d<LI, LJ, 3>(GA[0], GB[0], GC[0], inv_2zeta, Sx);
+            ovlp_os1d<LI, LJ, 3>(GA[1], GB[1], GC[1], inv_2zeta, Sy);
+            ovlp_os1d<LI, LJ, 3>(GA[2], GB[2], GC[2], inv_2zeta, Sz);
+            #pragma unroll
+            for (int iJ = 0; iJ < NJ; ++iJ) {
+                const int jx = ovlp_cart_comp(LJ, iJ, 0);
+                const int jy = ovlp_cart_comp(LJ, iJ, 1);
+                const int jz = ovlp_cart_comp(LJ, iJ, 2);
+                #pragma unroll
+                for (int iI = 0; iI < NI; ++iI) {
+                    const int ix = ovlp_cart_comp(LI, iI, 0);
+                    const int iy = ovlp_cart_comp(LI, iI, 1);
+                    const int iz = ovlp_cart_comp(LI, iI, 2);
+                    const double* X = Sx + (ix * NB + jx) * NC;
+                    const double* Y = Sy + (iy * NB + jy) * NC;
+                    const double* Z = Sz + (iz * NB + jz) * NC;
+                    ovlp_grad_terms(X[0], X[1], X[2], X[3], Y[0], Y[1], Y[2], Y[3],
+                                    Z[0], Z[1], Z[2], Z[3], nx, ny, nz,
+                                    prefactor * dmc[iJ * NI + iI], acc);
+                }
+            }
+        }
+        if (touched) {
+            #pragma unroll
+            for (int c = 0; c < OVLP_GRAD_NCOMP; ++c)
+                atomicAdd(&out[c * ngrids + grid], acc[c]);
+        }
+    }
+}
+
+template <int LI, int LJ>
 __global__ void GINTovlp_fock_sp_screened_t_kernel(
     double* __restrict__ fock, const int nao,
     const double* __restrict__ amp_s, const double* __restrict__ amp_p,

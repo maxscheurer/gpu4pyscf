@@ -735,13 +735,17 @@ class TestDROPGradient(unittest.TestCase):
                 screen_cls, 'density', autospec=True,
                 side_effect=screen_cls.density) as density, \
              mock.patch.object(
+                screen_cls, 'grad_density', autospec=True,
+                side_effect=screen_cls.grad_density) as grad_density, \
+             mock.patch.object(
                 screen_cls, 'ip1_sp_atoms', autospec=True,
                 side_effect=screen_cls.ip1_sp_atoms) as ip1:
             _, grad_gpu = self._gradient(mol, dm)
 
         # kernel(): one s+p density pass; gradient: one fused s/p/d/f pass
         kmaxs = [call.kwargs['kmax'] for call in density.call_args_list]
-        self.assertEqual(kmaxs, [1, 3])
+        self.assertEqual(kmaxs, [1])
+        self.assertEqual(grad_density.call_count, 1)
         self.assertEqual(ip1.call_count, 1)
 
         cpu = cpu_reference(

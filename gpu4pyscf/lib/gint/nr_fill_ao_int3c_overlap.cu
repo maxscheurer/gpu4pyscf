@@ -780,6 +780,26 @@ int GINTovlp_density_screened(
     return ovlp_check(__func__);
 }
 
+int GINTovlp_grad_density_screened(
+    const cudaStream_t stream, const BasisProdCache* bpcache, const int cp_ij_id,
+    double* out, const double* dm, const int nao, const double* normals,
+    const int* pair_ptr, const int* pair_tiles,
+    const double* coords, const double* exps, const int ngrids)
+{
+    OVLP_TYPE_INFO
+    if (i_l <= 2 && j_l <= 2) {
+        OVLP_T_SWITCH(GINTovlp_grad_density_screened_t_kernel, ,
+            out, dm, nao, normals, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
+            pair_ptr, pair_tiles, coords, exps, ngrids)
+        return ovlp_check(__func__);
+    }
+    const int lt = i_l + j_l + 3;
+    OVLP_SWITCH_L(lt, GINTovlp_grad_density_screened_kernel,
+        out, dm, nao, normals, bas_ij0, prim_ij0, ntasks_ij, nprim_ij,
+        i_l, j_l, pair_ptr, pair_tiles, coords, exps, ngrids)
+    return ovlp_check(__func__);
+}
+
 int GINTovlp_fock_sp_screened(
     const cudaStream_t stream, const BasisProdCache* bpcache, const int cp_ij_id,
     double* fock, const int nao, const double* amp_s, const double* amp_p,

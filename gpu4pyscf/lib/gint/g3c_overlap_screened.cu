@@ -318,6 +318,98 @@ __global__ void GINTovlp_density_screened_kernel(
     #undef S_IDX
 }
 
+/*
+ * Gradient density contractions, reduced to the 11 per-point quantities the
+ * GOSTSHYP gradient uses (aux l = 0..3, contracted with the surface normal n):
+ *   0: s   1-3: p_x,p_y,p_z   4-6: sum_q d_xq n_q (x,y,z)   7: tr d
+ *   8-10: f_xxx+f_xyy+f_xzz, f_xxy+f_yyy+f_yzz, f_xxz+f_yyz+f_zzz
+ * out is component-major [11, ngrids].
+ */
+#define OVLP_GRAD_NCOMP 11
+__device__ __forceinline__ void ovlp_grad_terms(
+    const double x0, const double x1, const double x2, const double x3,
+    const double y0, const double y1, const double y2, const double y3,
+    const double z0, const double z1, const double z2, const double z3,
+    const double nx, const double ny, const double nz, const double w,
+    double* __restrict__ acc)
+{
+    acc[0] += w * x0 * y0 * z0;
+    acc[1] += w * x1 * y0 * z0;
+    acc[2] += w * x0 * y1 * z0;
+    acc[3] += w * x0 * y0 * z1;
+    const double dxx = x2 * y0 * z0, dyy = x0 * y2 * z0, dzz = x0 * y0 * z2;
+    const double dxy = x1 * y1 * z0, dxz = x1 * y0 * z1, dyz = x0 * y1 * z1;
+    acc[4] += w * (dxx * nx + dxy * ny + dxz * nz);
+    acc[5] += w * (dxy * nx + dyy * ny + dyz * nz);
+    acc[6] += w * (dxz * nx + dyz * ny + dzz * nz);
+    acc[7] += w * (dxx + dyy + dzz);
+    acc[8]  += w * (x3 * y0 * z0 + x1 * y2 * z0 + x1 * y0 * z2);
+    acc[9]  += w * (x2 * y1 * z0 + x0 * y3 * z0 + x0 * y1 * z2);
+    acc[10] += w * (x2 * y0 * z1 + x0 * y2 * z1 + x0 * y0 * z3);
+}
+
+template <int MAX_L_TOTAL>
+__global__ void GINTovlp_grad_density_screened_kernel(
+    double* __restrict__ out,
+    const double* __restrict__ dm, const int nao,
+    const double* __restrict__ normals,
+    const int bas_ij0, const int prim_ij0, const int ntasks_ij, const int nprim_ij,
+    const int i_l, const int j_l,
+    const int* __restrict__ pair_ptr, const int* __restrict__ pair_tiles,
+    const double* __restrict__ coords, const double* __restrict__ exps,
+    const int ngrids)
+{
+    OVLP_PAIR_SETUP
+    constexpr int STRIDE = MAX_L_TOTAL + 2;
+    constexpr int BUF_SIZE = STRIDE * STRIDE * STRIDE;
+    double Sx[BUF_SIZE], Sy[BUF_SIZE], Sz[BUF_SIZE];
+    #define S_IDX(a, b, c) ((a) * STRIDE * STRIDE + (b) * STRIDE + (c))
+    for (int t = t0 + lane / OVLP_TILE; t < t1; t += OVLP_TPW) {
+        const int grid = pair_tiles[t] * OVLP_TILE + lane % OVLP_TILE;
+        if (grid >= ngrids) continue;
+        const double Cx = coords[grid * 3 + 0];
+        const double Cy = coords[grid * 3 + 1];
+        const double Cz = coords[grid * 3 + 2];
+        const double gamma = exps[grid];
+        const double nx = normals[grid * 3 + 0];
+        const double ny = normals[grid * 3 + 1];
+        const double nz = normals[grid * 3 + 2];
+        double acc[OVLP_GRAD_NCOMP];
+        for (int c = 0; c < OVLP_GRAD_NCOMP; ++c) acc[c] = 0.0;
+        bool touched = false;
+        for (int ij = prim_ij; ij < prim_ij + nprim_ij; ++ij) {
+            OVLP_PRIM_SETUP
+            touched = true;
+            compute_3c_overlap_recursion_general<MAX_L_TOTAL>(
+                i_l, j_l, 3, GA, GB, GC, inv_2zeta, Sx, Sy, Sz);
+            for (int iJ = 0; iJ < ncart_j; ++iJ) {
+                const int jx = c_idx[j_loc + iJ];
+                const int jy = c_idx[j_loc + iJ + TOT_NF];
+                const int jz = c_idx[j_loc + iJ + 2 * TOT_NF];
+                for (int iI = 0; iI < ncart_i; ++iI) {
+                    const int ix = c_idx[i_loc + iI];
+                    const int iy = c_idx[i_loc + iI + TOT_NF];
+                    const int iz = c_idx[i_loc + iI + 2 * TOT_NF];
+                    const int ii = ao_i + iI;
+                    const int jj = ao_j + iJ;
+                    double d = dm[ii * nao + jj];
+                    if (ish != jsh) d += dm[jj * nao + ii];
+                    ovlp_grad_terms(
+                        Sx[S_IDX(ix, jx, 0)], Sx[S_IDX(ix, jx, 1)], Sx[S_IDX(ix, jx, 2)], Sx[S_IDX(ix, jx, 3)],
+                        Sy[S_IDX(iy, jy, 0)], Sy[S_IDX(iy, jy, 1)], Sy[S_IDX(iy, jy, 2)], Sy[S_IDX(iy, jy, 3)],
+                        Sz[S_IDX(iz, jz, 0)], Sz[S_IDX(iz, jz, 1)], Sz[S_IDX(iz, jz, 2)], Sz[S_IDX(iz, jz, 3)],
+                        nx, ny, nz, prefactor * d, acc);
+                }
+            }
+        }
+        if (touched) {
+            for (int c = 0; c < OVLP_GRAD_NCOMP; ++c)
+                atomicAdd(&out[c * ngrids + grid], acc[c]);
+        }
+    }
+    #undef S_IDX
+}
+
 __device__ __forceinline__ double warp_sum(double v) {
     for (int off = 16; off > 0; off >>= 1)
         v += __shfl_down_sync(0xffffffff, v, off);

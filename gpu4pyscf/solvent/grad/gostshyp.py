@@ -295,13 +295,15 @@ class Gradients(lib.StreamObject):
         # Term dE2: Gtilde operator gradient
         # ==================================================================
 
-        # One fused screened pass for all density contractions (aux l=0..3)
+        # One fused screened pass for all density contractions (aux l=0..3),
+        # reduced in-kernel to the combinations used below.
         screen = gostshyp.get_screen()
-        dens = screen.density(mol, dm, kmax=3)
-        s_val = dens[:, 0]
-        p_contracted = dens[:, 1:4]
-        d_contracted = dens[:, 4:10]
-        f_contracted = dens[:, 10:20]
+        gd = screen.grad_density(mol, dm, normals)
+        s_val = gd[:, 0]
+        p_contracted = gd[:, 1:4]
+        d_dot_n = gd[:, 4:7]   # sum_q d_xq n_q
+        trace_d = gd[:, 7]
+        f_trace = gd[:, 8:11]  # (xf, yf, zf)
 
         coeffs = -2.0 * P * areas * gtilde_expval * widths / (forces * forces)
         weighted_amp = coeffs[:, None] * normals
@@ -317,7 +319,6 @@ class Gradients(lib.StreamObject):
         dgtilde_gaussian = amplitudes[:, None] * 2.0 * widths[:, None] * p_contracted
 
         # --- Part C: d-type width gradient ---
-        trace_d = d_contracted[:, 0] + d_contracted[:, 3] + d_contracted[:, 5]
         imd = wgrad_prefs * amplitudes * trace_d
         w_area -= imd
 
@@ -325,20 +326,10 @@ class Gradients(lib.StreamObject):
         # Term dE3: Force operator gradient
         # ==================================================================
 
-        # Build 3x3 derivative matrix on GPU: dS_p_dC[g, x, p]
+        # sum_p dS_p/dC_x n_p = 2 gamma sum_p d_xp n_p - s n_x
         two_gamma = 2.0 * widths
-        dS_p_dC = cp.zeros((ngrids, 3, 3))
-        dS_p_dC[:, 0, 0] = two_gamma * d_contracted[:, 0] - s_val
-        dS_p_dC[:, 0, 1] = two_gamma * d_contracted[:, 1]
-        dS_p_dC[:, 0, 2] = two_gamma * d_contracted[:, 2]
-        dS_p_dC[:, 1, 0] = two_gamma * d_contracted[:, 1]
-        dS_p_dC[:, 1, 1] = two_gamma * d_contracted[:, 3] - s_val
-        dS_p_dC[:, 1, 2] = two_gamma * d_contracted[:, 4]
-        dS_p_dC[:, 2, 0] = two_gamma * d_contracted[:, 2]
-        dS_p_dC[:, 2, 1] = two_gamma * d_contracted[:, 4]
-        dS_p_dC[:, 2, 2] = two_gamma * d_contracted[:, 5] - s_val
-
-        dG = cp.einsum('gxp,gp,g->gx', dS_p_dC, normals, coeffs)
+        dG = coeffs[:, None] * (two_gamma[:, None] * d_dot_n
+                                - s_val[:, None] * normals)
 
         # Apply both Gaussian-center responses together.  For DROP this also
         # adds normal response while reusing p_contracted from dE2.
@@ -350,12 +341,8 @@ class Gradients(lib.StreamObject):
         dE2 = gtilde_operator_grad
 
         # --- Part C: f-type width gradient ---
-        xf = f_contracted[:, 0] + f_contracted[:, 3] + f_contracted[:, 5]
-        yf = f_contracted[:, 1] + f_contracted[:, 6] + f_contracted[:, 8]
-        zf = f_contracted[:, 2] + f_contracted[:, 7] + f_contracted[:, 9]
-
         f_coeffs = -2.0 * widths * wgrad_prefs
-        dr = cp.stack([xf, yf, zf], axis=1) * f_coeffs[:, None]
+        dr = f_trace * f_coeffs[:, None]
 
         rf2 = 1.0 / (forces * forces)
         dr *= normals
