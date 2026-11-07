@@ -64,7 +64,8 @@ def _gen_surface(mol, ng=110, rad=modified_Bondi):
     r_atm_gpu = cp.asarray(r_atm)
     w = unit_sphere[:, 3] * 4.0 * PI
     swf = cp.empty((natm, ng))
-    chunk = max(1, (1 << 25) // max(1, ng * natm))
+    # keep temporaries < 100 MB so they come from the CuPy pool
+    chunk = max(1, (1 << 23) // max(1, ng * natm))
     for a0 in range(0, natm, chunk):
         a1 = min(natm, a0 + chunk)
         na = a1 - a0
@@ -104,6 +105,16 @@ def _gen_surface(mol, ng=110, rad=modified_Bondi):
     }
 
 
+_pair_bound_kernel = cp.ElementwiseKernel(
+    'float64 xi, float64 yi, float64 zi, float64 ai, float64 ci, '
+    'float64 xj, float64 yj, float64 zj, float64 aj, float64 cj',
+    'float64 q',
+    '''
+    const double dx = xi - xj, dy = yi - yj, dz = zi - zj;
+    q = ci * cj * exp(-(ai * aj / (ai + aj)) * (dx * dx + dy * dy + dz * dz));
+    ''', 'gost_pair_bound')
+
+
 class _OverlapPairOpt(VHFOpt):
     """VHFOpt whose shell pairs are selected by a rigorous overlap bound.
 
@@ -122,14 +133,14 @@ class _OverlapPairOpt(VHFOpt):
         mol = self._sorted_mol
         bas = mol._bas
         nbas = mol.nbas
-        amin = np.empty(nbas)
-        cmax = np.empty(nbas)
-        for ish in range(nbas):
-            n = bas[ish, gto.NPRIM_OF]
-            pe = bas[ish, gto.PTR_EXP]
-            pc = bas[ish, gto.PTR_COEFF]
-            amin[ish] = mol._env[pe:pe + n].min()
-            cmax[ish] = np.abs(mol._env[pc:pc + n]).max()
+        nprim = bas[:, gto.NPRIM_OF]
+        npmax = int(nprim.max())
+        k = np.arange(npmax)
+        valid = k[None, :] < nprim[:, None]
+        pe = np.where(valid, bas[:, gto.PTR_EXP][:, None] + k, 0)
+        pc = np.where(valid, bas[:, gto.PTR_COEFF][:, None] + k, 0)
+        amin = np.where(valid, mol._env[pe], np.inf).min(axis=1)
+        cmax = np.where(valid, np.abs(mol._env[pc]), 0.0).max(axis=1)
         l = bas[:, gto.ANG_OF]
         cmax[l == 0] *= 0.282094791773878143
         cmax[l == 1] *= 0.488602511902919921
@@ -150,12 +161,11 @@ class _OverlapPairOpt(VHFOpt):
             for q0, q1 in zip(offsets[:-1], offsets[1:]):
                 if q0 > p0:
                     continue
-                r2 = ((xyz[p0:p1, None, :] - xyz[None, q0:q1, :]) ** 2).sum(axis=2)
-                ai = amin[p0:p1, None]
-                aj = amin[None, q0:q1]
-                q = cp.exp(-(ai * aj / (ai + aj)) * r2)
-                q *= cmax[p0:p1, None]
-                q *= cmax[None, q0:q1]
+                q = _pair_bound_kernel(
+                    xyz[p0:p1, None, 0], xyz[p0:p1, None, 1], xyz[p0:p1, None, 2],
+                    amin[p0:p1, None], cmax[p0:p1, None],
+                    xyz[None, q0:q1, 0], xyz[None, q0:q1, 1], xyz[None, q0:q1, 2],
+                    amin[None, q0:q1], cmax[None, q0:q1])
                 mask = q >= thresh
                 if q0 == p0:
                     mask &= cp.tri(p1 - p0, dtype=bool)
