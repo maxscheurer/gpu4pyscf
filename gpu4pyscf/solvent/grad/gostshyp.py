@@ -1,4 +1,4 @@
-# Copyright 2021-2024 The PySCF Developers. All Rights Reserved.
+# Copyright 2026 The PySCF Developers. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -240,7 +240,6 @@ class Gradients(lib.StreamObject):
         t0 = logger.init_timer(self)
         gostshyp = self.gostshyp
         mol = self.mol
-        natm = mol.natm
 
         # Ensure dm is cupy on GPU
         dm = cp.asarray(dm)
@@ -253,18 +252,13 @@ class Gradients(lib.StreamObject):
         gtilde_expval = gostshyp.gtilde_expval
         widths = gostshyp.widths
         areas = gostshyp.areas
-        grid_coords = gostshyp.grid_coords
         normals = gostshyp.surface_normals
-        atom_idx = gostshyp.atom_idx  # numpy int array
-        intopt = gostshyp.intopt
         P = gostshyp.pressure_au
-        cutoff = gostshyp.overlap_cutoff
-        ngrids = len(areas)
-        aoslice = mol.aoslice_by_atom()
 
-        # Normalize PCM and MOIST derivatives to [natm, 3, ngrids].
-        # DROP coordinate derivatives stay on the host and are transferred once
-        # per chunk when all coordinate-dependent terms are available.
+        # DROP cavities also move their grid points: the MOIST coordinate
+        # derivatives stay on the host and are transferred once per chunk in
+        # _apply_grid_coordinate_response. Area derivatives of all cavities
+        # are contracted at the end by _contract_dareas.
         if gostshyp.cavity == 'drop':
             _, dcoords = _get_surface_derivatives(gostshyp)
         else:

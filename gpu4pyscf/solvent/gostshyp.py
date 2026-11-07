@@ -1,4 +1,4 @@
-# Copyright 2021-2026 The PySCF Developers. All Rights Reserved.
+# Copyright 2026 The PySCF Developers. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -135,7 +135,6 @@ class _OverlapPairOpt(VHFOpt):
         """Per-shell (min exponent, scaled max |coeff|, atom) of the sorted mol."""
         mol = self._sorted_mol
         bas = mol._bas
-        nbas = mol.nbas
         nprim = bas[:, gto.NPRIM_OF]
         npmax = int(nprim.max())
         k = np.arange(npmax)
