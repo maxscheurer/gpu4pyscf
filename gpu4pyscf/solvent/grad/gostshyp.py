@@ -354,25 +354,6 @@ class Gradients(lib.StreamObject):
     grad = kernel
 
 
-def make_grad(gostshyp_obj, dm):
-    """
-    Compute GOSTSHYP gradient.
-
-    Parameters
-    ----------
-    gostshyp_obj : GOSTSHYP
-        GOSTSHYP solvent object
-    dm : ndarray
-        Density matrix
-
-    Returns
-    -------
-    gradient : ndarray
-        Nuclear gradients
-    """
-    return Gradients(gostshyp_obj).kernel(dm)
-
-
 def make_grad_object(base_method):
     '''Create nuclear gradients object with solvent contributions for the given
     solvent-attached method based on its gradients method in vacuum

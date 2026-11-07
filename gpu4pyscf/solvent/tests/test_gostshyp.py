@@ -355,6 +355,9 @@ class TestGOSTSHYPBuild(unittest.TestCase):
 
         gostshyp = GOSTSHYP(mol)
         gostshyp.build()
+        gostshyp.kernel(converged_dm(mol))
+        old_intopt = gostshyp.intopt
+        old_screen = gostshyp.get_screen()
 
         mol_new = gto.M(
             atom='H 0 0 0; H 1.5 0 0',
@@ -365,8 +368,13 @@ class TestGOSTSHYPBuild(unittest.TestCase):
         gostshyp.reset(mol_new)
 
         self.assertEqual(gostshyp.mol, mol_new)
-        self.assertIsNone(gostshyp._gtilde)
-        self.assertIsNone(gostshyp._force_operators)
+        for name in ('e', 'v', 'amplitudes', 'forces', 'gtilde_expval',
+                     '_surface_derivatives', '_screen'):
+            self.assertIsNone(getattr(gostshyp, name), name)
+        self.assertIsNot(gostshyp.intopt, old_intopt)
+        self.assertIsNot(gostshyp.get_screen(), old_screen)
+        self.assertEqual(gostshyp.grid_coords.shape, (gostshyp.n_gaussian, 3))
+        self.assertTrue(np.all(gostshyp.atom_idx < mol_new.natm))
 
 
 class TestGOSTSHYPGradient(unittest.TestCase):

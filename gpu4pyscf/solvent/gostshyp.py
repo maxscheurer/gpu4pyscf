@@ -356,9 +356,7 @@ class GOSTSHYP(lib.StreamObject):
         self.amplitudes = None
         self.forces = None
 
-        # Cached operators
-        self._gtilde = None
-        self._force_operators = None
+        # Cached screening lists (see get_screen)
         self._screen = None
 
         # Timing (GPU ms accumulated via CUDA events)
@@ -484,8 +482,6 @@ class GOSTSHYP(lib.StreamObject):
 
         self.intopt = _OverlapPairOpt(mol, self.overlap_cutoff)
         self.intopt.build(1e-20, aosym=True, group_size=None)
-        self._gtilde = None
-        self._force_operators = None
         self._surface_derivatives = None
         self._screen = None
         return ngrids
@@ -550,50 +546,6 @@ class GOSTSHYP(lib.StreamObject):
                 sym = self.mol.atom_symbol(int(self.atom_idx[i]))
                 f.write(f'{sym:2s} {coords_ang[i,0]:16.10f} {coords_ang[i,1]:16.10f} '
                         f'{coords_ang[i,2]:16.10f}\n')
-
-    def _compute_gtilde(self):
-        """Compute s-type 3-center overlap integrals (cached)."""
-        if self._gtilde is not None:
-            return self._gtilde
-
-        mol = self.mol
-        nao = mol.nao
-        ngrids = self.n_gaussian
-
-        # Compute full tensor for s-type aux
-        gtilde = int3c_overlap.get_int3c_overlap(
-            mol, self.grid_coords, self.widths, aux_l=0, intopt=self.intopt)
-
-        # Shape: [ngrids, 1, nao, nao] -> [nao, nao, ngrids]
-        self._gtilde = gtilde[:, 0, :, :].transpose(1, 2, 0)
-        return self._gtilde
-
-    def _compute_force_operators(self):
-        """Compute p-type 3-center overlap contracted with normals (cached)."""
-        if self._force_operators is not None:
-            return self._force_operators
-
-        mol = self.mol
-        nao = mol.nao
-        ngrids = self.n_gaussian
-
-        # p-type coefficients: 2 * width (derivative of Gaussian)
-        p_coeffs = 2.0 * self.widths
-
-        # Compute full tensor for p-type aux
-        overlap3_p = int3c_overlap.get_int3c_overlap(
-            mol, self.grid_coords, self.widths, aux_l=1, intopt=self.intopt)
-
-        # Shape: [ngrids, 3, nao, nao] -> [nao, nao, ngrids, 3]
-        overlap3_p = overlap3_p.transpose(2, 3, 0, 1)
-
-        # Contract with surface normals: F_ij_g = sum_c overlap_ij_g_c * n_g_c
-        # Also apply p-type coefficient
-        force_ops = np.einsum('ijgc,gc,g->ijg', overlap3_p, self.surface_normals,
-                              p_coeffs, optimize=True)
-
-        self._force_operators = force_ops
-        return self._force_operators
 
     def kernel(self, dm):
         """
@@ -739,29 +691,6 @@ class GOSTSHYP(lib.StreamObject):
         result = grad_obj.kernel(dm)
         self._grad_t_wall = grad_obj.t_wall
         return result
-
-
-def GOSTSHYP_factory(method_or_mol, solvent_obj=None, dm=None):
-    """
-    Initialize GOSTSHYP model.
-
-    Examples
-    --------
-    >>> mf = GOSTSHYP(scf.RHF(mol))
-    >>> mf.kernel()
-
-    >>> sol = GOSTSHYP(mol)
-    >>> mf = sol.for_scf(scf.RHF(mol))
-    """
-    from pyscf import gto as pyscf_gto
-    from gpu4pyscf import scf
-
-    if isinstance(method_or_mol, pyscf_gto.mole.Mole):
-        return GOSTSHYP(method_or_mol)
-    elif isinstance(method_or_mol, scf.hf.SCF):
-        return gostshyp_for_scf(method_or_mol, solvent_obj, dm)
-    else:
-        raise NotImplementedError(f'GOSTSHYP model does not support {method_or_mol}')
 
 
 # Inject GOSTSHYP to SCF classes
