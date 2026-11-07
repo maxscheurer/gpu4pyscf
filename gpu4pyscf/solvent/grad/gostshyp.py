@@ -77,55 +77,114 @@ def _get_surface_derivatives(gostshyp):
     return result
 
 
-def _contract_dareas(gostshyp, weights, chunk_bytes=1 << 28):
+def _contract_dareas(gostshyp, weights):
     """Return sum_g dA_g/dR_(a,x) * weights_g as [natm, 3].
 
     For PCM-type cavities (vdw, vdw/occ) this evaluates the area derivative of
-    pcm.grad.get_dF_dA directly in grid chunks without materializing the dense
+    pcm.grad.get_dF_dA with one CUDA thread per surface point over the
+    neighbour atoms of its owner, without materializing the dense
     [natm, 3, ngrids] tensor. DROP cavities use the cached MOIST derivatives.
     """
     if gostshyp.cavity == 'drop':
         dareas, _ = _get_surface_derivatives(gostshyp)
         return cp.einsum('acg,g->ac', dareas, weights)
 
-    from gpu4pyscf.solvent.pcm import switch_h
-    from gpu4pyscf.solvent.grad.pcm import grad_switch_h
     surface = (gostshyp._outer_surface
                if gostshyp._outer_surface is not None
                else gostshyp.surface)
-    atom_coords = surface['atom_coords']
-    grid_coords = surface['grid_coords']
-    R_in_J = surface['R_in_J']
-    R_sw_J = surface['R_sw_J']
+    atom_coords = cp.ascontiguousarray(surface['atom_coords'])
+    grid_coords = cp.ascontiguousarray(surface['grid_coords'])
+    R_in_J = cp.ascontiguousarray(surface['R_in_J'], dtype=np.float64)
+    R_sw_J = cp.ascontiguousarray(surface['R_sw_J'], dtype=np.float64)
     natm = atom_coords.shape[0]
     ngrids = grid_coords.shape[0]
     wA = weights * surface['area']
     if gostshyp._occ_ratio_sq is not None:
         wA = wA * gostshyp._occ_ratio_sq
-    owner = cp.asarray(gostshyp.atom_idx)
+    wA = cp.ascontiguousarray(wA, dtype=np.float64)
+    owner = cp.asarray(gostshyp.atom_idx, dtype=np.int32)
 
+    # Only atoms with 0 < d_iJ < 1 contribute (grad_switch_h vanishes for
+    # d >= 1 and the displacement is zeroed for d < 1e-8). Candidate atoms J
+    # for points of atom a: |R_a - R_J| - r_max(a) < R_in_J + R_sw_J.
+    ptr, nbr = _owner_neighbours(gostshyp, surface)
     out = cp.zeros((natm, 3))
-    chunk = max(1, chunk_bytes // (natm * 3 * 8))
-    for p0 in range(0, ngrids, chunk):
-        p1 = min(ngrids, p0 + chunk)
-        n = p1 - p0
-        own = owner[p0:p1]
-        rows = cp.arange(n)
-        ri_rJ = grid_coords[p0:p1, None, :] - atom_coords[None, :, :]
-        riJ = cp.linalg.norm(ri_rJ, axis=-1)
-        diJ = (riJ - R_in_J) / R_sw_J
-        diJ[rows, own] = 1.0
-        small = diJ < 1e-8
-        diJ[small] = 0.0
-        ri_rJ[rows, own, :] = 0.0
-        ri_rJ[small] = 0.0
-        fiJ = switch_h(diJ)
-        dfiJ = (grad_switch_h(diJ) / (fiJ * riJ * R_sw_J))[:, :, None] * ri_rJ
-        w = wA[p0:p1]
-        # owner-atom response: + A_i sum_J dfiJ ; other atoms: - A_i dfiJ
-        cp.add.at(out, own, w[:, None] * dfiJ.sum(axis=1))
-        out -= cp.einsum('i,iJx->Jx', w, dfiJ)
+    _dareas_kernel(((ngrids + 127) // 128,), (128,),
+                   (grid_coords, atom_coords, R_in_J, R_sw_J, wA, owner,
+                    ptr, nbr, out, np.int32(ngrids)))
     return out
+
+
+_dareas_kernel = cp.RawKernel(r'''
+__device__ __forceinline__ double sw_h(double x) {
+    if (x < 0) return 0.0;
+    if (x > 1) return 1.0;
+    return x * x * x * (10.0 - 15.0 * x + 6.0 * x * x);
+}
+__device__ __forceinline__ double dsw_h(double x) {
+    if (x < 0 || x > 1) return 0.0;
+    return 30.0 * x * x - 60.0 * x * x * x + 30.0 * x * x * x * x;
+}
+extern "C" __global__
+void gost_contract_dareas(const double* __restrict__ grid, const double* __restrict__ atm,
+                          const double* __restrict__ R_in, const double* __restrict__ R_sw,
+                          const double* __restrict__ wA, const int* __restrict__ owner,
+                          const int* __restrict__ ptr, const int* __restrict__ nbr,
+                          double* __restrict__ out, const int ngrids)
+{
+    // sum_g w_g dA_g/dR (pcm.grad.get_dF_dA, area part), one thread per point:
+    //   owner atom: + A_g sum_J dfiJ;  atom J: - A_g dfiJ
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ngrids) return;
+    const int own = owner[i];
+    const double w = wA[i];
+    const double gx = grid[i * 3 + 0], gy = grid[i * 3 + 1], gz = grid[i * 3 + 2];
+    double sx = 0.0, sy = 0.0, sz = 0.0;
+    for (int n = ptr[own]; n < ptr[own + 1]; ++n) {
+        const int J = nbr[n];
+        const double dx = gx - atm[J * 3 + 0];
+        const double dy = gy - atm[J * 3 + 1];
+        const double dz = gz - atm[J * 3 + 2];
+        const double r = sqrt(dx * dx + dy * dy + dz * dz);
+        double d = (r - R_in[J]) / R_sw[J];
+        if (d < 1e-8) continue;       // displacement zeroed
+        const double g = dsw_h(d);
+        if (g == 0.0) continue;       // d >= 1
+        const double f = g / (sw_h(d) * r * R_sw[J]);
+        const double fx = f * dx, fy = f * dy, fz = f * dz;
+        sx += fx; sy += fy; sz += fz;
+        atomicAdd(&out[J * 3 + 0], -w * fx);
+        atomicAdd(&out[J * 3 + 1], -w * fy);
+        atomicAdd(&out[J * 3 + 2], -w * fz);
+    }
+    atomicAdd(&out[own * 3 + 0], w * sx);
+    atomicAdd(&out[own * 3 + 1], w * sy);
+    atomicAdd(&out[own * 3 + 2], w * sz);
+}
+''', 'gost_contract_dareas')
+
+
+def _owner_neighbours(gostshyp, surface):
+    """CSR neighbour lists (atoms != a that can switch points of atom a)."""
+    cache = getattr(gostshyp, '_dareas_nbr', None)
+    if cache is not None and cache[0] is surface['grid_coords']:
+        return cache[1], cache[2]
+    atom_coords = surface['atom_coords']
+    natm = atom_coords.shape[0]
+    owner = cp.asarray(gostshyp.atom_idx)
+    r_pt = cp.linalg.norm(surface['grid_coords'] - atom_coords[owner], axis=1)
+    r_max = cp.zeros(natm)
+    cp.maximum.at(r_max, owner, r_pt)
+    d_atm = cp.linalg.norm(atom_coords[:, None, :] - atom_coords[None, :, :], axis=2)
+    reach = surface['R_in_J'] + surface['R_sw_J']
+    nb = (d_atm - r_max[:, None]) < (reach[None, :] * (1 + 1e-12) + 1e-8)
+    nb[cp.arange(natm), cp.arange(natm)] = False
+    a, J = cp.nonzero(nb)
+    ptr = cp.zeros(natm + 1, dtype=np.int32)
+    cp.cumsum(nb.sum(axis=1), out=ptr[1:])
+    nbr = cp.ascontiguousarray(J.astype(np.int32))
+    gostshyp._dareas_nbr = (surface['grid_coords'], ptr, nbr)
+    return ptr, nbr
 
 
 def _apply_grid_coordinate_response(gostshyp, gtilde_grad, force_grad,
